@@ -166,10 +166,35 @@ pub struct ZoneStats {
     pub pids_current: u64,
 }
 
+/// How the backend enforces isolation boundaries.
+///
+/// This matters: a caller interpreting enforcement events or evaluating
+/// policy compliance must know whether isolation is per-syscall software
+/// policy (Linux eBPF) or structural hardware boundary (macOS VM).
+/// These are categorically different threat models.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum IsolationModel {
+    /// Per-syscall interception via eBPF LSM hooks. Enforcement is software
+    /// policy — every file_open, kill, ptrace, exec is checked against zone
+    /// membership maps. Relies on kernel BPF infrastructure being intact.
+    /// Observability is granular (individual denied syscalls are visible).
+    SyscallPolicy,
+    /// Structural hardware boundary via hypervisor (VM). Isolation doesn't
+    /// depend on intercepting individual syscalls — the VM boundary prevents
+    /// cross-zone access structurally. Stronger isolation guarantee, but
+    /// fewer per-operation observability hooks.
+    HardwareBoundary,
+}
+
 /// Report from verifying zone isolation integrity.
+///
+/// The meaning of `is_isolated` depends on `model`:
+/// - `SyscallPolicy`: all BPF programs loaded, maps consistent, cgroup exists
+/// - `HardwareBoundary`: VM is running, sandbox profile applied
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IsolationReport {
     pub zone_id: Uuid,
+    pub model: IsolationModel,
     pub is_isolated: bool,
     pub checks: Vec<IsolationCheck>,
 }

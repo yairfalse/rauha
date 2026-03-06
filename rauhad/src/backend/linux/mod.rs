@@ -120,6 +120,93 @@ impl LinuxBackend {
 }
 
 impl IsolationBackend for LinuxBackend {
+    fn recover_zone(&self, zone: &ZoneHandle, zone_type: ZoneType, policy: &ZonePolicy) -> Result<()> {
+        tracing::info!(zone = zone.name, "recovering zone state from metadata");
+
+        // Allocate a compact zone_id (these are ephemeral, not persisted).
+        let zone_id = self.allocate_zone_id(zone.id);
+        self.zone_name_map
+            .lock()
+            .unwrap()
+            .insert(zone.name.clone(), zone.id);
+
+        // Re-create cgroup if missing (idempotent).
+        let cgroup_id = if self.cgroup.zone_cgroup_exists(&zone.name) {
+            self.cgroup.cgroup_id_for_zone(&zone.name)?
+        } else {
+            self.cgroup.create_zone_cgroup(&zone.name)?
+        };
+
+        // Re-apply resource limits.
+        if let Err(e) = self.cgroup.apply_resources(&zone.name, &policy.resources) {
+            tracing::warn!(%e, zone = zone.name, "failed to re-apply resource limits during recovery");
+        }
+
+        // Re-create netns if missing (idempotent).
+        if !namespace::netns_exists(&zone.name) {
+            if let Err(e) = namespace::create_netns(&zone.name) {
+                tracing::warn!(%e, zone = zone.name, "failed to re-create netns during recovery");
+            }
+        }
+
+        // Re-populate BPF maps.
+        if let Ok(ref mut ebpf_guard) = self.ebpf.lock() {
+            if let Some(ref mut ebpf) = **ebpf_guard {
+                let bpf = ebpf.bpf_mut();
+                if let Err(e) = MapManager::add_zone_member(bpf, cgroup_id, zone_id, zone_type) {
+                    tracing::warn!(%e, zone = zone.name, "failed to re-add zone to BPF map during recovery");
+                }
+                if let Err(e) = MapManager::set_zone_policy(bpf, zone_id, policy) {
+                    tracing::warn!(%e, zone = zone.name, "failed to re-set zone policy during recovery");
+                }
+            }
+        }
+
+        tracing::info!(zone = zone.name, zone_id, cgroup_id, "zone recovered");
+        Ok(())
+    }
+
+    fn cleanup_orphans(&self, known_zones: &[ZoneHandle]) -> Result<()> {
+        let known_names: std::collections::HashSet<&str> =
+            known_zones.iter().map(|z| z.name.as_str()).collect();
+
+        // Clean up orphaned cgroups under rauha.slice/.
+        let slice_path = std::path::Path::new("/sys/fs/cgroup/rauha.slice");
+        if slice_path.exists() {
+            if let Ok(entries) = std::fs::read_dir(slice_path) {
+                for entry in entries.flatten() {
+                    let name = entry.file_name();
+                    let name_str = name.to_string_lossy();
+                    if let Some(zone_name) = name_str.strip_prefix("zone-") {
+                        if !known_names.contains(zone_name) {
+                            tracing::warn!(cgroup = %name_str, "cleaning up orphaned cgroup");
+                            let _ = self.cgroup.destroy_zone_cgroup(zone_name);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Clean up orphaned network namespaces.
+        let netns_dir = std::path::Path::new("/var/run/netns");
+        if netns_dir.exists() {
+            if let Ok(entries) = std::fs::read_dir(netns_dir) {
+                for entry in entries.flatten() {
+                    let name = entry.file_name();
+                    let name_str = name.to_string_lossy();
+                    if let Some(zone_name) = name_str.strip_prefix("rauha-") {
+                        if !known_names.contains(zone_name) {
+                            tracing::warn!(netns = %name_str, "cleaning up orphaned netns");
+                            let _ = namespace::destroy_netns(zone_name);
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     fn create_zone(&self, config: &ZoneConfig) -> Result<ZoneHandle> {
         tracing::info!(zone = config.name, backend = "linux-ebpf", "creating zone");
 
@@ -360,9 +447,14 @@ impl IsolationBackend for LinuxBackend {
 
         Ok(IsolationReport {
             zone_id: zone.id,
+            model: IsolationModel::SyscallPolicy,
             is_isolated,
             checks,
         })
+    }
+
+    fn isolation_model(&self) -> IsolationModel {
+        IsolationModel::SyscallPolicy
     }
 
     fn name(&self) -> &str {

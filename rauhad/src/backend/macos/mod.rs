@@ -20,6 +20,16 @@ impl MacosBackend {
 }
 
 impl IsolationBackend for MacosBackend {
+    fn recover_zone(&self, _zone: &ZoneHandle, _zone_type: ZoneType, _policy: &ZonePolicy) -> Result<()> {
+        // TODO Phase 5: Re-attach to running VMs if daemon restarts.
+        Ok(())
+    }
+
+    fn cleanup_orphans(&self, _known_zones: &[ZoneHandle]) -> Result<()> {
+        // TODO Phase 5: Find and destroy orphaned VMs.
+        Ok(())
+    }
+
     fn create_zone(&self, config: &ZoneConfig) -> Result<ZoneHandle> {
         tracing::info!(zone = config.name, backend = "macos-virt", "creating zone");
 
@@ -88,6 +98,7 @@ impl IsolationBackend for MacosBackend {
     fn verify_isolation(&self, zone: &ZoneHandle) -> Result<IsolationReport> {
         Ok(IsolationReport {
             zone_id: zone.id,
+            model: IsolationModel::HardwareBoundary,
             is_isolated: true,
             checks: vec![IsolationCheck {
                 name: "stub".into(),
@@ -95,6 +106,10 @@ impl IsolationBackend for MacosBackend {
                 detail: "stub backend — no real isolation yet".into(),
             }],
         })
+    }
+
+    fn isolation_model(&self) -> IsolationModel {
+        IsolationModel::HardwareBoundary
     }
 
     fn name(&self) -> &str {
