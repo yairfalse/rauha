@@ -8,6 +8,14 @@
 
 3. **Easy to fix and maintain** — small files, clear boundaries, minimal dependencies. When something breaks, you should find the bug in minutes, not hours. No magic, no codegen you can't read, no framework lock-in.
 
+4. **Reliable as bedrock** — this is infrastructure. People put their production workloads on it. Every code path must be tested. Every error must be handled, not swallowed. No "we'll fix it later", no "shouldn't happen" comments hiding panics. If it can fail, it has a test that proves it handles failure. If it can't fail, prove it with types.
+
+## Non-Negotiables
+
+- No YAML. TOML for config, that's it.
+- No premature interfaces or plugin systems. Build what works, extract abstractions only when forced to by real use cases.
+- No "design for the future" — solve today's problem correctly. Tomorrow's problem gets solved tomorrow.
+
 ## Architecture Decisions
 
 - **Rust, not Go** — no GC, predictable performance, single static binaries
