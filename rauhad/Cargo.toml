@@ -1,0 +1,29 @@
+[package]
+name = "rauhad"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+rauha-common = { path = "../rauha-common" }
+
+tokio = { workspace = true }
+tonic = { workspace = true }
+prost = { workspace = true }
+serde = { workspace = true }
+toml = { workspace = true }
+redb = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+postcard = { workspace = true }
+tokio-stream = "0.1"
+
+[dev-dependencies]
+tempfile = "3"
+
+[build-dependencies]
+tonic-build = { workspace = true }
