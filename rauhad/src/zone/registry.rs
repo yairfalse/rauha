@@ -31,6 +31,53 @@ impl ZoneRegistry {
         }
     }
 
+    /// Reconcile persisted metadata with kernel state on startup.
+    ///
+    /// redb is the source of truth. For each persisted zone, re-establish
+    /// kernel state (cgroups, BPF maps, netns). Then clean up any orphaned
+    /// kernel state that doesn't correspond to a known zone.
+    ///
+    /// This handles the crash recovery case: rauhad dies between writing
+    /// to redb and updating kernel state, leaving them inconsistent.
+    pub async fn reconcile(&self) -> Result<()> {
+        let zones = self.metadata.list_zones()?;
+        if zones.is_empty() {
+            tracing::info!("no zones to reconcile");
+            self.backend.cleanup_orphans(&[])?;
+            return Ok(());
+        }
+
+        tracing::info!(count = zones.len(), "reconciling zones from metadata");
+
+        let mut handles = Vec::new();
+        for zone in &zones {
+            let handle = ZoneHandle {
+                id: zone.id,
+                name: zone.name.clone(),
+                platform_id: 0, // Will be set by recover_zone.
+            };
+
+            match self.backend.recover_zone(&handle, zone.zone_type, &zone.policy) {
+                Ok(()) => {
+                    handles.push(handle.clone());
+                    self.handles.write().await.insert(zone.name.clone(), handle);
+                    tracing::info!(zone = zone.name, "zone reconciled");
+                }
+                Err(e) => {
+                    tracing::error!(zone = zone.name, %e, "failed to reconcile zone — zone will be unavailable");
+                }
+            }
+        }
+
+        // Clean up orphaned kernel state.
+        if let Err(e) = self.backend.cleanup_orphans(&handles) {
+            tracing::warn!(%e, "failed to clean up orphaned kernel state");
+        }
+
+        tracing::info!(recovered = handles.len(), total = zones.len(), "reconciliation complete");
+        Ok(())
+    }
+
     pub async fn create_zone(&self, name: &str, zone_type: ZoneType, policy: ZonePolicy) -> Result<Zone> {
         // Check for duplicates.
         if self.metadata.get_zone(name)?.is_some() {

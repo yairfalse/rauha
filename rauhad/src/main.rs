@@ -52,6 +52,11 @@ async fn main() -> anyhow::Result<()> {
         backend,
     ));
 
+    // Reconcile persisted metadata with kernel state.
+    // Handles crash recovery: re-pushes zone policies to BPF maps,
+    // re-creates missing cgroups/netns, cleans up orphaned kernel state.
+    registry.reconcile().await?;
+
     // Set up gRPC services.
     let zone_svc = server::ZoneServiceImpl::new(registry.clone(), root.clone());
     let container_svc = server::ContainerServiceImpl::new(registry.clone());
