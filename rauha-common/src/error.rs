@@ -39,6 +39,37 @@ pub enum RauhaError {
     #[error("unsupported platform: {0}")]
     UnsupportedPlatform(String),
 
+    #[error("eBPF error: {message}")]
+    EbpfError {
+        message: String,
+        /// What the user should try to fix this.
+        hint: String,
+    },
+
+    #[error("cgroup error: {message}")]
+    CgroupError {
+        message: String,
+        hint: String,
+    },
+
+    #[error("namespace error: {message}")]
+    NamespaceError {
+        message: String,
+        hint: String,
+    },
+
+    #[error("network error: {message}")]
+    NetworkError {
+        message: String,
+        hint: String,
+    },
+
+    #[error("kernel too old: requires {required}, found {found}")]
+    KernelTooOld {
+        required: String,
+        found: String,
+    },
+
     #[error(transparent)]
     Io(#[from] std::io::Error),
 
