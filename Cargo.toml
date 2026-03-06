@@ -2,10 +2,12 @@
 resolver = "2"
 members = [
     "rauha-common",
+    "rauha-ebpf-common",
     "rauhad",
     "rauha-cli",
     "rauha-shim",
     "rauha-oci",
+    "xtask",
 ]
 
 [workspace.package]
@@ -56,3 +58,14 @@ hex = "0.4"
 [workspace.dependencies.nix]
 version = "0.29"
 features = ["fs", "mount", "sched", "signal", "user", "net"]
+
+# eBPF (Linux)
+[workspace.dependencies.aya]
+version = "0.13"
+[workspace.dependencies.aya-log]
+version = "0.2"
+
+# Internal
+[workspace.dependencies.rauha-ebpf-common]
+path = "rauha-ebpf-common"
+features = ["userspace"]
