@@ -1,0 +1,88 @@
+syntax = "proto3";
+
+package rauha.container.v1;
+
+service ContainerService {
+    rpc CreateContainer(CreateContainerRequest) returns (CreateContainerResponse);
+    rpc StartContainer(StartContainerRequest) returns (StartContainerResponse);
+    rpc StopContainer(StopContainerRequest) returns (StopContainerResponse);
+    rpc DeleteContainer(DeleteContainerRequest) returns (DeleteContainerResponse);
+    rpc GetContainer(GetContainerRequest) returns (GetContainerResponse);
+    rpc ListContainers(ListContainersRequest) returns (ListContainersResponse);
+    rpc ExecInContainer(ExecInContainerRequest) returns (ExecInContainerResponse);
+}
+
+message CreateContainerRequest {
+    string zone_name = 1;
+    string name = 2;
+    string image = 3;
+    repeated string command = 4;
+    map<string, string> env = 5;
+    string working_dir = 6;
+}
+
+message CreateContainerResponse {
+    string container_id = 1;
+    string name = 2;
+    string state = 3;
+}
+
+message StartContainerRequest {
+    string container_id = 1;
+}
+
+message StartContainerResponse {}
+
+message StopContainerRequest {
+    string container_id = 1;
+    uint32 timeout_seconds = 2;
+}
+
+message StopContainerResponse {}
+
+message DeleteContainerRequest {
+    string container_id = 1;
+    bool force = 2;
+}
+
+message DeleteContainerResponse {}
+
+message GetContainerRequest {
+    string container_id = 1;
+}
+
+message GetContainerResponse {
+    ContainerInfo container = 1;
+}
+
+message ListContainersRequest {
+    string zone_name = 1; // empty = all zones
+}
+
+message ListContainersResponse {
+    repeated ContainerInfo containers = 1;
+}
+
+message ContainerInfo {
+    string id = 1;
+    string name = 2;
+    string zone_id = 3;
+    string zone_name = 4;
+    string image = 5;
+    string state = 6;
+    uint32 pid = 7;
+    string created_at = 8;
+    string started_at = 9;
+}
+
+message ExecInContainerRequest {
+    string container_id = 1;
+    repeated string command = 2;
+    map<string, string> env = 3;
+}
+
+message ExecInContainerResponse {
+    int32 exit_code = 1;
+    bytes stdout = 2;
+    bytes stderr = 3;
+}

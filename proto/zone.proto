@@ -1,0 +1,113 @@
+syntax = "proto3";
+
+package rauha.zone.v1;
+
+service ZoneService {
+    rpc CreateZone(CreateZoneRequest) returns (CreateZoneResponse);
+    rpc DeleteZone(DeleteZoneRequest) returns (DeleteZoneResponse);
+    rpc GetZone(GetZoneRequest) returns (GetZoneResponse);
+    rpc ListZones(ListZonesRequest) returns (ListZonesResponse);
+    rpc ApplyPolicy(ApplyPolicyRequest) returns (ApplyPolicyResponse);
+    rpc GetPolicy(GetPolicyRequest) returns (GetPolicyResponse);
+    rpc ZoneStats(ZoneStatsRequest) returns (ZoneStatsResponse);
+    rpc VerifyIsolation(VerifyIsolationRequest) returns (VerifyIsolationResponse);
+    rpc WatchEvents(WatchEventsRequest) returns (stream ZoneEvent);
+}
+
+message CreateZoneRequest {
+    string name = 1;
+    string zone_type = 2;  // "non-global", "privileged"
+    string policy_toml = 3; // inline TOML policy (optional)
+}
+
+message CreateZoneResponse {
+    string zone_id = 1;
+    string name = 2;
+    string state = 3;
+}
+
+message DeleteZoneRequest {
+    string name = 1;
+    bool force = 2;
+}
+
+message DeleteZoneResponse {}
+
+message GetZoneRequest {
+    string name = 1;
+}
+
+message GetZoneResponse {
+    ZoneInfo zone = 1;
+}
+
+message ListZonesRequest {}
+
+message ListZonesResponse {
+    repeated ZoneInfo zones = 1;
+}
+
+message ZoneInfo {
+    string id = 1;
+    string name = 2;
+    string zone_type = 3;
+    string state = 4;
+    uint32 container_count = 5;
+    string created_at = 6;
+}
+
+message ApplyPolicyRequest {
+    string zone_name = 1;
+    string policy_toml = 2;
+}
+
+message ApplyPolicyResponse {}
+
+message GetPolicyRequest {
+    string zone_name = 1;
+}
+
+message GetPolicyResponse {
+    string policy_toml = 1;
+}
+
+message ZoneStatsRequest {
+    string zone_name = 1;
+}
+
+message ZoneStatsResponse {
+    string zone_id = 1;
+    uint32 container_count = 2;
+    double cpu_usage_percent = 3;
+    uint64 memory_usage_bytes = 4;
+    uint64 memory_limit_bytes = 5;
+    uint64 network_rx_bytes = 6;
+    uint64 network_tx_bytes = 7;
+    uint64 pids_current = 8;
+}
+
+message VerifyIsolationRequest {
+    string zone_name = 1;
+}
+
+message VerifyIsolationResponse {
+    bool is_isolated = 1;
+    repeated IsolationCheck checks = 2;
+}
+
+message IsolationCheck {
+    string name = 1;
+    bool passed = 2;
+    string detail = 3;
+}
+
+message WatchEventsRequest {
+    string zone_name = 1; // empty = all zones
+}
+
+message ZoneEvent {
+    string zone_name = 1;
+    string event_type = 2;
+    string message = 3;
+    string timestamp = 4;
+}

@@ -1,0 +1,53 @@
+syntax = "proto3";
+
+package rauha.image.v1;
+
+service ImageService {
+    rpc Pull(PullRequest) returns (stream PullProgress);
+    rpc List(ListImagesRequest) returns (ListImagesResponse);
+    rpc Remove(RemoveImageRequest) returns (RemoveImageResponse);
+    rpc Inspect(InspectImageRequest) returns (InspectImageResponse);
+}
+
+message PullRequest {
+    string reference = 1; // e.g. "docker.io/nginx:latest"
+}
+
+message PullProgress {
+    string status = 1;
+    string layer = 2;
+    uint64 current = 3;
+    uint64 total = 4;
+    bool done = 5;
+}
+
+message ListImagesRequest {}
+
+message ListImagesResponse {
+    repeated ImageInfo images = 1;
+}
+
+message ImageInfo {
+    string digest = 1;
+    repeated string tags = 2;
+    uint64 size = 3;
+    string created_at = 4;
+}
+
+message RemoveImageRequest {
+    string reference = 1;
+}
+
+message RemoveImageResponse {}
+
+message InspectImageRequest {
+    string reference = 1;
+}
+
+message InspectImageResponse {
+    string digest = 1;
+    repeated string tags = 2;
+    uint64 size = 3;
+    string config_json = 4;
+    repeated string layers = 5;
+}
