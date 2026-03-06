@@ -1,0 +1,15 @@
+[package]
+name = "rauha-shim"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+rauha-common = { path = "../rauha-common" }
+
+tokio = { workspace = true }
+postcard = { workspace = true }
+serde = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
