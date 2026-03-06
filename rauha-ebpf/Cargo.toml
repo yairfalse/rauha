@@ -1,0 +1,24 @@
+[package]
+name = "rauha-ebpf"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+
+# NOT a workspace member — targets bpfel-unknown-none.
+
+[dependencies]
+aya-ebpf = "0.1"
+aya-log-ebpf = "0.1"
+rauha-ebpf-common = { path = "../rauha-ebpf-common", default-features = false }
+
+[[bin]]
+name = "rauha-ebpf"
+path = "src/main.rs"
+
+[profile.dev]
+opt-level = 2
+debug = false
+overflow-checks = false
+
+[profile.release]
+lto = true
