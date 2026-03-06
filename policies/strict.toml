@@ -1,0 +1,28 @@
+[zone]
+name = "strict"
+type = "non-global"
+
+[capabilities]
+allowed = []
+
+[resources]
+cpu_shares = 512
+memory_limit = "1Gi"
+io_weight = 50
+pids_max = 128
+
+[network]
+mode = "isolated"
+allowed_zones = []
+allowed_egress = []
+allowed_ingress = []
+
+[filesystem]
+shared_layers = true
+writable_paths = ["/tmp"]
+
+[devices]
+allowed = ["/dev/null", "/dev/zero", "/dev/urandom"]
+
+[syscalls]
+deny = ["mount", "umount2", "pivot_root", "ptrace", "kexec_load", "reboot"]
