@@ -6,7 +6,7 @@ use crate::reference::ImageReference;
 use rauha_common::error::RauhaError;
 
 /// OCI manifest (simplified — we parse what we need).
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OciManifest {
     pub schema_version: u32,
@@ -413,4 +413,121 @@ fn extract_param<'a>(header: &'a str, key: &str) -> Option<&'a str> {
 // reqwest re-exports it, but we reference it explicitly for the streaming blob download.
 mod futures_util {
     pub use tokio_stream::StreamExt;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extract_param_realm() {
+        let header = r#"Bearer realm="https://auth.docker.io/token",service="registry.docker.io",scope="repository:library/nginx:pull""#;
+        assert_eq!(
+            extract_param(header, "realm"),
+            Some("https://auth.docker.io/token")
+        );
+        assert_eq!(
+            extract_param(header, "service"),
+            Some("registry.docker.io")
+        );
+        assert_eq!(
+            extract_param(header, "scope"),
+            Some("repository:library/nginx:pull")
+        );
+    }
+
+    #[test]
+    fn extract_param_missing_key() {
+        let header = r#"Bearer realm="https://auth.example.com/token""#;
+        assert_eq!(extract_param(header, "service"), None);
+    }
+
+    #[test]
+    fn extract_param_empty_header() {
+        assert_eq!(extract_param("", "realm"), None);
+        assert_eq!(extract_param("Basic", "realm"), None);
+    }
+
+    #[test]
+    fn extract_param_ghcr() {
+        let header = r#"Bearer realm="https://ghcr.io/token",service="ghcr.io",scope="repository:owner/repo:pull""#;
+        assert_eq!(
+            extract_param(header, "realm"),
+            Some("https://ghcr.io/token")
+        );
+        assert_eq!(extract_param(header, "service"), Some("ghcr.io"));
+    }
+
+    #[test]
+    fn manifest_deserialization() {
+        let json = r#"{
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
+            "config": {
+                "mediaType": "application/vnd.docker.container.image.v1+json",
+                "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "size": 1234
+            },
+            "layers": [
+                {
+                    "mediaType": "application/vnd.docker.image.rootfs.diff.tar.gzip",
+                    "digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                    "size": 5678
+                },
+                {
+                    "mediaType": "application/vnd.docker.image.rootfs.diff.tar.gzip",
+                    "digest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                    "size": 9012
+                }
+            ]
+        }"#;
+
+        let manifest: OciManifest = serde_json::from_str(json).unwrap();
+        assert_eq!(manifest.schema_version, 2);
+        assert_eq!(manifest.layers.len(), 2);
+        assert_eq!(manifest.config.size, 1234);
+        assert_eq!(manifest.layers[0].size, 5678);
+        assert!(manifest.layers[1].digest.starts_with("sha256:"));
+    }
+
+    #[test]
+    fn image_config_deserialization() {
+        let json = r#"{
+            "config": {
+                "Cmd": ["/bin/sh"],
+                "Entrypoint": ["/docker-entrypoint.sh"],
+                "Env": ["PATH=/usr/local/bin:/usr/bin", "NGINX_VERSION=1.25"],
+                "WorkingDir": "/app",
+                "User": "nobody"
+            }
+        }"#;
+
+        let config: OciImageConfig = serde_json::from_str(json).unwrap();
+        let inner = config.config.unwrap();
+        assert_eq!(inner.cmd.unwrap(), vec!["/bin/sh"]);
+        assert_eq!(inner.entrypoint.unwrap(), vec!["/docker-entrypoint.sh"]);
+        assert_eq!(inner.env.as_ref().unwrap().len(), 2);
+        assert_eq!(inner.working_dir.unwrap(), "/app");
+        assert_eq!(inner.user.unwrap(), "nobody");
+    }
+
+    #[test]
+    fn image_config_empty() {
+        // Config with no inner config (minimal image).
+        let json = r#"{}"#;
+        let config: OciImageConfig = serde_json::from_str(json).unwrap();
+        assert!(config.config.is_none());
+    }
+
+    #[test]
+    fn image_config_partial() {
+        // Config with only some fields set.
+        let json = r#"{"config": {"Cmd": ["echo", "hello"]}}"#;
+        let config: OciImageConfig = serde_json::from_str(json).unwrap();
+        let inner = config.config.unwrap();
+        assert_eq!(inner.cmd.unwrap(), vec!["echo", "hello"]);
+        assert!(inner.entrypoint.is_none());
+        assert!(inner.env.is_none());
+        assert!(inner.working_dir.is_none());
+    }
 }

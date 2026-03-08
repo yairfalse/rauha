@@ -329,6 +329,276 @@ impl ImageService {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::content::ContentStore;
+    use crate::distribution::{OciDescriptor, OciManifest};
+    use std::io::Write;
+
+    /// Create a gzipped tar archive from a list of (path, content) pairs.
+    fn make_tar_gz(files: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut tar_data = Vec::new();
+        {
+            let enc = flate2::write::GzEncoder::new(&mut tar_data, flate2::Compression::fast());
+            let mut builder = tar::Builder::new(enc);
+
+            for (path, content) in files {
+                let mut header = tar::Header::new_gnu();
+                header.set_path(path).unwrap();
+                header.set_size(content.len() as u64);
+                header.set_mode(0o644);
+                header.set_cksum();
+                builder.append(&header, *content).unwrap();
+            }
+
+            builder.finish().unwrap();
+            let enc = builder.into_inner().unwrap();
+            enc.finish().unwrap();
+        }
+        tar_data
+    }
+
+    /// Set up a content store with a fake manifest and layers.
+    fn setup_content_store_with_image(
+        dir: &std::path::Path,
+    ) -> (Arc<ContentStore>, String) {
+        let content_dir = dir.join("content");
+        let store = Arc::new(ContentStore::new(&content_dir).unwrap());
+
+        // Create a layer.
+        let layer_data = make_tar_gz(&[
+            ("hello.txt", b"hello world"),
+            ("bin/test", b"#!/bin/sh\necho hi"),
+        ]);
+        let layer_digest = store.put_blob(&layer_data).unwrap();
+
+        // Create image config.
+        let config_json = br#"{"config":{"Cmd":["/bin/sh"],"Env":["PATH=/usr/bin"]}}"#;
+        let config_digest = store.put_blob(config_json).unwrap();
+
+        // Create manifest.
+        let manifest = OciManifest {
+            schema_version: 2,
+            media_type: "application/vnd.oci.image.manifest.v1+json".into(),
+            config: OciDescriptor {
+                media_type: "application/vnd.oci.image.config.v1+json".into(),
+                digest: config_digest.as_str().to_string(),
+                size: config_json.len() as u64,
+            },
+            layers: vec![OciDescriptor {
+                media_type: "application/vnd.oci.image.rootfs.diff.tar.gzip".into(),
+                digest: layer_digest.as_str().to_string(),
+                size: layer_data.len() as u64,
+            }],
+        };
+        let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
+
+        // Store manifest under canonical reference.
+        let reference = "registry-1.docker.io/library/testimage:latest";
+        store.put_manifest(reference, &manifest_bytes).unwrap();
+
+        (store, reference.to_string())
+    }
+
+    #[test]
+    fn inspect_returns_image_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, _reference) = setup_content_store_with_image(dir.path());
+
+        let svc = ImageService::new(store, dir.path().to_path_buf());
+        let config = svc.inspect("testimage:latest").unwrap();
+
+        let inner = config.config.unwrap();
+        assert_eq!(inner.cmd.unwrap(), vec!["/bin/sh"]);
+        assert_eq!(inner.env.unwrap(), vec!["PATH=/usr/bin"]);
+    }
+
+    #[test]
+    fn inspect_missing_image_returns_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let content_dir = dir.path().join("content");
+        let store = Arc::new(ContentStore::new(&content_dir).unwrap());
+
+        let svc = ImageService::new(store, dir.path().to_path_buf());
+        let result = svc.inspect("nonexistent:latest");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn prepare_rootfs_unpacks_layer() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, _reference) = setup_content_store_with_image(dir.path());
+
+        let svc = ImageService::new(store, dir.path().to_path_buf());
+        let rootfs = dir.path().join("test-rootfs");
+        svc.prepare_rootfs("testimage:latest", &rootfs).unwrap();
+
+        // Verify files were unpacked.
+        assert!(rootfs.join("hello.txt").exists());
+        assert_eq!(
+            std::fs::read_to_string(rootfs.join("hello.txt")).unwrap(),
+            "hello world"
+        );
+        assert!(rootfs.join("bin/test").exists());
+    }
+
+    #[test]
+    fn prepare_rootfs_missing_image_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let content_dir = dir.path().join("content");
+        let store = Arc::new(ContentStore::new(&content_dir).unwrap());
+
+        let svc = ImageService::new(store, dir.path().to_path_buf());
+        let rootfs = dir.path().join("test-rootfs");
+        let result = svc.prepare_rootfs("nonexistent:latest", &rootfs);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn list_images_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let content_dir = dir.path().join("content");
+        let store = Arc::new(ContentStore::new(&content_dir).unwrap());
+
+        let svc = ImageService::new(store, dir.path().to_path_buf());
+        let images = svc.list_images().unwrap();
+        assert!(images.is_empty());
+    }
+
+    #[test]
+    fn list_images_returns_stored_image() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, _reference) = setup_content_store_with_image(dir.path());
+
+        let svc = ImageService::new(store, dir.path().to_path_buf());
+        let images = svc.list_images().unwrap();
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].layers, 1);
+        assert!(images[0].size > 0);
+    }
+
+    #[test]
+    fn remove_image_deletes_reference() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, _reference) = setup_content_store_with_image(dir.path());
+
+        let svc = ImageService::new(store, dir.path().to_path_buf());
+
+        // Verify image exists.
+        assert!(svc.inspect("testimage:latest").is_ok());
+
+        // Remove it.
+        svc.remove_image("testimage:latest").unwrap();
+
+        // Should no longer be inspectable.
+        assert!(svc.inspect("testimage:latest").is_err());
+    }
+
+    #[test]
+    fn whiteout_file_deletion() {
+        let dir = tempfile::tempdir().unwrap();
+        let content_dir = dir.path().join("content");
+        let store = Arc::new(ContentStore::new(&content_dir).unwrap());
+
+        // Layer 1: create a file.
+        let layer1 = make_tar_gz(&[("etc/config.txt", b"original")]);
+        let layer1_digest = store.put_blob(&layer1).unwrap();
+
+        // Layer 2: whiteout that file.
+        let layer2 = make_tar_gz(&[("etc/.wh.config.txt", b"")]);
+        let layer2_digest = store.put_blob(&layer2).unwrap();
+
+        let config_json = br#"{"config":{"Cmd":["/bin/sh"]}}"#;
+        let config_digest = store.put_blob(config_json).unwrap();
+
+        let manifest = OciManifest {
+            schema_version: 2,
+            media_type: String::new(),
+            config: OciDescriptor {
+                media_type: String::new(),
+                digest: config_digest.as_str().to_string(),
+                size: config_json.len() as u64,
+            },
+            layers: vec![
+                OciDescriptor {
+                    media_type: String::new(),
+                    digest: layer1_digest.as_str().to_string(),
+                    size: layer1.len() as u64,
+                },
+                OciDescriptor {
+                    media_type: String::new(),
+                    digest: layer2_digest.as_str().to_string(),
+                    size: layer2.len() as u64,
+                },
+            ],
+        };
+        let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
+        let reference = "registry-1.docker.io/library/whiteout-test:latest";
+        store.put_manifest(reference, &manifest_bytes).unwrap();
+
+        let svc = ImageService::new(store, dir.path().to_path_buf());
+        let rootfs = dir.path().join("rootfs");
+        svc.prepare_rootfs("whiteout-test:latest", &rootfs).unwrap();
+
+        // The file should have been deleted by the whiteout.
+        assert!(!rootfs.join("etc/config.txt").exists());
+    }
+
+    #[test]
+    fn multiple_layers_applied_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let content_dir = dir.path().join("content");
+        let store = Arc::new(ContentStore::new(&content_dir).unwrap());
+
+        // Layer 1: create a file.
+        let layer1 = make_tar_gz(&[("data.txt", b"layer1")]);
+        let layer1_digest = store.put_blob(&layer1).unwrap();
+
+        // Layer 2: overwrite the file.
+        let layer2 = make_tar_gz(&[("data.txt", b"layer2")]);
+        let layer2_digest = store.put_blob(&layer2).unwrap();
+
+        let config_json = br#"{"config":{"Cmd":["/bin/sh"]}}"#;
+        let config_digest = store.put_blob(config_json).unwrap();
+
+        let manifest = OciManifest {
+            schema_version: 2,
+            media_type: String::new(),
+            config: OciDescriptor {
+                media_type: String::new(),
+                digest: config_digest.as_str().to_string(),
+                size: config_json.len() as u64,
+            },
+            layers: vec![
+                OciDescriptor {
+                    media_type: String::new(),
+                    digest: layer1_digest.as_str().to_string(),
+                    size: layer1.len() as u64,
+                },
+                OciDescriptor {
+                    media_type: String::new(),
+                    digest: layer2_digest.as_str().to_string(),
+                    size: layer2.len() as u64,
+                },
+            ],
+        };
+        let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
+        let reference = "registry-1.docker.io/library/layered:latest";
+        store.put_manifest(reference, &manifest_bytes).unwrap();
+
+        let svc = ImageService::new(store, dir.path().to_path_buf());
+        let rootfs = dir.path().join("rootfs");
+        svc.prepare_rootfs("layered:latest", &rootfs).unwrap();
+
+        // Layer 2 should have overwritten layer 1.
+        assert_eq!(
+            std::fs::read_to_string(rootfs.join("data.txt")).unwrap(),
+            "layer2"
+        );
+    }
+}
+
 /// Unpack a tar layer into a target directory, handling OCI whiteout files.
 fn unpack_layer(
     archive: &mut tar::Archive<flate2::read::GzDecoder<std::fs::File>>,

@@ -129,4 +129,105 @@ mod tests {
             _ => panic!("wrong variant"),
         }
     }
+
+    #[test]
+    fn roundtrip_all_request_variants() {
+        let cases: Vec<ShimRequest> = vec![
+            ShimRequest::CreateContainer {
+                id: "c1".into(),
+                spec_json: "{}".into(),
+            },
+            ShimRequest::StartContainer { id: "c1".into() },
+            ShimRequest::StopContainer {
+                id: "c1".into(),
+                signal: 15,
+            },
+            ShimRequest::Signal {
+                id: "c1".into(),
+                signal: 9,
+            },
+            ShimRequest::GetState { id: "c1".into() },
+            ShimRequest::Shutdown,
+        ];
+
+        for req in cases {
+            let encoded = encode(&req).unwrap();
+            let _decoded: ShimRequest = decode_from(&mut &encoded[..]).unwrap();
+        }
+    }
+
+    #[test]
+    fn roundtrip_all_response_variants() {
+        let cases: Vec<ShimResponse> = vec![
+            ShimResponse::Ok,
+            ShimResponse::Created { pid: 12345 },
+            ShimResponse::State {
+                pid: 999,
+                status: "running".into(),
+            },
+            ShimResponse::Error {
+                message: "something failed".into(),
+            },
+        ];
+
+        for resp in cases {
+            let encoded = encode(&resp).unwrap();
+            let _decoded: ShimResponse = decode_from(&mut &encoded[..]).unwrap();
+        }
+    }
+
+    #[test]
+    fn encode_to_decode_from_stream() {
+        let req = ShimRequest::StopContainer {
+            id: "test".into(),
+            signal: 15,
+        };
+
+        let mut buf = Vec::new();
+        encode_to(&mut buf, &req).unwrap();
+
+        let decoded: ShimRequest = decode_from(&mut &buf[..]).unwrap();
+        match decoded {
+            ShimRequest::StopContainer { id, signal } => {
+                assert_eq!(id, "test");
+                assert_eq!(signal, 15);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn multiple_messages_on_stream() {
+        let mut buf = Vec::new();
+
+        let req1 = ShimRequest::StartContainer { id: "a".into() };
+        let req2 = ShimRequest::GetState { id: "b".into() };
+
+        encode_to(&mut buf, &req1).unwrap();
+        encode_to(&mut buf, &req2).unwrap();
+
+        let mut cursor = &buf[..];
+        let d1: ShimRequest = decode_from(&mut cursor).unwrap();
+        let d2: ShimRequest = decode_from(&mut cursor).unwrap();
+
+        match d1 {
+            ShimRequest::StartContainer { id } => assert_eq!(id, "a"),
+            _ => panic!("wrong variant"),
+        }
+        match d2 {
+            ShimRequest::GetState { id } => assert_eq!(id, "b"),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn truncated_message_returns_error() {
+        let req = ShimRequest::Shutdown;
+        let encoded = encode(&req).unwrap();
+
+        // Only give it part of the message.
+        let truncated = &encoded[..encoded.len() - 1];
+        let result = decode_from::<ShimRequest>(&mut &truncated[..]);
+        assert!(result.is_err());
+    }
 }
