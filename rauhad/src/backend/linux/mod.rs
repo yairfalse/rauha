@@ -12,19 +12,62 @@ mod namespace;
 mod network;
 
 use std::collections::HashMap;
+use std::io::{Read, Write};
+use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
+use std::process::Command;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Mutex;
+use std::time::Duration;
 
 use rauha_common::backend::IsolationBackend;
 use rauha_common::container::{ContainerHandle, ContainerSpec};
 use rauha_common::error::{RauhaError, Result};
+use rauha_common::shim::{self, ShimRequest, ShimResponse};
 use rauha_common::zone::*;
 use uuid::Uuid;
 
 use self::cgroup::CgroupManager;
 use self::ebpf::EbpfManager;
 use self::maps::MapManager;
+
+/// Connection to a zone's shim process via Unix socket.
+struct ShimConnection {
+    socket_path: PathBuf,
+}
+
+impl ShimConnection {
+    fn new(socket_path: PathBuf) -> Self {
+        Self { socket_path }
+    }
+
+    /// Send a request to the shim and receive a response.
+    fn send_request(&self, request: &ShimRequest) -> Result<ShimResponse> {
+        let mut stream = UnixStream::connect(&self.socket_path).map_err(|e| {
+            RauhaError::ShimError {
+                zone: self.socket_path.display().to_string(),
+                message: format!("failed to connect to shim: {e}"),
+            }
+        })?;
+
+        stream
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .ok();
+        stream
+            .set_write_timeout(Some(Duration::from_secs(10)))
+            .ok();
+
+        shim::encode_to(&mut stream, request).map_err(|e| RauhaError::ShimError {
+            zone: self.socket_path.display().to_string(),
+            message: format!("failed to send request: {e}"),
+        })?;
+
+        shim::decode_from::<ShimResponse>(&mut stream).map_err(|e| RauhaError::ShimError {
+            zone: self.socket_path.display().to_string(),
+            message: format!("failed to read response: {e}"),
+        })
+    }
+}
 
 /// Linux isolation backend using eBPF LSM + namespaces + cgroups.
 pub struct LinuxBackend {
@@ -39,6 +82,8 @@ pub struct LinuxBackend {
     zone_id_map: Mutex<HashMap<Uuid, u32>>,
     /// Maps zone name → Uuid for reverse lookups.
     zone_name_map: Mutex<HashMap<String, Uuid>>,
+    /// Shim connections per zone.
+    shim_connections: Mutex<HashMap<String, ShimConnection>>,
 }
 
 impl LinuxBackend {
@@ -70,6 +115,7 @@ impl LinuxBackend {
             next_zone_id: AtomicU32::new(1), // 0 is reserved for "no zone".
             zone_id_map: Mutex::new(HashMap::new()),
             zone_name_map: Mutex::new(HashMap::new()),
+            shim_connections: Mutex::new(HashMap::new()),
         })
     }
 
@@ -117,6 +163,121 @@ impl LinuxBackend {
     fn remove_zone_id(&self, uuid: &Uuid) -> Option<u32> {
         self.zone_id_map.lock().unwrap().remove(uuid)
     }
+
+    /// Get the socket path for a zone's shim.
+    fn shim_socket_path(zone_name: &str) -> PathBuf {
+        PathBuf::from(format!("/run/rauha/shim-{zone_name}.sock"))
+    }
+
+    /// Ensure a shim process is running for a zone, spawning one if needed.
+    fn ensure_shim(&self, zone_name: &str) -> Result<()> {
+        let socket_path = Self::shim_socket_path(zone_name);
+
+        // Check if shim is already connected and responsive.
+        {
+            let conns = self.shim_connections.lock().unwrap();
+            if let Some(conn) = conns.get(zone_name) {
+                // Try a quick health check.
+                if conn
+                    .send_request(&ShimRequest::GetState {
+                        id: "__ping__".into(),
+                    })
+                    .is_ok()
+                {
+                    return Ok(());
+                }
+            }
+        }
+
+        // If socket exists but shim is dead, remove the stale socket.
+        if socket_path.exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+
+        // Spawn shim process.
+        let rootfs_root = PathBuf::from(&self.root).join("zones").join(zone_name);
+        std::fs::create_dir_all(&rootfs_root).map_err(|e| RauhaError::ShimError {
+            zone: zone_name.into(),
+            message: format!("failed to create zone dir: {e}"),
+        })?;
+
+        // Ensure /run/rauha exists.
+        std::fs::create_dir_all("/run/rauha").ok();
+
+        let shim_bin = find_shim_binary()?;
+
+        Command::new(&shim_bin)
+            .arg("--zone-name")
+            .arg(zone_name)
+            .arg("--socket")
+            .arg(&socket_path)
+            .arg("--rootfs-root")
+            .arg(&rootfs_root)
+            .spawn()
+            .map_err(|e| RauhaError::ShimError {
+                zone: zone_name.into(),
+                message: format!("failed to spawn shim: {e}"),
+            })?;
+
+        // Wait for socket to appear.
+        for _ in 0..50 {
+            if socket_path.exists() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+
+        if !socket_path.exists() {
+            return Err(RauhaError::ShimError {
+                zone: zone_name.into(),
+                message: "shim socket did not appear after spawn".into(),
+            });
+        }
+
+        // Register connection.
+        let conn = ShimConnection::new(socket_path);
+        self.shim_connections
+            .lock()
+            .unwrap()
+            .insert(zone_name.to_string(), conn);
+
+        tracing::info!(zone = zone_name, "shim spawned");
+        Ok(())
+    }
+
+    /// Send a request to a zone's shim.
+    fn shim_request(&self, zone_name: &str, request: &ShimRequest) -> Result<ShimResponse> {
+        let conns = self.shim_connections.lock().unwrap();
+        let conn = conns.get(zone_name).ok_or_else(|| RauhaError::ShimError {
+            zone: zone_name.into(),
+            message: "no shim connection".into(),
+        })?;
+        conn.send_request(request)
+    }
+}
+
+/// Find the rauha-shim binary.
+fn find_shim_binary() -> Result<PathBuf> {
+    let candidates = [
+        // Same directory as the running binary.
+        std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.join("rauha-shim"))),
+        // System path.
+        Some(PathBuf::from("/usr/local/bin/rauha-shim")),
+        Some(PathBuf::from("/usr/bin/rauha-shim")),
+    ];
+
+    for candidate in candidates.iter().flatten() {
+        if candidate.exists() {
+            return Ok(candidate.clone());
+        }
+    }
+
+    Err(RauhaError::ShimError {
+        zone: String::new(),
+        message: "rauha-shim binary not found".into(),
+    })
 }
 
 impl IsolationBackend for LinuxBackend {
@@ -274,6 +435,14 @@ impl IsolationBackend for LinuxBackend {
     fn destroy_zone(&self, zone: &ZoneHandle) -> Result<()> {
         tracing::info!(zone = zone.name, "destroying zone");
 
+        // Shut down shim if running.
+        {
+            let mut conns = self.shim_connections.lock().unwrap();
+            if let Some(conn) = conns.remove(&zone.name) {
+                let _ = conn.send_request(&ShimRequest::Shutdown);
+            }
+        }
+
         // Remove from BPF maps first.
         let zone_id = self.remove_zone_id(&zone.id);
         if let (Some(zone_id), Ok(ref mut ebpf_guard)) = (zone_id, self.ebpf.lock()) {
@@ -292,6 +461,10 @@ impl IsolationBackend for LinuxBackend {
         self.cgroup.destroy_zone_cgroup(&zone.name)?;
 
         self.zone_name_map.lock().unwrap().remove(&zone.name);
+
+        // Clean up shim socket.
+        let socket_path = Self::shim_socket_path(&zone.name);
+        let _ = std::fs::remove_file(&socket_path);
 
         tracing::info!(zone = zone.name, "zone destroyed");
         Ok(())
@@ -339,25 +512,168 @@ impl IsolationBackend for LinuxBackend {
             container = spec.name,
             "creating container"
         );
-        // TODO Phase 3: Fork into zone's namespaces, set up rootfs, exec.
-        Ok(ContainerHandle {
-            id: Uuid::new_v4(),
-            zone_id: zone.id,
-            pid: 0,
-            platform_id: 0,
-        })
+
+        // Ensure shim is running for this zone.
+        self.ensure_shim(&zone.name)?;
+
+        let container_id = Uuid::new_v4();
+
+        // Prepare rootfs for this container.
+        let rootfs_dir = PathBuf::from(&self.root)
+            .join("zones")
+            .join(&zone.name)
+            .join("containers")
+            .join(container_id.to_string())
+            .join("rootfs");
+        std::fs::create_dir_all(&rootfs_dir).map_err(|e| RauhaError::RootfsError {
+            message: format!("failed to create rootfs dir: {e}"),
+        })?;
+
+        // Generate OCI runtime spec (will be populated with image config by the caller).
+        // For now, create a minimal spec with the container's command.
+        let spec_json = serde_json::to_string(
+            &oci_spec::runtime::SpecBuilder::default()
+                .version("1.0.2")
+                .root(
+                    oci_spec::runtime::RootBuilder::default()
+                        .path(rootfs_dir.to_string_lossy().as_ref())
+                        .readonly(false)
+                        .build()
+                        .unwrap(),
+                )
+                .process(
+                    oci_spec::runtime::ProcessBuilder::default()
+                        .args(if spec.command.is_empty() {
+                            vec!["/bin/sh".to_string()]
+                        } else {
+                            spec.command.clone()
+                        })
+                        .env(
+                            spec.env
+                                .iter()
+                                .map(|(k, v)| format!("{k}={v}"))
+                                .chain(std::iter::once(
+                                    "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".into(),
+                                ))
+                                .collect::<Vec<_>>(),
+                        )
+                        .cwd(spec.working_dir.as_deref().unwrap_or("/"))
+                        .terminal(false)
+                        .build()
+                        .unwrap(),
+                )
+                .hostname(spec.name.clone())
+                .build()
+                .unwrap(),
+        )
+        .map_err(|e| RauhaError::BackendError(format!("failed to serialize spec: {e}")))?;
+
+        // Send CreateContainer to shim.
+        let response = self.shim_request(
+            &zone.name,
+            &ShimRequest::CreateContainer {
+                id: container_id.to_string(),
+                spec_json,
+            },
+        )?;
+
+        match response {
+            ShimResponse::Created { pid } | ShimResponse::Ok => Ok(ContainerHandle {
+                id: container_id,
+                zone_id: zone.id,
+                pid: match response {
+                    ShimResponse::Created { pid } => pid,
+                    _ => 0,
+                },
+                platform_id: 0,
+            }),
+            ShimResponse::Error { message } => Err(RauhaError::ShimError {
+                zone: zone.name.clone(),
+                message,
+            }),
+            _ => Err(RauhaError::ShimError {
+                zone: zone.name.clone(),
+                message: "unexpected shim response".into(),
+            }),
+        }
     }
 
     fn start_container(&self, container: &ContainerHandle) -> Result<()> {
         tracing::info!(container = %container.id, "starting container");
-        // TODO Phase 3.
-        Ok(())
+
+        // Look up zone name for this container.
+        let zone_name = self
+            .zone_name_map
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(_, uuid)| **uuid == container.zone_id)
+            .map(|(name, _)| name.clone())
+            .ok_or_else(|| RauhaError::ShimError {
+                zone: container.zone_id.to_string(),
+                message: "zone not found for container".into(),
+            })?;
+
+        let response = self.shim_request(
+            &zone_name,
+            &ShimRequest::StartContainer {
+                id: container.id.to_string(),
+            },
+        )?;
+
+        match response {
+            ShimResponse::Created { .. } | ShimResponse::Ok => Ok(()),
+            ShimResponse::Error { message } => Err(RauhaError::ContainerExecError {
+                container: container.id.to_string(),
+                message,
+            }),
+            _ => Err(RauhaError::ShimError {
+                zone: zone_name,
+                message: "unexpected shim response".into(),
+            }),
+        }
     }
 
     fn stop_container(&self, container: &ContainerHandle) -> Result<()> {
         tracing::info!(container = %container.id, "stopping container");
-        // TODO Phase 3.
-        Ok(())
+
+        let zone_name = self
+            .zone_name_map
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(_, uuid)| **uuid == container.zone_id)
+            .map(|(name, _)| name.clone())
+            .ok_or_else(|| RauhaError::ShimError {
+                zone: container.zone_id.to_string(),
+                message: "zone not found for container".into(),
+            })?;
+
+        // Send SIGTERM first.
+        let response = self.shim_request(
+            &zone_name,
+            &ShimRequest::StopContainer {
+                id: container.id.to_string(),
+                signal: 15, // SIGTERM
+            },
+        )?;
+
+        match response {
+            ShimResponse::Ok => Ok(()),
+            ShimResponse::Error { message } => {
+                tracing::warn!(container = %container.id, %message, "SIGTERM failed, trying SIGKILL");
+                // Try SIGKILL as fallback.
+                let _ = self.shim_request(
+                    &zone_name,
+                    &ShimRequest::Signal {
+                        id: container.id.to_string(),
+                        signal: 9, // SIGKILL
+                    },
+                );
+                Ok(())
+            }
+            _ => Ok(()),
+        }
     }
 
     fn zone_stats(&self, zone: &ZoneHandle) -> Result<ZoneStats> {

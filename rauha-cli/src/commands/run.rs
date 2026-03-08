@@ -100,6 +100,15 @@ pub async fn handle_ps(args: PsArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[derive(Args)]
+pub struct DeleteArgs {
+    /// Container ID
+    pub container_id: String,
+    /// Force stop if running
+    #[arg(long)]
+    pub force: bool,
+}
+
 pub async fn handle_stop(args: StopArgs) -> anyhow::Result<()> {
     let channel = super::connect().await?;
     let mut client = ContainerServiceClient::new(channel);
@@ -112,5 +121,20 @@ pub async fn handle_stop(args: StopArgs) -> anyhow::Result<()> {
         .await?;
 
     println!("Stopped: {}", args.container_id);
+    Ok(())
+}
+
+pub async fn handle_delete(args: DeleteArgs) -> anyhow::Result<()> {
+    let channel = super::connect().await?;
+    let mut client = ContainerServiceClient::new(channel);
+
+    client
+        .delete_container(pb::container::DeleteContainerRequest {
+            container_id: args.container_id.clone(),
+            force: args.force,
+        })
+        .await?;
+
+    println!("Deleted: {}", args.container_id);
     Ok(())
 }

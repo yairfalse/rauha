@@ -22,6 +22,8 @@ enum Commands {
     Ps(commands::run::PsArgs),
     /// Stop a container
     Stop(commands::run::StopArgs),
+    /// Delete a container
+    Delete(commands::run::DeleteArgs),
     /// Manage images
     #[command(subcommand)]
     Image(commands::image::ImageAction),
@@ -54,6 +56,7 @@ async fn main() -> anyhow::Result<()> {
         Commands::Run(args) => commands::run::handle_run(args).await?,
         Commands::Ps(args) => commands::run::handle_ps(args).await?,
         Commands::Stop(args) => commands::run::handle_stop(args).await?,
+        Commands::Delete(args) => commands::run::handle_delete(args).await?,
         Commands::Image(action) => commands::image::handle(action).await?,
         Commands::Policy { action } => commands::policy::handle(action).await?,
         Commands::Trace(args) => commands::trace::handle_trace(args).await?,

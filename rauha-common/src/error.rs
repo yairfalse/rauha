@@ -64,6 +64,21 @@ pub enum RauhaError {
         hint: String,
     },
 
+    #[error("image pull error: {reference}: {message}")]
+    ImagePullError { reference: String, message: String },
+
+    #[error("content store error: {message}")]
+    ContentError { message: String },
+
+    #[error("shim error for zone {zone}: {message}")]
+    ShimError { zone: String, message: String },
+
+    #[error("rootfs error: {message}")]
+    RootfsError { message: String },
+
+    #[error("container exec error for {container}: {message}")]
+    ContainerExecError { container: String, message: String },
+
     #[error("kernel too old: requires {required}, found {found}")]
     KernelTooOld {
         required: String,

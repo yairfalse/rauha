@@ -1,6 +1,6 @@
 use chrono::Utc;
 use rauha_common::backend::IsolationBackend;
-use rauha_common::container::{Container, ContainerSpec, ContainerState};
+use rauha_common::container::{Container, ContainerHandle, ContainerSpec, ContainerState};
 use rauha_common::error::{RauhaError, Result};
 use rauha_common::zone::*;
 use std::collections::HashMap;
@@ -20,6 +20,8 @@ pub struct ZoneRegistry {
     backend: Arc<dyn IsolationBackend>,
     /// In-memory cache of zone handles for fast backend operations.
     handles: RwLock<HashMap<String, ZoneHandle>>,
+    /// In-memory cache of container handles (needed for start/stop operations).
+    container_handles: RwLock<HashMap<Uuid, ContainerHandle>>,
 }
 
 impl ZoneRegistry {
@@ -28,6 +30,7 @@ impl ZoneRegistry {
             metadata,
             backend,
             handles: RwLock::new(HashMap::new()),
+            container_handles: RwLock::new(HashMap::new()),
         }
     }
 
@@ -134,6 +137,12 @@ impl ZoneRegistry {
         // Clean up containers if force.
         if force {
             for container in &containers {
+                // Stop running containers.
+                if container.state == ContainerState::Running {
+                    if let Some(handle) = self.container_handles.write().await.remove(&container.id) {
+                        let _ = self.backend.stop_container(&handle);
+                    }
+                }
                 self.metadata.delete_container(&container.id)?;
             }
         }
@@ -205,8 +214,101 @@ impl ZoneRegistry {
         };
 
         self.metadata.put_container(&container)?;
+
+        // Cache container handle for start/stop operations.
+        self.container_handles
+            .write()
+            .await
+            .insert(container_handle.id, container_handle);
+
         tracing::info!(container = %container.id, zone = zone_name, "container created");
         Ok(container)
+    }
+
+    /// Start a previously created container.
+    pub async fn start_container(&self, container_id: &Uuid) -> Result<()> {
+        let container = self
+            .metadata
+            .get_container(container_id)?
+            .ok_or_else(|| RauhaError::ContainerNotFound(*container_id))?;
+
+        let container_handle = self
+            .container_handles
+            .read()
+            .await
+            .get(container_id)
+            .cloned()
+            .ok_or_else(|| RauhaError::ContainerNotFound(*container_id))?;
+
+        self.backend.start_container(&container_handle)?;
+
+        // Update metadata.
+        let mut updated = container;
+        updated.state = ContainerState::Running;
+        updated.started_at = Some(Utc::now());
+        self.metadata.put_container(&updated)?;
+
+        tracing::info!(container = %container_id, "container started");
+        Ok(())
+    }
+
+    /// Stop a running container.
+    pub async fn stop_container(&self, container_id: &Uuid, _timeout: u32) -> Result<()> {
+        let container = self
+            .metadata
+            .get_container(container_id)?
+            .ok_or_else(|| RauhaError::ContainerNotFound(*container_id))?;
+
+        let container_handle = self
+            .container_handles
+            .read()
+            .await
+            .get(container_id)
+            .cloned()
+            .ok_or_else(|| RauhaError::ContainerNotFound(*container_id))?;
+
+        self.backend.stop_container(&container_handle)?;
+
+        // Update metadata.
+        let mut updated = container;
+        updated.state = ContainerState::Stopped;
+        updated.finished_at = Some(Utc::now());
+        self.metadata.put_container(&updated)?;
+
+        tracing::info!(container = %container_id, "container stopped");
+        Ok(())
+    }
+
+    /// Delete a container, stopping it first if needed.
+    pub async fn delete_container(&self, container_id: &Uuid, force: bool) -> Result<()> {
+        let container = self
+            .metadata
+            .get_container(container_id)?
+            .ok_or_else(|| RauhaError::ContainerNotFound(*container_id))?;
+
+        if container.state == ContainerState::Running {
+            if force {
+                self.stop_container(container_id, 10).await?;
+            } else {
+                return Err(RauhaError::BackendError(format!(
+                    "container {} is running, use force to stop it first",
+                    container_id
+                )));
+            }
+        }
+
+        self.container_handles.write().await.remove(container_id);
+        self.metadata.delete_container(container_id)?;
+
+        tracing::info!(container = %container_id, "container deleted");
+        Ok(())
+    }
+
+    /// Get a container by ID.
+    pub fn get_container(&self, container_id: &Uuid) -> Result<Container> {
+        self.metadata
+            .get_container(container_id)?
+            .ok_or_else(|| RauhaError::ContainerNotFound(*container_id))
     }
 
     pub fn list_containers(&self, zone_name: Option<&str>) -> Result<Vec<Container>> {

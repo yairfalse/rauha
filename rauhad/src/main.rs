@@ -11,6 +11,7 @@ use tracing_subscriber::EnvFilter;
 
 use server::pb::zone::zone_service_server::ZoneServiceServer;
 use server::pb::container::container_service_server::ContainerServiceServer;
+use server::pb::image::image_service_server::ImageServiceServer;
 
 const DEFAULT_ROOT: &str = if cfg!(target_os = "macos") {
     // ~/Library/Application Support/Rauha
@@ -46,6 +47,16 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!(backend = backend.name(), "isolation backend initialized");
 
+    // Create image service.
+    let content_store = Arc::new(
+        rauha_oci::content::ContentStore::new(&root_path.join("content"))
+            .expect("failed to initialize content store"),
+    );
+    let image_service = Arc::new(rauha_oci::image::ImageService::new(
+        content_store,
+        root_path.clone(),
+    ));
+
     // Create zone registry.
     let registry = Arc::new(zone::registry::ZoneRegistry::new(
         metadata.clone(),
@@ -60,6 +71,7 @@ async fn main() -> anyhow::Result<()> {
     // Set up gRPC services.
     let zone_svc = server::ZoneServiceImpl::new(registry.clone(), root.clone());
     let container_svc = server::ContainerServiceImpl::new(registry.clone());
+    let image_svc = server::ImageServiceImpl::new(image_service);
 
     // Determine socket path.
     let socket_path = if cfg!(target_os = "macos") {
@@ -76,6 +88,7 @@ async fn main() -> anyhow::Result<()> {
     Server::builder()
         .add_service(ZoneServiceServer::new(zone_svc))
         .add_service(ContainerServiceServer::new(container_svc))
+        .add_service(ImageServiceServer::new(image_svc))
         .serve(addr)
         .await?;
 

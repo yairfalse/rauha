@@ -19,6 +19,7 @@ pub mod pb {
 
 use pb::zone::zone_service_server::ZoneService;
 use pb::container::container_service_server::ContainerService;
+use pb::image::image_service_server::ImageService;
 
 // --- Zone Service ---
 
@@ -282,31 +283,89 @@ impl ContainerService for ContainerServiceImpl {
 
     async fn start_container(
         &self,
-        _request: Request<pb::container::StartContainerRequest>,
+        request: Request<pb::container::StartContainerRequest>,
     ) -> Result<Response<pb::container::StartContainerResponse>, Status> {
-        // TODO: Look up container handle and delegate to backend.
+        let req = request.into_inner();
+        let container_id = req
+            .container_id
+            .parse::<uuid::Uuid>()
+            .map_err(|e| Status::invalid_argument(format!("invalid container ID: {e}")))?;
+
+        self.registry
+            .start_container(&container_id)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+
         Ok(Response::new(pb::container::StartContainerResponse {}))
     }
 
     async fn stop_container(
         &self,
-        _request: Request<pb::container::StopContainerRequest>,
+        request: Request<pb::container::StopContainerRequest>,
     ) -> Result<Response<pb::container::StopContainerResponse>, Status> {
+        let req = request.into_inner();
+        let container_id = req
+            .container_id
+            .parse::<uuid::Uuid>()
+            .map_err(|e| Status::invalid_argument(format!("invalid container ID: {e}")))?;
+
+        self.registry
+            .stop_container(&container_id, req.timeout_seconds)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+
         Ok(Response::new(pb::container::StopContainerResponse {}))
     }
 
     async fn delete_container(
         &self,
-        _request: Request<pb::container::DeleteContainerRequest>,
+        request: Request<pb::container::DeleteContainerRequest>,
     ) -> Result<Response<pb::container::DeleteContainerResponse>, Status> {
+        let req = request.into_inner();
+        let container_id = req
+            .container_id
+            .parse::<uuid::Uuid>()
+            .map_err(|e| Status::invalid_argument(format!("invalid container ID: {e}")))?;
+
+        self.registry
+            .delete_container(&container_id, req.force)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+
         Ok(Response::new(pb::container::DeleteContainerResponse {}))
     }
 
     async fn get_container(
         &self,
-        _request: Request<pb::container::GetContainerRequest>,
+        request: Request<pb::container::GetContainerRequest>,
     ) -> Result<Response<pb::container::GetContainerResponse>, Status> {
-        Err(Status::unimplemented("not yet implemented"))
+        let req = request.into_inner();
+        let container_id = req
+            .container_id
+            .parse::<uuid::Uuid>()
+            .map_err(|e| Status::invalid_argument(format!("invalid container ID: {e}")))?;
+
+        let container = self
+            .registry
+            .get_container(&container_id)
+            .map_err(|e| Status::not_found(e.to_string()))?;
+
+        Ok(Response::new(pb::container::GetContainerResponse {
+            container: Some(pb::container::ContainerInfo {
+                id: container.id.to_string(),
+                name: container.name,
+                zone_id: container.zone_id.to_string(),
+                zone_name: String::new(), // TODO: reverse lookup
+                image: container.image,
+                state: format!("{:?}", container.state),
+                pid: container.pid.unwrap_or(0),
+                created_at: container.created_at.to_rfc3339(),
+                started_at: container
+                    .started_at
+                    .map(|t| t.to_rfc3339())
+                    .unwrap_or_default(),
+            }),
+        }))
     }
 
     async fn list_containers(
@@ -349,6 +408,114 @@ impl ContainerService for ContainerServiceImpl {
         &self,
         _request: Request<pb::container::ExecInContainerRequest>,
     ) -> Result<Response<pb::container::ExecInContainerResponse>, Status> {
-        Err(Status::unimplemented("not yet implemented"))
+        Err(Status::unimplemented(
+            "exec_in_container is planned for Phase 4",
+        ))
+    }
+}
+
+// --- Image Service ---
+
+pub struct ImageServiceImpl {
+    image_service: Arc<rauha_oci::image::ImageService>,
+}
+
+impl ImageServiceImpl {
+    pub fn new(image_service: Arc<rauha_oci::image::ImageService>) -> Self {
+        Self { image_service }
+    }
+}
+
+#[tonic::async_trait]
+impl ImageService for ImageServiceImpl {
+    type PullStream = ReceiverStream<Result<pb::image::PullProgress, Status>>;
+
+    async fn pull(
+        &self,
+        request: Request<pb::image::PullRequest>,
+    ) -> Result<Response<Self::PullStream>, Status> {
+        let req = request.into_inner();
+        let (tx, rx) = mpsc::channel(64);
+        let svc = self.image_service.clone();
+
+        tokio::spawn(async move {
+            let reference = req.reference;
+            let tx_clone = tx.clone();
+
+            let result = svc
+                .pull(&reference, |progress| {
+                    let _ = tx_clone.try_send(Ok(pb::image::PullProgress {
+                        status: progress.status,
+                        layer: progress.layer,
+                        current: progress.current,
+                        total: progress.total,
+                        done: progress.done,
+                    }));
+                })
+                .await;
+
+            if let Err(e) = result {
+                let _ = tx.send(Err(Status::internal(e.to_string()))).await;
+            }
+        });
+
+        Ok(Response::new(ReceiverStream::new(rx)))
+    }
+
+    async fn list(
+        &self,
+        _request: Request<pb::image::ListImagesRequest>,
+    ) -> Result<Response<pb::image::ListImagesResponse>, Status> {
+        let images = self
+            .image_service
+            .list_images()
+            .map_err(|e| Status::internal(e.to_string()))?;
+
+        let infos = images
+            .into_iter()
+            .map(|img| pb::image::ImageInfo {
+                digest: img.digest,
+                tags: vec![img.reference],
+                size: img.size,
+                created_at: String::new(),
+            })
+            .collect();
+
+        Ok(Response::new(pb::image::ListImagesResponse {
+            images: infos,
+        }))
+    }
+
+    async fn remove(
+        &self,
+        request: Request<pb::image::RemoveImageRequest>,
+    ) -> Result<Response<pb::image::RemoveImageResponse>, Status> {
+        let req = request.into_inner();
+        self.image_service
+            .remove_image(&req.reference)
+            .map_err(|e| Status::internal(e.to_string()))?;
+        Ok(Response::new(pb::image::RemoveImageResponse {}))
+    }
+
+    async fn inspect(
+        &self,
+        request: Request<pb::image::InspectImageRequest>,
+    ) -> Result<Response<pb::image::InspectImageResponse>, Status> {
+        let req = request.into_inner();
+        let config = self
+            .image_service
+            .inspect(&req.reference)
+            .map_err(|e| Status::not_found(e.to_string()))?;
+
+        let config_json =
+            serde_json::to_string_pretty(&config).unwrap_or_else(|_| "{}".into());
+
+        Ok(Response::new(pb::image::InspectImageResponse {
+            digest: String::new(),
+            tags: vec![req.reference],
+            size: 0,
+            config_json,
+            layers: Vec::new(),
+        }))
     }
 }
