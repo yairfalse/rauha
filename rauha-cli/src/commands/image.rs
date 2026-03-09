@@ -36,20 +36,40 @@ pub async fn handle(action: ImageAction) -> anyhow::Result<()> {
                 .await?
                 .into_inner();
 
+            use std::io::Write;
             use tokio_stream::StreamExt;
+            let mut last_status = String::new();
             while let Some(progress) = stream.next().await {
                 match progress {
                     Ok(p) => {
                         if p.done {
+                            // Clear the progress line, then print completion.
+                            if !last_status.is_empty() {
+                                print!("\r{}\r", " ".repeat(60));
+                            }
                             println!("Pull complete: {reference}");
                         } else if p.total > 0 {
                             let pct = (p.current as f64 / p.total as f64 * 100.0) as u32;
-                            println!("  {} {} ({pct}%)", p.status, p.layer);
+                            let size_mb = p.total as f64 / 1_048_576.0;
+                            let msg = format!(
+                                "  {} {:.1}MB {pct}%",
+                                p.status, size_mb,
+                            );
+                            // Overwrite in place with carriage return.
+                            print!("\r{msg:<60}");
+                            let _ = std::io::stdout().flush();
+                            last_status = msg;
                         } else {
+                            if !last_status.is_empty() {
+                                print!("\r{}\r", " ".repeat(60));
+                                let _ = std::io::stdout().flush();
+                            }
                             println!("  {}", p.status);
+                            last_status.clear();
                         }
                     }
                     Err(e) => {
+                        println!();
                         eprintln!("Pull error: {e}");
                         return Err(e.into());
                     }

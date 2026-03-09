@@ -112,19 +112,31 @@ impl ImageService {
             });
 
             let status_prefix = format!("pulling layer {layer_num}");
+            let manifest_size = layer.size;
+            let mut last_reported_pct: i64 = -1;
             self.client
                 .pull_blob(
                     &reference.registry,
                     &reference.repository,
                     &layer_digest,
                     |current, total| {
-                        on_progress(PullProgress {
-                            status: status_prefix.clone(),
-                            layer: layer_digest.to_string(),
-                            current,
-                            total,
-                            done: false,
-                        });
+                        // Use manifest-declared size when CDN strips Content-Length.
+                        let effective_total = if total > 0 { total } else { manifest_size };
+                        if effective_total == 0 {
+                            return;
+                        }
+                        let pct = (current * 100 / effective_total) as i64;
+                        // Throttle: report every 5% or at 100%.
+                        if pct >= last_reported_pct + 5 || (pct == 100 && last_reported_pct != 100) {
+                            last_reported_pct = pct;
+                            on_progress(PullProgress {
+                                status: status_prefix.clone(),
+                                layer: layer_digest.to_string(),
+                                current,
+                                total: effective_total,
+                                done: false,
+                            });
+                        }
                     },
                 )
                 .await?;

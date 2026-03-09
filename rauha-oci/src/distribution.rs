@@ -16,6 +16,32 @@ pub struct OciManifest {
     pub layers: Vec<OciDescriptor>,
 }
 
+/// OCI Image Index (manifest list) — multi-arch wrapper pointing to
+/// platform-specific manifests.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OciIndex {
+    #[allow(dead_code)]
+    pub schema_version: u32,
+    pub manifests: Vec<OciPlatformManifest>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OciPlatformManifest {
+    pub media_type: String,
+    pub digest: String,
+    #[allow(dead_code)]
+    pub size: u64,
+    pub platform: Option<OciPlatform>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct OciPlatform {
+    pub architecture: String,
+    pub os: String,
+}
+
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OciDescriptor {
@@ -66,6 +92,9 @@ impl DistributionClient {
     }
 
     /// Pull and store a manifest, returning the parsed manifest.
+    ///
+    /// Handles OCI Image Index (manifest list) by selecting the platform
+    /// manifest matching the current architecture, then fetching it by digest.
     pub async fn pull_manifest(
         &self,
         reference: &ImageReference,
@@ -75,9 +104,78 @@ impl DistributionClient {
             reference.registry, reference.repository, reference.tag
         );
 
+        let accept = &[
+            "application/vnd.oci.image.manifest.v1+json",
+            "application/vnd.docker.distribution.manifest.v2+json",
+            "application/vnd.oci.image.index.v1+json",
+            "application/vnd.docker.distribution.manifest.list.v2+json",
+        ];
+
         let body = self
             .authenticated_get(
                 &url,
+                &reference.registry,
+                &reference.repository,
+                accept,
+            )
+            .await?;
+
+        let canonical = reference.to_string_canonical();
+
+        // Try parsing as a single manifest first.
+        if let Ok(manifest) = serde_json::from_slice::<OciManifest>(&body) {
+            self.content
+                .put_manifest(&canonical, &body)
+                .map_err(|e| RauhaError::ContentError {
+                    message: format!("failed to store manifest: {e}"),
+                })?;
+            return Ok(manifest);
+        }
+
+        // Try parsing as a manifest list / OCI index.
+        let index: OciIndex = serde_json::from_slice(&body).map_err(|e| {
+            RauhaError::ImagePullError {
+                reference: canonical.clone(),
+                message: format!("invalid manifest JSON (not a manifest or index): {e}"),
+            }
+        })?;
+
+        // Pick the platform manifest matching current OS/arch.
+        let (target_os, target_arch) = current_platform();
+        let platform_entry = index
+            .manifests
+            .iter()
+            .find(|m| {
+                m.platform
+                    .as_ref()
+                    .map(|p| p.os == target_os && p.architecture == target_arch)
+                    .unwrap_or(false)
+            })
+            .or_else(|| {
+                // Fallback: linux/amd64 is the most common default.
+                index.manifests.iter().find(|m| {
+                    m.platform
+                        .as_ref()
+                        .map(|p| p.os == "linux" && p.architecture == "amd64")
+                        .unwrap_or(false)
+                })
+            })
+            .ok_or_else(|| RauhaError::ImagePullError {
+                reference: canonical.clone(),
+                message: format!(
+                    "no manifest for platform {target_os}/{target_arch} in index"
+                ),
+            })?;
+
+        // Fetch the platform-specific manifest by digest.
+        let manifest_url = format!(
+            "https://{}/v2/{}/manifests/{}",
+            reference.registry, reference.repository, platform_entry.digest
+        );
+
+        let manifest_body = self
+            .authenticated_get(
+                &manifest_url,
                 &reference.registry,
                 &reference.repository,
                 &[
@@ -87,17 +185,15 @@ impl DistributionClient {
             )
             .await?;
 
-        // Store raw manifest in content store.
-        let canonical = reference.to_string_canonical();
         self.content
-            .put_manifest(&canonical, &body)
+            .put_manifest(&canonical, &manifest_body)
             .map_err(|e| RauhaError::ContentError {
                 message: format!("failed to store manifest: {e}"),
             })?;
 
-        serde_json::from_slice(&body).map_err(|e| RauhaError::ImagePullError {
+        serde_json::from_slice(&manifest_body).map_err(|e| RauhaError::ImagePullError {
             reference: canonical,
-            message: format!("invalid manifest JSON: {e}"),
+            message: format!("invalid platform manifest JSON: {e}"),
         })
     }
 
@@ -398,6 +494,28 @@ impl DistributionClient {
             .await
             .insert((registry.to_string(), scope.to_string()), token.to_string());
     }
+}
+
+/// Returns (os, architecture) matching OCI platform conventions.
+fn current_platform() -> (&'static str, &'static str) {
+    let os = if cfg!(target_os = "linux") {
+        "linux"
+    } else if cfg!(target_os = "macos") {
+        // OCI images are Linux; when pulling on macOS we want linux images.
+        "linux"
+    } else {
+        "linux"
+    };
+
+    let arch = if cfg!(target_arch = "x86_64") {
+        "amd64"
+    } else if cfg!(target_arch = "aarch64") {
+        "arm64"
+    } else {
+        "amd64"
+    };
+
+    (os, arch)
 }
 
 /// Extract a parameter from a Bearer challenge header.
