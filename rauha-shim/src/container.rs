@@ -20,7 +20,6 @@ pub fn fork_and_exec(
     use nix::unistd::{self, ForkResult};
     use oci_spec::runtime::Spec;
     use std::ffi::CString;
-    use std::io::{Read as _, Write as _};
     use std::os::fd::AsRawFd;
     use std::path::PathBuf;
 
