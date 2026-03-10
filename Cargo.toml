@@ -67,7 +67,7 @@ hex = "0.4"
 # Platform-specific (Linux)
 [workspace.dependencies.nix]
 version = "0.29"
-features = ["fs", "mount", "sched", "signal", "user", "net"]
+features = ["fs", "mount", "sched", "signal", "user", "net", "hostname"]
 
 # eBPF (Linux)
 [workspace.dependencies.aya]

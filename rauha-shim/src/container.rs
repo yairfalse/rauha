@@ -18,7 +18,11 @@ pub fn fork_and_exec(
     rootfs_root: &Path,
 ) -> anyhow::Result<u32> {
     use nix::unistd::{self, ForkResult};
+    use oci_spec::runtime::Spec;
     use std::ffi::CString;
+    use std::io::{Read as _, Write as _};
+    use std::os::fd::AsRawFd;
+    use std::path::PathBuf;
 
     let spec: Spec = serde_json::from_str(spec_json)?;
 
@@ -47,7 +51,7 @@ pub fn fork_and_exec(
     let log_dir = PathBuf::from("/run/rauha/containers").join(container_id);
     std::fs::create_dir_all(&log_dir)?;
 
-    // Create sync pipe.
+    // Create sync pipe. OwnedFd closes automatically on drop.
     let (pipe_rd, pipe_wr) = nix::unistd::pipe()?;
 
     // Prepare C strings before fork (allocation not async-signal-safe after fork).
@@ -62,30 +66,31 @@ pub fn fork_and_exec(
         .map(|vars| {
             vars.iter()
                 .map(|e| CString::new(e.as_str()).unwrap())
-                .collect()
+                .collect::<Vec<CString>>()
         })
         .unwrap_or_default();
 
-    let cwd = process
-        .cwd()
-        .as_ref()
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_else(|| "/".to_string());
-
+    let cwd = process.cwd().to_string_lossy().to_string();
     let cwd_cstr = CString::new(cwd.as_str())?;
 
     let hostname = spec.hostname().cloned();
 
+    // Convert OwnedFd to raw fds for use across fork.
+    // We manage lifetime manually after fork (child/parent each close their end).
+    let rd_raw = pipe_rd.as_raw_fd();
+    let wr_raw = pipe_wr.as_raw_fd();
+
     // Fork.
     match unsafe { unistd::fork() }? {
         ForkResult::Child => {
-            // Close write end of pipe.
-            let _ = nix::unistd::close(pipe_wr);
+            // Drop the write end (closes it).
+            drop(pipe_wr);
 
             // Block until parent confirms cgroup enrollment.
             let mut buf = [0u8; 1];
-            let _ = nix::unistd::read(pipe_rd, &mut buf);
-            let _ = nix::unistd::close(pipe_rd);
+            let _ = nix::unistd::read(rd_raw, &mut buf);
+            // Drop the read end.
+            drop(pipe_rd);
 
             // New session.
             let _ = nix::unistd::setsid();
@@ -125,8 +130,8 @@ pub fn fork_and_exec(
             std::process::exit(127);
         }
         ForkResult::Parent { child } => {
-            // Close read end.
-            let _ = nix::unistd::close(pipe_rd);
+            // Drop read end (closes it).
+            drop(pipe_rd);
 
             let child_pid = child.as_raw() as u32;
 
@@ -139,8 +144,9 @@ pub fn fork_and_exec(
             }
 
             // Signal child to proceed (unblock from sync pipe).
-            let _ = nix::unistd::write(pipe_wr, &[1u8]);
-            let _ = nix::unistd::close(pipe_wr);
+            let _ = nix::unistd::write(wr_raw, &[1u8]);
+            // Drop write end (closes it).
+            drop(pipe_wr);
 
             tracing::info!(pid = child_pid, container = container_id, "child forked");
             Ok(child_pid)
