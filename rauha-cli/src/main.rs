@@ -38,6 +38,8 @@ enum Commands {
     Top(commands::trace::TopArgs),
     /// Stream zone events
     Events(commands::trace::EventsArgs),
+    /// Set up macOS environment (VM assets, pf firewall, entitlements)
+    Setup(commands::setup::SetupArgs),
 }
 
 #[tokio::main]
@@ -62,6 +64,7 @@ async fn main() -> anyhow::Result<()> {
         Commands::Trace(args) => commands::trace::handle_trace(args).await?,
         Commands::Top(args) => commands::trace::handle_top(args).await?,
         Commands::Events(args) => commands::trace::handle_events(args).await?,
+        Commands::Setup(args) => commands::setup::handle(args).await?,
     }
 
     Ok(())

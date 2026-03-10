@@ -6,6 +6,7 @@ members = [
     "rauhad",
     "rauha-cli",
     "rauha-shim",
+    "rauha-guest-agent",
     "rauha-oci",
     "xtask",
 ]
@@ -74,6 +75,16 @@ features = ["fs", "mount", "sched", "signal", "user", "net", "hostname"]
 version = "0.13"
 [workspace.dependencies.aya-log]
 version = "0.2"
+
+# macOS Virtualization.framework bindings
+[workspace.dependencies.objc2]
+version = "0.6"
+[workspace.dependencies.block2]
+version = "0.6"
+[workspace.dependencies.objc2-virtualization]
+version = "0.3"
+[workspace.dependencies.objc2-foundation]
+version = "0.3"
 
 # Internal
 [workspace.dependencies.rauha-ebpf-common]

@@ -1,6 +1,7 @@
 pub mod image;
 pub mod policy;
 pub mod run;
+pub mod setup;
 pub mod trace;
 pub mod zone;
 

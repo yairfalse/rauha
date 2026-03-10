@@ -138,6 +138,16 @@ impl ShimState {
         }
     }
 
+    /// Return (running_pids_count, total_count) for stats.
+    pub fn container_summary(&self) -> (u32, u32) {
+        let running = self
+            .containers
+            .values()
+            .filter(|p| p.status == ContainerStatus::Running && p.pid > 0)
+            .count() as u32;
+        (running, self.containers.len() as u32)
+    }
+
     pub fn request_shutdown(&mut self) {
         self.shutdown = true;
     }

@@ -141,5 +141,13 @@ fn handle_request(state: &mut ShimState, request: ShimRequest) -> ShimResponse {
             state.request_shutdown();
             ShimResponse::Ok
         }
+        ShimRequest::GetStats => {
+            let (pids, _) = state.container_summary();
+            ShimResponse::Stats {
+                cpu_usage_ns: 0,    // TODO: read from cgroup
+                memory_bytes: 0,    // TODO: read from cgroup
+                pids,
+            }
+        }
     }
 }

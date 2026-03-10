@@ -26,19 +26,32 @@ is intercepted by eBPF programs that check zone membership in BPF maps.
 
 ### macOS: Hardware Boundary (Virtualization.framework)
 
-Each zone runs in a lightweight VM. The hypervisor boundary prevents
-cross-zone access structurally — no need to intercept individual syscalls.
+Each zone runs in a lightweight Linux VM using Apple's Virtualization.framework.
+The hypervisor boundary prevents cross-zone access structurally — no need to
+intercept individual syscalls. Communication between the host daemon (rauhad)
+and each VM happens over virtio-vsock using the same ShimRequest/ShimResponse
+protocol as the Linux shim.
+
+**Architecture:**
+- One VM per zone, containing a minimal Linux kernel + initramfs
+- Guest agent (rauha-guest-agent) inside each VM handles container lifecycle
+- Container rootfs shared from host via virtio-fs, cloned with APFS clonefile()
+- Network isolation via pf firewall anchors (one per zone)
 
 **Strengths:**
 - Hardware isolation — stronger guarantee than software policy
 - Simpler enforcement model — VM boundary is all-or-nothing
 - No kernel version fragmentation
+- Sub-second VM boot times with minimal kernel + initramfs (~15MB)
 
 **Weaknesses:**
 - Fewer observability hooks — `rauha trace` cannot show per-syscall events
   without DTrace integration (painful, limited on modern macOS)
 - Higher per-zone overhead (VM startup vs. cgroup creation)
 - Policy granularity limited to VM-level controls
+- VMs do not survive daemon restart — zones must be recovered on startup
+- CPU/memory limits set at VM boot time; changes require zone restart
+- Requires `com.apple.security.virtualization` entitlement on rauhad binary
 
 ### What This Means for Users
 
@@ -116,6 +129,20 @@ allowed, but do not verify the target is in the same zone. Full cross-zone
 ptrace/signal blocking requires:
 - CO-RE BTF for `task_struct->cgroups` traversal
 - Or a secondary BPF map keyed by pid→zone_id (requires tracking all pids)
+
+### VM Lifecycle and Daemon Restart (macOS)
+
+Unlike Linux cgroups and network namespaces which persist in the kernel,
+Virtualization.framework VMs die when rauhad exits. On daemon restart,
+`recover_zone` re-boots VMs for zones that should be active (based on
+persisted redb state). Container processes inside VMs are lost on
+daemon crash — there is no way to reattach to a VM that was destroyed.
+
+**Implications:**
+- Running containers are terminated on daemon crash/restart
+- Zone recovery involves a full VM reboot (sub-second with warm cache)
+- pf rules are re-applied from zone policy on recovery
+- Container rootfs data persists (on host APFS) across restarts
 
 ### Kernel Version Sensitivity (Linux)
 

@@ -29,6 +29,8 @@ pub enum ShimRequest {
         id: String,
     },
     Shutdown,
+    /// Request resource usage stats from all containers in this zone.
+    GetStats,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -37,6 +39,12 @@ pub enum ShimResponse {
     Created { pid: u32 },
     State { pid: u32, status: String },
     Error { message: String },
+    /// Zone-level resource usage statistics.
+    Stats {
+        cpu_usage_ns: u64,
+        memory_bytes: u64,
+        pids: u32,
+    },
 }
 
 /// Encode a message to the wire format: [u32 LE length][postcard bytes].
@@ -148,6 +156,7 @@ mod tests {
             },
             ShimRequest::GetState { id: "c1".into() },
             ShimRequest::Shutdown,
+            ShimRequest::GetStats,
         ];
 
         for req in cases {
@@ -167,6 +176,11 @@ mod tests {
             },
             ShimResponse::Error {
                 message: "something failed".into(),
+            },
+            ShimResponse::Stats {
+                cpu_usage_ns: 1_000_000,
+                memory_bytes: 64 * 1024 * 1024,
+                pids: 5,
             },
         ];
 
