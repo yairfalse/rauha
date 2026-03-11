@@ -213,6 +213,38 @@ impl ImageService {
         Ok(())
     }
 
+    /// Prepare a shared base rootfs for an image, returning the path.
+    ///
+    /// Idempotent: if the rootfs directory already exists and is non-empty,
+    /// returns immediately without re-extracting layers.
+    pub fn prepare_base_rootfs(&self, reference_str: &str) -> Result<PathBuf, RauhaError> {
+        let reference = ImageReference::parse(reference_str).map_err(|e| {
+            RauhaError::ImagePullError {
+                reference: reference_str.into(),
+                message: e,
+            }
+        })?;
+
+        let canonical = reference.to_string_canonical();
+        let safe_name = canonical.replace(['/', ':'], "_");
+        let rootfs_path = self.root.join("images").join(&safe_name).join("rootfs");
+
+        // Idempotency: skip extraction if rootfs already has content.
+        if rootfs_path.exists() {
+            if let Ok(mut entries) = std::fs::read_dir(&rootfs_path) {
+                if entries.next().is_some() {
+                    tracing::debug!(rootfs = %rootfs_path.display(), "base rootfs already prepared");
+                    return Ok(rootfs_path);
+                }
+            }
+        }
+
+        tracing::info!(image = %canonical, rootfs = %rootfs_path.display(), "preparing base rootfs");
+        self.prepare_rootfs(reference_str, &rootfs_path)?;
+
+        Ok(rootfs_path)
+    }
+
     /// Get the image config (CMD, ENV, WORKDIR, etc.) from a pulled image.
     pub fn inspect(&self, reference_str: &str) -> Result<OciImageConfig, RauhaError> {
         let canonical = {

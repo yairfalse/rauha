@@ -18,6 +18,7 @@ use crate::metadata::db::MetadataStore;
 pub struct ZoneRegistry {
     metadata: Arc<MetadataStore>,
     backend: Arc<dyn IsolationBackend>,
+    image_service: Arc<rauha_oci::image::ImageService>,
     /// In-memory cache of zone handles for fast backend operations.
     handles: RwLock<HashMap<String, ZoneHandle>>,
     /// In-memory cache of container handles (needed for start/stop operations).
@@ -25,10 +26,15 @@ pub struct ZoneRegistry {
 }
 
 impl ZoneRegistry {
-    pub fn new(metadata: Arc<MetadataStore>, backend: Arc<dyn IsolationBackend>) -> Self {
+    pub fn new(
+        metadata: Arc<MetadataStore>,
+        backend: Arc<dyn IsolationBackend>,
+        image_service: Arc<rauha_oci::image::ImageService>,
+    ) -> Self {
         Self {
             metadata,
             backend,
+            image_service,
             handles: RwLock::new(HashMap::new()),
             container_handles: RwLock::new(HashMap::new()),
         }
@@ -196,6 +202,13 @@ impl ZoneRegistry {
         let handle = handles
             .get(zone_name)
             .ok_or_else(|| RauhaError::ZoneNotFound(zone_name.into()))?;
+
+        // Prepare rootfs from image if one is specified.
+        let mut spec = spec;
+        if !spec.image.is_empty() {
+            let base = self.image_service.prepare_base_rootfs(&spec.image)?;
+            spec.rootfs_path = Some(base);
+        }
 
         let container_handle = self.backend.create_container(handle, &spec)?;
 

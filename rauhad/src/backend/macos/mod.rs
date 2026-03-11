@@ -161,13 +161,20 @@ impl IsolationBackend for MacosBackend {
         let container_id = Uuid::new_v4();
 
         // Clone rootfs for this container using APFS CoW.
-        let image_rootfs = self.root.join("images").join(&spec.image).join("rootfs");
         let container_rootfs = self
             .apfs_manager
             .container_rootfs(&zone.name, &container_id.to_string());
 
-        self.apfs_manager
-            .clone_rootfs(&image_rootfs, &container_rootfs)?;
+        if let Some(ref base_rootfs) = spec.rootfs_path {
+            self.apfs_manager
+                .clone_rootfs(base_rootfs, &container_rootfs)?;
+        } else {
+            std::fs::create_dir_all(&container_rootfs).map_err(|e| {
+                RauhaError::RootfsError {
+                    message: format!("failed to create container rootfs dir: {e}"),
+                }
+            })?;
+        }
 
         // Send CreateContainer to guest agent via vsock.
         let spec_json = self.build_spec_json(spec);
