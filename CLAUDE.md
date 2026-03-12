@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What This Is
 
-Rauha is an isolation-first container runtime. Zones are the core concept — a first-class isolation boundary that unifies cgroups, namespaces, and eBPF enforcement under one API. Linux uses eBPF LSM hooks for per-syscall enforcement; macOS will use Virtualization.framework VMs.
+Rauha is an isolation-first container runtime. Zones are the core concept — a first-class isolation boundary that unifies cgroups, namespaces, and eBPF enforcement under one API. Linux uses eBPF LSM hooks for per-syscall enforcement; macOS uses Virtualization.framework VMs.
 
 ## Build & Test Commands
 
@@ -16,6 +16,7 @@ cargo test test_name                 # Run a single test by name
 cargo build --bin rauhad             # Build just the daemon
 cargo build --bin rauha              # Build just the CLI
 cargo build --bin rauha-shim         # Build the per-zone shim
+cargo build --bin rauha-guest-agent  # Build the macOS VM guest agent
 
 # eBPF programs (separate build, requires nightly Rust)
 cargo xtask build-ebpf               # Debug build
@@ -65,6 +66,21 @@ This diverges from containerd's one-shim-per-container model. Zones are the isol
 
 The sync pipe pattern in `rauha-shim/src/container.rs` prevents a TOCTOU race: the child must be in the zone's cgroup **before** it runs, otherwise eBPF enforcement doesn't apply. Parent writes child PID to cgroup, then signals the pipe; child blocks until confirmed.
 
+### macOS Backend: VM-Per-Zone (`rauhad/src/backend/macos/`)
+
+On macOS, each zone is a lightweight Linux VM via Apple's Virtualization.framework. The VM itself is the isolation boundary — no cgroups or namespaces needed.
+
+- **vm.rs** — VM lifecycle. VZVirtualMachine must be created and operated from a GCD serial dispatch queue (one queue per VM).
+- **vsock.rs** — virtio-vsock (port 5123) bridge between rauhad and the guest agent inside the VM.
+- **apfs.rs** — APFS `clonefile()` for instant, zero-copy rootfs clones (macOS equivalent of overlayfs).
+- **pf.rs** — macOS packet filter (pf) firewall anchors, one per zone, generated from ZonePolicy.
+
+The `rauha-guest-agent` runs inside the VM and handles `ShimRequest`/`ShimResponse` messages (same postcard protocol as the Linux shim). It's simpler than `rauha-shim`: no cgroup enrollment (VM is the boundary), no `setns` (already in the right namespace).
+
+Resource limits (CPU/memory) are set at VM boot and require restart to change. Filesystem sharing uses virtio-fs, mounting the container rootfs from host into the VM at `/mnt/rauha`.
+
+macOS requires the `com.apple.security.virtualization` entitlement — see `rauhad/rauhad.entitlements`.
+
 ### Data Stores
 
 - **redb** (`/var/lib/rauha/metadata/rauha.redb`) — persisted zone/container metadata. Source of truth on crash recovery.
@@ -83,7 +99,7 @@ Built separately via `cargo xtask build-ebpf` targeting `bpfel-unknown-none`. No
 - Linux-only code uses `#[cfg(target_os = "linux")]` with stub implementations for other platforms.
 - Policies are TOML. See `policies/standard.toml` for the canonical example.
 - Tests go in `#[cfg(test)]` modules within source files, not in separate test files.
-- The macOS backend (`rauhad/src/backend/macos/`) is a stub — it logs operations and returns Ok.
+- macOS backend code uses `#[cfg(target_os = "macos")]` and ObjC2 bindings for Virtualization.framework.
 
 ## Workspace Crates
 
@@ -93,13 +109,22 @@ Built separately via `cargo xtask build-ebpf` targeting `bpfel-unknown-none`. No
 | `rauhad` | Daemon — gRPC server, zone registry, metadata (redb), Linux/macOS backends |
 | `rauha-cli` | CLI binary — connects to rauhad via gRPC |
 | `rauha-shim` | Per-zone sync process — fork/run containers (Linux only) |
+| `rauha-guest-agent` | Guest-side daemon inside macOS VMs — container lifecycle over virtio-vsock |
 | `rauha-oci` | OCI image pull, content store, rootfs preparation, runtime spec generation |
 | `rauha-ebpf` | eBPF LSM programs (kernel-side, not in workspace, separate build) |
 | `rauha-ebpf-common` | Shared `#[repr(C)]` types between eBPF programs and userspace |
 | `xtask` | Build helper for eBPF compilation |
 
-## Linux Kernel Requirements (for eBPF enforcement)
+## Platform Requirements
+
+### Linux (eBPF enforcement)
 
 - Linux 6.1+ with `CONFIG_BPF_LSM=y`, `CONFIG_BPF_SYSCALL=y`, `CONFIG_DEBUG_INFO_BTF=y`
 - Boot parameter: `lsm=lockdown,capability,bpf`
 - BTF at `/sys/kernel/btf/vmlinux`
+
+### macOS (Virtualization.framework)
+
+- macOS 15+ (Sequoia) for full Containers API support
+- Apple Silicon or Intel with VT-x
+- rauhad binary must be signed with `com.apple.security.virtualization` entitlement
