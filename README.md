@@ -95,11 +95,13 @@ This isn't a userspace check. It's enforced in the kernel, on every access, with
 
 Requires Linux 6.1+ with `CONFIG_BPF_LSM=y`.
 
-### macOS: truly native, no Linux VM
+### macOS: native isolation via Virtualization.framework
 
-On macOS, each zone is a lightweight VM via Apple's Virtualization.framework. Not a hidden Linux VM like Docker Desktop — a native Apple Silicon hypervisor VM that boots in under a second.
+On macOS, each zone is a lightweight Linux VM via Apple's Virtualization.framework. Not a hidden shared VM like Docker Desktop — each zone gets its own VM with hardware-enforced isolation.
 
-Same `rauha zone create` command. Same policy format. Same isolation guarantees. Native filesystem performance. No virtio-fs overhead.
+The `rauha-guest-agent` runs inside each VM and manages container processes over virtio-vsock (port 5123), using the same `ShimRequest`/`ShimResponse` postcard protocol as the Linux shim. APFS `clonefile()` provides instant, zero-copy rootfs clones. Network isolation uses pf firewall anchors per zone.
+
+Same `rauha zone create` command. Same policy format. Same isolation guarantees.
 
 ---
 
@@ -143,52 +145,26 @@ Same `rauha zone create` command. Same policy format. Same isolation guarantees.
                    │                                     │
           ┌────────▼─────────┐                ┌─────────▼────────┐
           │   Linux Backend   │                │  macOS Backend    │
-          │                   │                │  (Phase 5)        │
-          │  eBPF LSM hooks   │                │                   │
-          │  cgroups v2       │                │  Virt.framework   │
-          │  network ns       │                │  sandbox profiles │
-          │  shim management  │                │  pf firewall      │
-          └────────┬─────────┘                └───────────────────┘
-                   │
-                   │ spawns one per zone
-                   │
-          ┌────────▼──────────────────────────────────────────┐
-          │                    rauha-shim                      │
-          │              (sync, single-threaded)               │
-          │                                                    │
-          │  Unix socket: /run/rauha/shim-{zone}.sock          │
-          │  IPC: length-prefixed postcard                     │
-          │                                                    │
-          │  For each container:                               │
-          │    fork() ──> write PID to zone cgroup             │
-          │           ──> signal sync pipe                     │
-          │           ──> child: pivot_root + exec             │
-          │                                                    │
-          │  ┌─────────┐  ┌─────────┐  ┌─────────┐           │
-          │  │ nginx   │  │ app     │  │ worker  │           │
-          │  │ PID 42  │  │ PID 87  │  │ PID 91  │           │
-          │  └─────────┘  └─────────┘  └─────────┘           │
-          └───────────────────┬───────────────────────────────┘
-                              │
-           ┌──────────────────▼───────────────────────────┐
-           │              Linux Kernel                     │
-           │                                               │
-           │  BPF maps (pinned at /sys/fs/bpf/rauha/)     │
-           │    ZONE_MEMBERSHIP   cgroup_id -> zone_id    │
-           │    ZONE_POLICY       zone_id -> policy       │
-           │    INODE_ZONE_MAP    inode -> zone_id        │
-           │    ZONE_ALLOWED_COMMS  (src,dst) -> allowed  │
-           │                                               │
-           │  LSM hooks                                    │
-           │    file_open ──> rauha_file_open              │
-           │    bprm_check ──> rauha_bprm_check            │
-           │    ptrace ──> rauha_ptrace_check              │
-           │    task_kill ──> rauha_task_kill               │
-           │    cgroup_attach ──> rauha_cgroup_attach       │
-           │                                               │
-           │  cgroups v2                                   │
-           │    /sys/fs/cgroup/rauha.slice/zone-{name}/   │
-           └───────────────────────────────────────────────┘
+          │                   │                │                   │
+          │  eBPF LSM hooks   │                │  Virt.framework   │
+          │  cgroups v2       │                │  APFS clonefile   │
+          │  network ns       │                │  pf firewall      │
+          │  shim management  │                │  virtio-vsock     │
+          └────────┬─────────┘                └─────────┬─────────┘
+                   │                                     │
+                   │ spawns one per zone                  │ one VM per zone
+                   │                                     │
+          ┌────────▼───────────────────────┐  ┌─────────▼──────────────────┐
+          │         rauha-shim             │  │     rauha-guest-agent      │
+          │    (sync, single-threaded)     │  │    (inside Linux VM)       │
+          │                                │  │                            │
+          │  Unix socket IPC               │  │  virtio-vsock (port 5123)  │
+          │  length-prefixed postcard      │  │  length-prefixed postcard  │
+          │                                │  │                            │
+          │  fork() -> cgroup enroll       │  │  fork() -> pivot_root      │
+          │        -> sync pipe            │  │        -> exec             │
+          │        -> pivot_root + exec    │  │  (no cgroup — VM isolates) │
+          └────────────────────────────────┘  └────────────────────────────┘
 ```
 
 ### The `IsolationBackend` trait
@@ -232,6 +208,7 @@ trait IsolationBackend: Send + Sync {
 | `rauhad` | Daemon — gRPC server, zone registry, metadata store (redb), backends |
 | `rauha-cli` | CLI binary |
 | `rauha-shim` | Per-zone shim process (sync, single-threaded, Linux only) |
+| `rauha-guest-agent` | Guest-side daemon inside macOS VMs — container lifecycle over virtio-vsock |
 | `rauha-oci` | OCI image pull, content store, rootfs preparation, runtime spec generation |
 | `rauha-ebpf` | eBPF LSM programs (kernel-side, separate build target) |
 | `rauha-ebpf-common` | Shared `#[repr(C)]` types between eBPF programs and userspace |
@@ -249,6 +226,8 @@ trait IsolationBackend: Send + Sync {
 | `nix` | Linux syscalls (fork, setns, pivot_root, mount) |
 | `oci-spec` | OCI runtime spec types |
 | `reqwest` | OCI registry HTTP client |
+| `objc2-virtualization` | macOS Virtualization.framework bindings (Rust ↔ ObjC) |
+| `dispatch2` | GCD serial queues for VZVirtualMachine operations |
 
 ---
 
@@ -321,7 +300,7 @@ deny = ["mount", "umount2", "pivot_root"]
 - [x] **Phase 2: Linux Isolation** — eBPF programs (Aya), BPF map management, LSM enforcement, network namespaces, cgroup hierarchy, crash recovery
 - [x] **Phase 3: Container Runtime** — OCI image pull, content store, image service, zone shim, container lifecycle
 - [ ] **Phase 4: Integration & Hardening** — end-to-end testing, overlayfs snapshotter, PTY attach, streaming logs
-- [ ] **Phase 5: macOS Backend** — Virtualization.framework, sandbox profiles, APFS clone snapshotter, Network.framework + pf
+- [x] **Phase 5: macOS Backend** — Virtualization.framework, sandbox profiles, APFS clone snapshotter, Network.framework + pf
 - [ ] **Phase 6: Observability** — `rauha trace` (eBPF/DTrace), `rauha top`, event streaming
 
 ---
@@ -367,6 +346,11 @@ cargo xtask build-ebpf --release
 - Linux 6.1+ kernel
 - `CONFIG_BPF_LSM=y`, `CONFIG_BPF_SYSCALL=y`, `CONFIG_DEBUG_INFO_BTF=y`
 - Boot parameter: `lsm=lockdown,capability,bpf`
+
+**macOS requirements:**
+- macOS 15+ (Sequoia) for full Containers API support
+- Apple Silicon or Intel with VT-x
+- rauhad binary must be signed with `com.apple.security.virtualization` entitlement (see `rauhad/rauhad.entitlements`)
 
 ---
 
