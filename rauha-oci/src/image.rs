@@ -1,5 +1,6 @@
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use rauha_common::error::RauhaError;
 
@@ -31,6 +32,8 @@ pub struct ImageService {
     content: Arc<ContentStore>,
     client: DistributionClient,
     root: PathBuf,
+    /// Tracks images currently being extracted to prevent concurrent extraction races.
+    extracting: Mutex<HashSet<String>>,
 }
 
 impl ImageService {
@@ -40,6 +43,7 @@ impl ImageService {
             content,
             client,
             root,
+            extracting: Mutex::new(HashSet::new()),
         }
     }
 
@@ -211,6 +215,84 @@ impl ImageService {
 
         tracing::info!(rootfs = %target.display(), layers = manifest.layers.len(), "rootfs prepared");
         Ok(())
+    }
+
+    /// Prepare a shared base rootfs for an image, returning the path.
+    ///
+    /// Idempotent: uses a `.complete` marker file to distinguish fully extracted
+    /// rootfs from partial/crashed extractions. Extraction happens into a temp
+    /// directory and is atomically renamed into place.
+    ///
+    /// Thread-safe: a per-image lock prevents concurrent extractions of the
+    /// same image from racing.
+    pub fn prepare_base_rootfs(&self, reference_str: &str) -> Result<PathBuf, RauhaError> {
+        let reference = ImageReference::parse(reference_str).map_err(|e| {
+            RauhaError::ImagePullError {
+                reference: reference_str.into(),
+                message: e,
+            }
+        })?;
+
+        let canonical = reference.to_string_canonical();
+        let safe_name = canonical.replace(['/', ':'], "_");
+        let image_dir = self.root.join("images").join(&safe_name);
+        let rootfs_path = image_dir.join("rootfs");
+        let marker = image_dir.join(".complete");
+
+        // Fast path: already fully extracted.
+        if marker.exists() {
+            tracing::debug!(rootfs = %rootfs_path.display(), "base rootfs already prepared");
+            return Ok(rootfs_path);
+        }
+
+        // Acquire per-image lock to prevent concurrent extraction races.
+        // Spin-wait if another thread is already extracting this image.
+        loop {
+            {
+                let mut extracting = self.extracting.lock().unwrap();
+                if !extracting.contains(&safe_name) {
+                    // Re-check marker after acquiring lock (another thread may have finished).
+                    if marker.exists() {
+                        return Ok(rootfs_path);
+                    }
+                    extracting.insert(safe_name.clone());
+                    break;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+
+        // Extract into a temp directory, then atomically rename into place.
+        // This prevents partial extractions from being treated as complete.
+        let temp_rootfs = image_dir.join(".rootfs-extracting");
+        if temp_rootfs.exists() {
+            let _ = std::fs::remove_dir_all(&temp_rootfs);
+        }
+
+        tracing::info!(image = %canonical, rootfs = %rootfs_path.display(), "preparing base rootfs");
+        let result = self.prepare_rootfs(reference_str, &temp_rootfs);
+
+        // Always release the per-image lock, even on failure.
+        self.extracting.lock().unwrap().remove(&safe_name);
+
+        result?;
+
+        // Atomic rename: if rootfs_path exists from a crashed run, remove it first.
+        if rootfs_path.exists() {
+            std::fs::remove_dir_all(&rootfs_path).map_err(|e| RauhaError::RootfsError {
+                message: format!("failed to remove stale rootfs: {e}"),
+            })?;
+        }
+        std::fs::rename(&temp_rootfs, &rootfs_path).map_err(|e| RauhaError::RootfsError {
+            message: format!("failed to rename rootfs into place: {e}"),
+        })?;
+
+        // Write completion marker.
+        std::fs::write(&marker, b"").map_err(|e| RauhaError::RootfsError {
+            message: format!("failed to write completion marker: {e}"),
+        })?;
+
+        Ok(rootfs_path)
     }
 
     /// Get the image config (CMD, ENV, WORKDIR, etc.) from a pulled image.
@@ -465,6 +547,64 @@ mod tests {
         let rootfs = dir.path().join("test-rootfs");
         let result = svc.prepare_rootfs("nonexistent:latest", &rootfs);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn prepare_base_rootfs_extracts_and_returns_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, _reference) = setup_content_store_with_image(dir.path());
+
+        let svc = ImageService::new(store, dir.path().to_path_buf());
+        let rootfs = svc.prepare_base_rootfs("testimage:latest").unwrap();
+
+        // Verify path structure.
+        assert!(rootfs.ends_with("rootfs"));
+        assert!(rootfs.join("hello.txt").exists());
+        assert_eq!(
+            std::fs::read_to_string(rootfs.join("hello.txt")).unwrap(),
+            "hello world"
+        );
+        // Verify completion marker was written.
+        let marker = rootfs.parent().unwrap().join(".complete");
+        assert!(marker.exists());
+    }
+
+    #[test]
+    fn prepare_base_rootfs_idempotent_skips_reextraction() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, _reference) = setup_content_store_with_image(dir.path());
+
+        let svc = ImageService::new(store, dir.path().to_path_buf());
+
+        // First call extracts.
+        let path1 = svc.prepare_base_rootfs("testimage:latest").unwrap();
+        // Second call returns immediately (idempotent).
+        let path2 = svc.prepare_base_rootfs("testimage:latest").unwrap();
+
+        assert_eq!(path1, path2);
+        assert!(path1.join("hello.txt").exists());
+    }
+
+    #[test]
+    fn prepare_base_rootfs_recovers_from_partial_extraction() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, _reference) = setup_content_store_with_image(dir.path());
+
+        let svc = ImageService::new(store, dir.path().to_path_buf());
+
+        // Simulate a crashed extraction: create rootfs dir with content but no marker.
+        let safe_name = "registry-1.docker.io_library_testimage_latest";
+        let image_dir = dir.path().join("images").join(safe_name);
+        let rootfs_dir = image_dir.join("rootfs");
+        std::fs::create_dir_all(&rootfs_dir).unwrap();
+        std::fs::write(rootfs_dir.join("stale-file"), b"leftover").unwrap();
+        // No .complete marker — simulates crash mid-extraction.
+
+        // Should re-extract despite non-empty dir.
+        let path = svc.prepare_base_rootfs("testimage:latest").unwrap();
+        assert!(path.join("hello.txt").exists());
+        // Stale file should be gone (replaced by fresh extraction).
+        assert!(!path.join("stale-file").exists());
     }
 
     #[test]

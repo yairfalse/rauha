@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -41,4 +43,6 @@ pub struct ContainerSpec {
     pub command: Vec<String>,
     pub env: Vec<(String, String)>,
     pub working_dir: Option<String>,
+    /// Prepared base rootfs path (set by orchestration layer after image extraction).
+    pub rootfs_path: Option<PathBuf>,
 }

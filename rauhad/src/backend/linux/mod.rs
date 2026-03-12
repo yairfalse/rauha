@@ -525,9 +525,14 @@ impl IsolationBackend for LinuxBackend {
             .join("containers")
             .join(container_id.to_string())
             .join("rootfs");
-        std::fs::create_dir_all(&rootfs_dir).map_err(|e| RauhaError::RootfsError {
-            message: format!("failed to create rootfs dir: {e}"),
-        })?;
+
+        if let Some(ref base_rootfs) = spec.rootfs_path {
+            copy_dir_recursive(base_rootfs, &rootfs_dir)?;
+        } else {
+            std::fs::create_dir_all(&rootfs_dir).map_err(|e| RauhaError::RootfsError {
+                message: format!("failed to create rootfs dir: {e}"),
+            })?;
+        }
 
         // Generate OCI runtime spec (will be populated with image config by the caller).
         // For now, create a minimal spec with the container's command.
@@ -776,4 +781,62 @@ impl IsolationBackend for LinuxBackend {
     fn name(&self) -> &str {
         "linux-ebpf"
     }
+}
+
+/// Recursively copy a directory tree, preserving symlinks and file permissions.
+///
+/// Uses `symlink_metadata` to avoid following symlinks (OCI rootfs trees
+/// commonly contain symlinks that must be preserved as-is).
+fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> Result<()> {
+    std::fs::create_dir_all(dst).map_err(|e| RauhaError::RootfsError {
+        message: format!("failed to create dir {}: {e}", dst.display()),
+    })?;
+
+    for entry in std::fs::read_dir(src).map_err(|e| RauhaError::RootfsError {
+        message: format!("failed to read dir {}: {e}", src.display()),
+    })? {
+        let entry = entry.map_err(|e| RauhaError::RootfsError {
+            message: format!("failed to read entry: {e}"),
+        })?;
+        let src_path = entry.path();
+        let dst_path = dst.join(entry.file_name());
+
+        // Use symlink_metadata to detect symlinks without following them.
+        let meta = std::fs::symlink_metadata(&src_path).map_err(|e| RauhaError::RootfsError {
+            message: format!("failed to stat {}: {e}", src_path.display()),
+        })?;
+
+        if meta.is_symlink() {
+            let link_target =
+                std::fs::read_link(&src_path).map_err(|e| RauhaError::RootfsError {
+                    message: format!("failed to read symlink {}: {e}", src_path.display()),
+                })?;
+            std::os::unix::fs::symlink(&link_target, &dst_path).map_err(|e| {
+                RauhaError::RootfsError {
+                    message: format!(
+                        "failed to create symlink {} → {}: {e}",
+                        dst_path.display(),
+                        link_target.display()
+                    ),
+                }
+            })?;
+        } else if meta.is_dir() {
+            copy_dir_recursive(&src_path, &dst_path)?;
+        } else {
+            std::fs::copy(&src_path, &dst_path).map_err(|e| RauhaError::RootfsError {
+                message: format!(
+                    "failed to copy {} → {}: {e}",
+                    src_path.display(),
+                    dst_path.display()
+                ),
+            })?;
+        }
+    }
+
+    // Preserve directory permissions.
+    if let Ok(metadata) = std::fs::symlink_metadata(src) {
+        let _ = std::fs::set_permissions(dst, metadata.permissions());
+    }
+
+    Ok(())
 }

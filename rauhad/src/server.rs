@@ -266,6 +266,7 @@ impl ContainerService for ContainerServiceImpl {
             } else {
                 Some(req.working_dir)
             },
+            rootfs_path: None,
         };
 
         let container = self

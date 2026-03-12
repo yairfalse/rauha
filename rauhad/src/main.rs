@@ -61,6 +61,7 @@ async fn main() -> anyhow::Result<()> {
     let registry = Arc::new(zone::registry::ZoneRegistry::new(
         metadata.clone(),
         backend,
+        image_service.clone(),
     ));
 
     // Reconcile persisted metadata with kernel state.

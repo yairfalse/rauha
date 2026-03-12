@@ -18,6 +18,7 @@ use crate::metadata::db::MetadataStore;
 pub struct ZoneRegistry {
     metadata: Arc<MetadataStore>,
     backend: Arc<dyn IsolationBackend>,
+    image_service: Arc<rauha_oci::image::ImageService>,
     /// In-memory cache of zone handles for fast backend operations.
     handles: RwLock<HashMap<String, ZoneHandle>>,
     /// In-memory cache of container handles (needed for start/stop operations).
@@ -25,10 +26,15 @@ pub struct ZoneRegistry {
 }
 
 impl ZoneRegistry {
-    pub fn new(metadata: Arc<MetadataStore>, backend: Arc<dyn IsolationBackend>) -> Self {
+    pub fn new(
+        metadata: Arc<MetadataStore>,
+        backend: Arc<dyn IsolationBackend>,
+        image_service: Arc<rauha_oci::image::ImageService>,
+    ) -> Self {
         Self {
             metadata,
             backend,
+            image_service,
             handles: RwLock::new(HashMap::new()),
             container_handles: RwLock::new(HashMap::new()),
         }
@@ -192,6 +198,21 @@ impl ZoneRegistry {
         spec: ContainerSpec,
     ) -> Result<Container> {
         let zone = self.get_zone(zone_name).await?;
+
+        // Prepare rootfs from image if one is specified.
+        // Uses spawn_blocking because layer extraction does heavy I/O.
+        let mut spec = spec;
+        if !spec.image.is_empty() {
+            let image_svc = self.image_service.clone();
+            let image_ref = spec.image.clone();
+            let base = tokio::task::spawn_blocking(move || {
+                image_svc.prepare_base_rootfs(&image_ref)
+            })
+            .await
+            .map_err(|e| RauhaError::BackendError(format!("rootfs task panicked: {e}")))??;
+            spec.rootfs_path = Some(base);
+        }
+
         let handles = self.handles.read().await;
         let handle = handles
             .get(zone_name)
