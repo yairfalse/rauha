@@ -198,17 +198,25 @@ impl ZoneRegistry {
         spec: ContainerSpec,
     ) -> Result<Container> {
         let zone = self.get_zone(zone_name).await?;
+
+        // Prepare rootfs from image if one is specified.
+        // Uses spawn_blocking because layer extraction does heavy I/O.
+        let mut spec = spec;
+        if !spec.image.is_empty() {
+            let image_svc = self.image_service.clone();
+            let image_ref = spec.image.clone();
+            let base = tokio::task::spawn_blocking(move || {
+                image_svc.prepare_base_rootfs(&image_ref)
+            })
+            .await
+            .map_err(|e| RauhaError::BackendError(format!("rootfs task panicked: {e}")))??;
+            spec.rootfs_path = Some(base);
+        }
+
         let handles = self.handles.read().await;
         let handle = handles
             .get(zone_name)
             .ok_or_else(|| RauhaError::ZoneNotFound(zone_name.into()))?;
-
-        // Prepare rootfs from image if one is specified.
-        let mut spec = spec;
-        if !spec.image.is_empty() {
-            let base = self.image_service.prepare_base_rootfs(&spec.image)?;
-            spec.rootfs_path = Some(base);
-        }
 
         let container_handle = self.backend.create_container(handle, &spec)?;
 

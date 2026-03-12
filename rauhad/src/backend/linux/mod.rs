@@ -783,7 +783,10 @@ impl IsolationBackend for LinuxBackend {
     }
 }
 
-/// Recursively copy a directory tree, preserving file permissions.
+/// Recursively copy a directory tree, preserving symlinks and file permissions.
+///
+/// Uses `symlink_metadata` to avoid following symlinks (OCI rootfs trees
+/// commonly contain symlinks that must be preserved as-is).
 fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> Result<()> {
     std::fs::create_dir_all(dst).map_err(|e| RauhaError::RootfsError {
         message: format!("failed to create dir {}: {e}", dst.display()),
@@ -798,7 +801,26 @@ fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> Result<()
         let src_path = entry.path();
         let dst_path = dst.join(entry.file_name());
 
-        if src_path.is_dir() {
+        // Use symlink_metadata to detect symlinks without following them.
+        let meta = std::fs::symlink_metadata(&src_path).map_err(|e| RauhaError::RootfsError {
+            message: format!("failed to stat {}: {e}", src_path.display()),
+        })?;
+
+        if meta.is_symlink() {
+            let link_target =
+                std::fs::read_link(&src_path).map_err(|e| RauhaError::RootfsError {
+                    message: format!("failed to read symlink {}: {e}", src_path.display()),
+                })?;
+            std::os::unix::fs::symlink(&link_target, &dst_path).map_err(|e| {
+                RauhaError::RootfsError {
+                    message: format!(
+                        "failed to create symlink {} → {}: {e}",
+                        dst_path.display(),
+                        link_target.display()
+                    ),
+                }
+            })?;
+        } else if meta.is_dir() {
             copy_dir_recursive(&src_path, &dst_path)?;
         } else {
             std::fs::copy(&src_path, &dst_path).map_err(|e| RauhaError::RootfsError {
@@ -812,7 +834,7 @@ fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> Result<()
     }
 
     // Preserve directory permissions.
-    if let Ok(metadata) = std::fs::metadata(src) {
+    if let Ok(metadata) = std::fs::symlink_metadata(src) {
         let _ = std::fs::set_permissions(dst, metadata.permissions());
     }
 
