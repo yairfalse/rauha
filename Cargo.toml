@@ -68,7 +68,7 @@ hex = "0.4"
 # Platform-specific (Linux)
 [workspace.dependencies.nix]
 version = "0.29"
-features = ["fs", "mount", "sched", "signal", "user", "net", "hostname"]
+features = ["fs", "mount", "sched", "signal", "user", "net", "hostname", "poll", "term", "process"]
 
 # eBPF (Linux)
 [workspace.dependencies.aya]
@@ -83,6 +83,10 @@ version = "0.6"
 version = "0.6"
 [workspace.dependencies.objc2-virtualization]
 version = "0.3"
+features = ["dispatch2"]
+[workspace.dependencies.dispatch2]
+version = "0.3"
+features = ["alloc", "objc2"]
 [workspace.dependencies.objc2-foundation]
 version = "0.3"
 

@@ -153,6 +153,12 @@ fn handle_request(state: &mut AgentState, request: ShimRequest) -> ShimResponse 
                 pids,
             }
         }
+        ShimRequest::Attach { .. } => ShimResponse::Error {
+            message: "attach not yet supported in guest agent".into(),
+        },
+        ShimRequest::Exec { .. } => ShimResponse::Error {
+            message: "exec not yet supported in guest agent".into(),
+        },
     }
 }
 

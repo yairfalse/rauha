@@ -96,8 +96,14 @@ impl VmManager {
     }
 
     /// Boot a VM for the given zone.
+    ///
+    /// Virtualization.framework requires that `VZVirtualMachine` is created
+    /// and operated from the dispatch queue it's bound to. We create a
+    /// serial dispatch queue per VM and use `exec_sync` to run the start
+    /// call on that queue.
     #[cfg(target_os = "macos")]
     pub fn boot_vm(&self, zone_name: &str, config: &VmConfig) -> Result<()> {
+        use std::sync::{Arc, Condvar};
         use objc2_foundation::{NSArray, NSString, NSURL};
         use objc2_virtualization::*;
 
@@ -112,6 +118,8 @@ impl VmManager {
             }
         }
 
+        // Build the VM configuration (can happen on any thread).
+        eprintln!("[vm] creating boot loader");
         let kernel_url =
             NSURL::fileURLWithPath(&NSString::from_str(&self.kernel_path.to_string_lossy()));
         let boot_loader = unsafe {
@@ -127,6 +135,7 @@ impl VmManager {
             loader
         };
 
+        eprintln!("[vm] creating VM configuration (cpus={}, mem={})", config.cpus, config.memory_bytes);
         let vm_config_obj = unsafe {
             let cfg = VZVirtualMachineConfiguration::new();
             cfg.setBootLoader(Some(&boot_loader));
@@ -138,7 +147,7 @@ impl VmManager {
                 objc2::rc::Retained::cast_unchecked(vsock_config),
             ]));
 
-            let shared_dir = VZSharedDirectory::initWithURL_readOnly(
+            let shared_dir_obj = VZSharedDirectory::initWithURL_readOnly(
                 VZSharedDirectory::alloc(),
                 &NSURL::fileURLWithPath(&NSString::from_str(
                     &config.shared_dir.to_string_lossy(),
@@ -147,7 +156,7 @@ impl VmManager {
             );
             let single_dir_share = VZSingleDirectoryShare::initWithDirectory(
                 VZSingleDirectoryShare::alloc(),
-                &shared_dir,
+                &shared_dir_obj,
             );
             let fs_config = VZVirtioFileSystemDeviceConfiguration::initWithTag(
                 VZVirtioFileSystemDeviceConfiguration::alloc(),
@@ -168,6 +177,7 @@ impl VmManager {
             cfg
         };
 
+        eprintln!("[vm] validating configuration");
         unsafe {
             if let Err(e) = vm_config_obj.validateWithError() {
                 return Err(RauhaError::BackendError(format!(
@@ -176,22 +186,70 @@ impl VmManager {
             }
         }
 
-        let zone = zone_name.to_string();
+        // Create a serial dispatch queue for this VM.
+        let queue = dispatch2::DispatchQueue::new(
+            &format!("com.rauha.vm.{zone_name}"),
+            None,
+        );
+
+        // Create the VM bound to our queue.
+        eprintln!("[vm] creating VZVirtualMachine on dispatch queue");
         let vm = unsafe {
-            let vm = VZVirtualMachine::initWithConfiguration(
+            VZVirtualMachine::initWithConfiguration_queue(
                 VZVirtualMachine::alloc(),
                 &vm_config_obj,
-            );
-            vm.startWithCompletionHandler(&block2::RcBlock::new(
-                move |err: *mut objc2_foundation::NSError| {
-                    if !err.is_null() {
-                        let e = &*err;
-                        tracing::error!(error = %e, zone = %zone, "VM start failed");
-                    }
-                },
-            ));
-            vm
+                &queue,
+            )
         };
+
+        // Start the VM from its queue using exec_sync + condvar for the
+        // async completion handler.
+        let start_result: Arc<Mutex<Option<std::result::Result<(), String>>>> =
+            Arc::new(Mutex::new(None));
+        let start_cond = Arc::new(Condvar::new());
+
+        eprintln!("[vm] starting VM via dispatch queue");
+        let sr = Arc::clone(&start_result);
+        let sc = Arc::clone(&start_cond);
+        // Use a raw pointer to move the VM ref into the Send closure.
+        // Safety: the VM is alive for the duration (we hold a Retained clone).
+        let vm_ptr = objc2::rc::Retained::as_ptr(&vm) as usize;
+        queue.exec_async(move || {
+            eprintln!("[vm] inside dispatch queue — calling startWithCompletionHandler");
+            unsafe {
+                let vm_ref = &*(vm_ptr as *const objc2_virtualization::VZVirtualMachine);
+                vm_ref.startWithCompletionHandler(&block2::RcBlock::new(
+                    move |err: *mut objc2_foundation::NSError| {
+                        let res = if !err.is_null() {
+                            let e = &*err;
+                            eprintln!("[vm] start completion: error = {e}");
+                            Err(format!("VM start failed: {e}"))
+                        } else {
+                            eprintln!("[vm] start completion: success");
+                            Ok(())
+                        };
+                        let mut guard = sr.lock().unwrap();
+                        *guard = Some(res);
+                        sc.notify_one();
+                    },
+                ));
+            }
+        });
+
+        // Wait for the start completion handler.
+        let guard = start_result.lock().unwrap();
+        let (guard, timeout) = start_cond
+            .wait_timeout_while(guard, std::time::Duration::from_secs(30), |r| r.is_none())
+            .unwrap();
+
+        if timeout.timed_out() {
+            return Err(RauhaError::BackendError("VM start timed out (30s)".into()));
+        }
+
+        if let Some(Err(e)) = guard.as_ref() {
+            return Err(RauhaError::BackendError(e.clone()));
+        }
+        drop(guard);
 
         let mut vms = self.vms.lock().unwrap();
         vms.insert(

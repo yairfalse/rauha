@@ -295,6 +295,58 @@ impl ImageService {
         Ok(rootfs_path)
     }
 
+    /// Return layer digests and content root for an image.
+    ///
+    /// Used by the overlayfs snapshotter to extract layers individually
+    /// rather than merging them all into one directory.
+    pub fn layer_digests(&self, reference_str: &str) -> Result<(Vec<String>, PathBuf), RauhaError> {
+        let canonical = {
+            let reference = ImageReference::parse(reference_str).map_err(|e| {
+                RauhaError::ImagePullError {
+                    reference: reference_str.into(),
+                    message: e,
+                }
+            })?;
+            reference.to_string_canonical()
+        };
+
+        let manifest_bytes =
+            self.content
+                .get_manifest(&canonical)
+                .map_err(|e| RauhaError::ContentError {
+                    message: format!("failed to read manifest: {e}"),
+                })?
+                .ok_or_else(|| RauhaError::ImagePullError {
+                    reference: reference_str.into(),
+                    message: "image not pulled — run `rauha image pull` first".into(),
+                })?;
+
+        let manifest: OciManifest =
+            serde_json::from_slice(&manifest_bytes).map_err(|e| RauhaError::ContentError {
+                message: format!("corrupt manifest: {e}"),
+            })?;
+
+        let digests = manifest
+            .layers
+            .iter()
+            .map(|l| l.digest.clone())
+            .collect();
+
+        let content_root = self.root.join("content");
+        Ok((digests, content_root))
+    }
+
+    /// Return the safe name for an image reference (used for directory paths).
+    pub fn image_safe_name(&self, reference_str: &str) -> Result<String, RauhaError> {
+        let reference = ImageReference::parse(reference_str).map_err(|e| {
+            RauhaError::ImagePullError {
+                reference: reference_str.into(),
+                message: e,
+            }
+        })?;
+        Ok(reference.to_string_canonical().replace(['/', ':'], "_"))
+    }
+
     /// Get the image config (CMD, ENV, WORKDIR, etc.) from a pulled image.
     pub fn inspect(&self, reference_str: &str) -> Result<OciImageConfig, RauhaError> {
         let canonical = {
@@ -424,14 +476,13 @@ impl ImageService {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::content::ContentStore;
     use crate::distribution::{OciDescriptor, OciManifest};
-    use std::io::Write;
 
     /// Create a gzipped tar archive from a list of (path, content) pairs.
-    fn make_tar_gz(files: &[(&str, &[u8])]) -> Vec<u8> {
+    pub fn make_tar_gz(files: &[(&str, &[u8])]) -> Vec<u8> {
         let mut tar_data = Vec::new();
         {
             let enc = flate2::write::GzEncoder::new(&mut tar_data, flate2::Compression::fast());
@@ -752,7 +803,7 @@ mod tests {
 }
 
 /// Unpack a tar layer into a target directory, handling OCI whiteout files.
-fn unpack_layer(
+pub fn unpack_layer(
     archive: &mut tar::Archive<flate2::read::GzDecoder<std::fs::File>>,
     target: &Path,
 ) -> Result<(), RauhaError> {

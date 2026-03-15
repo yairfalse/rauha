@@ -9,7 +9,10 @@ service ContainerService {
     rpc DeleteContainer(DeleteContainerRequest) returns (DeleteContainerResponse);
     rpc GetContainer(GetContainerRequest) returns (GetContainerResponse);
     rpc ListContainers(ListContainersRequest) returns (ListContainersResponse);
+    rpc ContainerLogs(ContainerLogsRequest) returns (stream ContainerLogEntry);
     rpc ExecInContainer(ExecInContainerRequest) returns (ExecInContainerResponse);
+    rpc ExecStream(stream ExecStreamRequest) returns (stream ExecStreamResponse);
+    rpc Attach(stream AttachRequest) returns (stream AttachResponse);
 }
 
 message CreateContainerRequest {
@@ -85,4 +88,74 @@ message ExecInContainerResponse {
     int32 exit_code = 1;
     bytes stdout = 2;
     bytes stderr = 3;
+}
+
+// --- Streaming Logs ---
+
+message ContainerLogsRequest {
+    string container_id = 1;
+    bool follow = 2;
+    uint32 tail = 3; // 0 = all lines
+}
+
+message ContainerLogEntry {
+    string source = 1; // "stdout" or "stderr"
+    string line = 2;
+    string timestamp = 3;
+}
+
+// --- Streaming Exec ---
+
+message ExecStreamRequest {
+    oneof message {
+        ExecStreamStart start = 1;
+        bytes stdin_data = 2;
+        ExecStreamResize resize = 3;
+    }
+}
+
+message ExecStreamStart {
+    string container_id = 1;
+    repeated string command = 2;
+    map<string, string> env = 3;
+    bool tty = 4;
+}
+
+message ExecStreamResize {
+    uint32 rows = 1;
+    uint32 cols = 2;
+}
+
+message ExecStreamResponse {
+    oneof message {
+        bytes stdout_data = 1;
+        bytes stderr_data = 2;
+        int32 exit_code = 3;
+    }
+}
+
+// --- Attach ---
+
+message AttachRequest {
+    oneof message {
+        AttachStart start = 1;
+        bytes stdin_data = 2;
+        AttachResize resize = 3;
+    }
+}
+
+message AttachStart {
+    string container_id = 1;
+}
+
+message AttachResize {
+    uint32 rows = 1;
+    uint32 cols = 2;
+}
+
+message AttachResponse {
+    oneof message {
+        bytes stdout_data = 1;
+        int32 exit_code = 2;
+    }
 }

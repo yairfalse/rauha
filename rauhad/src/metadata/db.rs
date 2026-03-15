@@ -244,4 +244,114 @@ mod tests {
         db.delete_zone("test-zone").unwrap();
         assert!(db.get_zone("test-zone").unwrap().is_none());
     }
+
+    #[test]
+    fn test_container_crud() {
+        use rauha_common::container::{Container, ContainerState};
+
+        let db = test_db();
+        let zone_id = Uuid::new_v4();
+        let container = Container {
+            id: Uuid::new_v4(),
+            name: "test-ctr".into(),
+            zone_id,
+            image: "alpine:latest".into(),
+            state: ContainerState::Created,
+            pid: Some(1234),
+            created_at: chrono::Utc::now(),
+            started_at: None,
+            finished_at: None,
+            exit_code: None,
+        };
+
+        db.put_container(&container).unwrap();
+
+        let loaded = db.get_container(&container.id).unwrap().unwrap();
+        assert_eq!(loaded.name, "test-ctr");
+        assert_eq!(loaded.zone_id, zone_id);
+        assert_eq!(loaded.state, ContainerState::Created);
+
+        // Update state.
+        let mut updated = loaded;
+        updated.state = ContainerState::Running;
+        updated.started_at = Some(chrono::Utc::now());
+        db.put_container(&updated).unwrap();
+        let reloaded = db.get_container(&container.id).unwrap().unwrap();
+        assert_eq!(reloaded.state, ContainerState::Running);
+
+        // Delete.
+        db.delete_container(&container.id).unwrap();
+        assert!(db.get_container(&container.id).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_list_containers_by_zone() {
+        use rauha_common::container::{Container, ContainerState};
+
+        let db = test_db();
+        let zone_a = Uuid::new_v4();
+        let zone_b = Uuid::new_v4();
+        let now = chrono::Utc::now();
+
+        for (i, zone_id) in [(0, zone_a), (1, zone_a), (2, zone_b)] {
+            let c = Container {
+                id: Uuid::new_v4(),
+                name: format!("ctr-{i}"),
+                zone_id,
+                image: "alpine:latest".into(),
+                state: ContainerState::Created,
+                pid: Some(1000 + i),
+                created_at: now,
+                started_at: None,
+                finished_at: None,
+                exit_code: None,
+            };
+            db.put_container(&c).unwrap();
+        }
+
+        // All containers.
+        assert_eq!(db.list_containers(None).unwrap().len(), 3);
+        // Filtered by zone_a.
+        assert_eq!(db.list_containers(Some(&zone_a)).unwrap().len(), 2);
+        // Filtered by zone_b.
+        assert_eq!(db.list_containers(Some(&zone_b)).unwrap().len(), 1);
+        // Non-existent zone.
+        assert_eq!(db.list_containers(Some(&Uuid::new_v4())).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn test_get_nonexistent_zone() {
+        let db = test_db();
+        assert!(db.get_zone("nope").unwrap().is_none());
+    }
+
+    #[test]
+    fn test_get_nonexistent_container() {
+        let db = test_db();
+        assert!(db.get_container(&Uuid::new_v4()).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_multiple_zones() {
+        let db = test_db();
+        for i in 0..5 {
+            let zone = Zone {
+                id: Uuid::new_v4(),
+                name: format!("zone-{i}"),
+                zone_type: ZoneType::NonGlobal,
+                state: ZoneState::Ready,
+                policy: ZonePolicy::default(),
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+            };
+            db.put_zone(&zone).unwrap();
+        }
+
+        assert_eq!(db.list_zones().unwrap().len(), 5);
+
+        // Delete one, verify count.
+        db.delete_zone("zone-2").unwrap();
+        assert_eq!(db.list_zones().unwrap().len(), 4);
+        assert!(db.get_zone("zone-2").unwrap().is_none());
+    }
 }

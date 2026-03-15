@@ -1,4 +1,5 @@
 mod backend;
+mod logs;
 mod metadata;
 mod server;
 mod zone;
@@ -62,6 +63,7 @@ async fn main() -> anyhow::Result<()> {
         metadata.clone(),
         backend,
         image_service.clone(),
+        root.clone(),
     ));
 
     // Reconcile persisted metadata with kernel state.

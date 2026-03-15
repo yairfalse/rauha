@@ -155,4 +155,12 @@ impl ShimState {
     pub fn should_shutdown(&self) -> bool {
         self.shutdown
     }
+
+    pub fn zone_name(&self) -> &str {
+        &self.zone_name
+    }
+
+    pub fn rootfs_root(&self) -> &std::path::Path {
+        &self.rootfs_root
+    }
 }

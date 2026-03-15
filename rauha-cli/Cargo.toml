@@ -22,6 +22,7 @@ serde = { workspace = true }
 toml = { workspace = true }
 uuid = { workspace = true }
 tokio-stream = { workspace = true }
+libc = "0.2"
 
 [build-dependencies]
 tonic-build = { workspace = true }

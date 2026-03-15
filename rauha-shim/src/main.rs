@@ -1,3 +1,4 @@
+mod attach;
 mod container;
 mod io;
 mod state;
@@ -147,6 +148,48 @@ fn handle_request(state: &mut ShimState, request: ShimRequest) -> ShimResponse {
                 cpu_usage_ns: 0,    // TODO: read from cgroup
                 memory_bytes: 0,    // TODO: read from cgroup
                 pids,
+            }
+        }
+        ShimRequest::Exec {
+            id,
+            command,
+            env,
+            pty,
+        } => {
+            tracing::info!(container = %id, ?command, pty, "exec in container");
+            if !pty {
+                return ShimResponse::Error {
+                    message: "non-PTY exec not yet supported".into(),
+                };
+            }
+            let session_id = uuid::Uuid::new_v4().to_string();
+            match attach::fork_and_exec_pty(
+                &state.zone_name(),
+                &id,
+                &command,
+                &env,
+                state.rootfs_root(),
+            ) {
+                Ok((master_fd, _pid)) => {
+                    match attach::serve_attach_session(&id, &session_id, master_fd) {
+                        Ok(socket_path) => ShimResponse::AttachReady { socket_path },
+                        Err(e) => ShimResponse::Error {
+                            message: format!("failed to create attach session: {e}"),
+                        },
+                    }
+                }
+                Err(e) => ShimResponse::Error {
+                    message: format!("exec failed: {e}"),
+                },
+            }
+        }
+        ShimRequest::Attach { id, pty } => {
+            tracing::info!(container = %id, pty, "attach to container");
+            // Attach to an existing container's PTY requires the container
+            // to have been started with a PTY. For now, return not supported
+            // since Phase 3 containers use log-file stdio.
+            ShimResponse::Error {
+                message: "attach to non-PTY container not supported — use `exec -it` instead".into(),
             }
         }
     }
