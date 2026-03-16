@@ -9,6 +9,7 @@
 
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// A single log line with metadata.
 #[derive(Debug, Clone)]
@@ -27,6 +28,7 @@ pub fn tail_logs(
     container_id: &str,
     follow: bool,
     tail: u32,
+    cancelled: &AtomicBool,
     mut on_line: impl FnMut(LogLine) -> bool,
 ) {
     let stdout_path = log_path(container_id, "stdout");
@@ -65,6 +67,10 @@ pub fn tail_logs(
     let mut stderr_reader = open_at_end(&stderr_path);
 
     loop {
+        if cancelled.load(Ordering::Relaxed) {
+            return;
+        }
+
         let mut got_data = false;
 
         if let Some(ref mut reader) = stdout_reader {
@@ -121,6 +127,9 @@ fn log_path(container_id: &str, stream: &str) -> PathBuf {
 }
 
 /// Read the last N lines from a file (or all lines if tail == 0).
+///
+/// When tail > 0, uses a bounded ring buffer to avoid loading the entire
+/// file into memory (important for large log files).
 fn read_tail_lines(path: &PathBuf, tail: u32) -> Vec<String> {
     let file = match std::fs::File::open(path) {
         Ok(f) => f,
@@ -128,17 +137,26 @@ fn read_tail_lines(path: &PathBuf, tail: u32) -> Vec<String> {
     };
 
     let reader = BufReader::new(file);
-    let all_lines: Vec<String> = reader
-        .lines()
-        .filter_map(|l| l.ok())
-        .filter(|l| !l.is_empty())
-        .collect();
 
-    if tail == 0 || tail as usize >= all_lines.len() {
-        all_lines
-    } else {
-        all_lines[all_lines.len() - tail as usize..].to_vec()
+    if tail == 0 {
+        // Return all non-empty lines.
+        return reader
+            .lines()
+            .filter_map(|l| l.ok())
+            .filter(|l| !l.is_empty())
+            .collect();
     }
+
+    // Use a ring buffer of size `tail` to keep only the last N lines.
+    let cap = tail as usize;
+    let mut ring = std::collections::VecDeque::with_capacity(cap);
+    for line in reader.lines().filter_map(|l| l.ok()).filter(|l| !l.is_empty()) {
+        if ring.len() == cap {
+            ring.pop_front();
+        }
+        ring.push_back(line);
+    }
+    ring.into_iter().collect()
 }
 
 /// Open a file seeked to the end, for follow mode.

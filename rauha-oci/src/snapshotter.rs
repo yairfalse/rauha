@@ -50,11 +50,18 @@ impl OverlayfsSnapshotter {
         let mut layer_paths = Vec::with_capacity(layer_digests.len());
 
         for (i, digest_str) in layer_digests.iter().enumerate() {
-            let layer_dir = layers_dir.join(i.to_string());
-            let marker = layers_dir.join(format!("{i}.complete"));
+            // Key by digest (truncated to 12 chars for readability) instead of
+            // index, so reordering layers in a manifest doesn't re-extract.
+            let digest_key = if let Some(hex) = digest_str.strip_prefix("sha256:") {
+                &hex[..hex.len().min(12)]
+            } else {
+                &digest_str[..digest_str.len().min(12)]
+            };
+            let layer_dir = layers_dir.join(digest_key);
+            let marker = layers_dir.join(format!("{digest_key}.complete"));
 
             if marker.exists() {
-                tracing::debug!(layer = i, "layer already extracted");
+                tracing::debug!(layer = i, digest = %digest_key, "layer already extracted");
                 layer_paths.push(layer_dir);
                 continue;
             }
@@ -73,7 +80,7 @@ impl OverlayfsSnapshotter {
                 let _ = std::fs::remove_dir_all(&layer_dir);
             }
             std::fs::create_dir_all(&layer_dir).map_err(|e| RauhaError::RootfsError {
-                message: format!("failed to create layer dir {i}: {e}"),
+                message: format!("failed to create layer dir {digest_key}: {e}"),
             })?;
 
             tracing::info!(layer = i, digest = %digest, "extracting layer");

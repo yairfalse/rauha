@@ -106,6 +106,9 @@ pub fn serve_attach_session(
             }
         }
 
+        // Close PTY master fd now that the relay is done.
+        unsafe { libc::close(pty_master_fd); }
+
         // Clean up socket.
         let _ = std::fs::remove_file(&socket_path);
         tracing::debug!("attach session ended");
@@ -244,8 +247,9 @@ pub fn fork_and_exec_pty(
             let _ = nix::unistd::write(wr_raw, &[1u8]);
             drop(pipe_wr);
 
-            // Leak master_fd so it stays open for the attach relay thread.
-            // The relay thread will close it when the session ends.
+            // Prevent Rust from closing master_fd when pty.master drops —
+            // the relay thread owns the fd and closes it via libc::close()
+            // when the session ends (see serve_attach_session).
             std::mem::forget(pty.master);
 
             tracing::info!(pid = child_pid, container = container_id, "exec process forked with PTY");

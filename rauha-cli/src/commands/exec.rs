@@ -89,6 +89,7 @@ pub async fn handle_exec(args: ExecArgs) -> anyhow::Result<()> {
     });
 
     // Read from server and write to stdout.
+    let mut exit_code = None;
     use tokio_stream::StreamExt;
     while let Some(result) = out_stream.next().await {
         match result {
@@ -104,7 +105,8 @@ pub async fn handle_exec(args: ExecArgs) -> anyhow::Result<()> {
                     let _ = std::io::stderr().flush();
                 }
                 Some(pb::container::exec_stream_response::Message::ExitCode(code)) => {
-                    std::process::exit(code);
+                    exit_code = Some(code);
+                    break;
                 }
                 None => {}
             },
@@ -113,6 +115,13 @@ pub async fn handle_exec(args: ExecArgs) -> anyhow::Result<()> {
                 break;
             }
         }
+    }
+
+    // Drop _raw_guard before exiting so terminal state is restored.
+    drop(_raw_guard);
+
+    if let Some(code) = exit_code {
+        std::process::exit(code);
     }
 
     Ok(())
@@ -165,6 +174,7 @@ pub async fn handle_attach(args: AttachArgs) -> anyhow::Result<()> {
     });
 
     // Server -> stdout.
+    let mut exit_code = None;
     use tokio_stream::StreamExt;
     while let Some(result) = out_stream.next().await {
         match result {
@@ -175,7 +185,8 @@ pub async fn handle_attach(args: AttachArgs) -> anyhow::Result<()> {
                     let _ = std::io::stdout().flush();
                 }
                 Some(pb::container::attach_response::Message::ExitCode(code)) => {
-                    std::process::exit(code);
+                    exit_code = Some(code);
+                    break;
                 }
                 None => {}
             },
@@ -184,6 +195,13 @@ pub async fn handle_attach(args: AttachArgs) -> anyhow::Result<()> {
                 break;
             }
         }
+    }
+
+    // Drop _raw_guard before exiting so terminal state is restored.
+    drop(_raw_guard);
+
+    if let Some(code) = exit_code {
+        std::process::exit(code);
     }
 
     Ok(())

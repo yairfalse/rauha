@@ -76,7 +76,7 @@ pub fn fork_and_exec(
     let cwd = process.cwd().to_string_lossy().to_string();
     let cwd_cstr = CString::new(cwd.as_str())?;
 
-    let hostname = spec.hostname().clone();
+    let hostname = spec.hostname().cloned();
 
 
     match unsafe { unistd::fork() }? {

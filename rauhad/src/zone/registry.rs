@@ -27,6 +27,31 @@ pub struct ZoneRegistry {
     container_handles: RwLock<HashMap<Uuid, ContainerHandle>>,
 }
 
+/// Validate that a zone name is safe (no path traversal, no special chars).
+fn validate_zone_name(name: &str) -> Result<()> {
+    if name.is_empty() {
+        return Err(RauhaError::BackendError(
+            "zone name cannot be empty".into(),
+        ));
+    }
+    if name.contains('/') || name.contains('\\') || name.contains('\0') {
+        return Err(RauhaError::BackendError(
+            "zone name must not contain path separators".into(),
+        ));
+    }
+    if name == "." || name == ".." {
+        return Err(RauhaError::BackendError(
+            "zone name must not be '.' or '..'".into(),
+        ));
+    }
+    if name.len() > 128 {
+        return Err(RauhaError::BackendError(
+            "zone name must be 128 characters or fewer".into(),
+        ));
+    }
+    Ok(())
+}
+
 impl ZoneRegistry {
     pub fn new(
         metadata: Arc<MetadataStore>,
@@ -98,6 +123,9 @@ impl ZoneRegistry {
     }
 
     pub async fn create_zone(&self, name: &str, zone_type: ZoneType, policy: ZonePolicy) -> Result<Zone> {
+        // Validate zone name: reject path traversal and unsafe characters.
+        validate_zone_name(name)?;
+
         // Check for duplicates.
         if self.metadata.get_zone(name)?.is_some() {
             return Err(RauhaError::ZoneAlreadyExists(name.into()));
@@ -222,7 +250,7 @@ impl ZoneRegistry {
             {
                 let zone_root = self.root_path();
                 let zone_name_owned = zone_name.to_string();
-                let (layers, base_rootfs) = tokio::task::spawn_blocking(move || {
+                let layers = tokio::task::spawn_blocking(move || {
                     let safe_name = image_svc.image_safe_name(&image_ref)?;
                     let (digests, content_root) = image_svc.layer_digests(&image_ref)?;
 
@@ -234,14 +262,14 @@ impl ZoneRegistry {
                     let layer_paths =
                         snapshotter.prepare_layers(&safe_name, &digests, &content_root)?;
 
-                    let base = image_svc.prepare_base_rootfs(&image_ref)?;
-                    Ok::<_, RauhaError>((layer_paths, base))
+                    // Skip prepare_base_rootfs — overlayfs mounts the per-layer
+                    // directories directly. The merged rootfs would be redundant.
+                    Ok::<_, RauhaError>(layer_paths)
                 })
                 .await
                 .map_err(|e| RauhaError::BackendError(format!("rootfs task panicked: {e}")))??;
 
                 spec.overlay_layers = Some(layers);
-                spec.rootfs_path = Some(base_rootfs);
             }
 
             #[cfg(not(target_os = "linux"))]
@@ -357,6 +385,25 @@ impl ZoneRegistry {
                     "container {} is running, use force to stop it first",
                     container_id
                 )));
+            }
+        }
+
+        // Unmount overlayfs if applicable (Linux only, no-op on other platforms).
+        #[cfg(target_os = "linux")]
+        {
+            let zone_name = self.zone_name_for_container(&container.zone_id).await;
+            if let Some(zone_name) = zone_name {
+                let zone_data = std::path::PathBuf::from(&self.root)
+                    .join("zones")
+                    .join(&zone_name);
+                let container_root = zone_data
+                    .join("containers")
+                    .join(container_id.to_string());
+                let snapshotter =
+                    rauha_oci::snapshotter::OverlayfsSnapshotter::new(&zone_data);
+                if let Err(e) = snapshotter.unmount_overlay(&container_root) {
+                    tracing::warn!(container = %container_id, %e, "failed to unmount overlay");
+                }
             }
         }
 

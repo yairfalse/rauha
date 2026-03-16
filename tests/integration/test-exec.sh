@@ -32,8 +32,8 @@ EXEC_OUTPUT=$(echo "" | $RAUHA exec -it "$CONTAINER_ID" /bin/echo exec-test 2>/d
 if echo "$EXEC_OUTPUT" | grep -q "exec-test"; then
     echo "   exec output contains expected text (OK)"
 else
-    echo "   WARN: exec output: $EXEC_OUTPUT"
-    echo "   (exec may require PTY support which is Linux-only)"
+    echo "   FAIL: exec output did not contain 'exec-test': $EXEC_OUTPUT"
+    exit 1
 fi
 
 echo "5. Stopping container..."

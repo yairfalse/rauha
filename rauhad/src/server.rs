@@ -428,8 +428,19 @@ impl ContainerService for ContainerServiceImpl {
         let tail = req.tail;
         let id_str = container_id.to_string();
 
+        // Cancellation flag: set when the tx channel is dropped (client disconnects).
+        let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cancelled_clone = cancelled.clone();
+
+        // Monitor the receiver: when the client drops, signal cancellation.
+        let tx_clone = tx.clone();
+        tokio::spawn(async move {
+            tx_clone.closed().await;
+            cancelled_clone.store(true, std::sync::atomic::Ordering::Relaxed);
+        });
+
         tokio::task::spawn_blocking(move || {
-            crate::logs::tail_logs(&id_str, follow, tail, |log_line| {
+            crate::logs::tail_logs(&id_str, follow, tail, &cancelled, |log_line| {
                 tx.blocking_send(Ok(pb::container::ContainerLogEntry {
                     source: log_line.source,
                     line: log_line.line,
