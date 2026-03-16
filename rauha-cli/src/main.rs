@@ -38,6 +38,12 @@ enum Commands {
     Top(commands::trace::TopArgs),
     /// Stream zone events
     Events(commands::trace::EventsArgs),
+    /// Stream container logs
+    Logs(commands::logs::LogsArgs),
+    /// Execute a command in a running container
+    Exec(commands::exec::ExecArgs),
+    /// Attach to a running container
+    Attach(commands::exec::AttachArgs),
     /// Set up macOS environment (VM assets, pf firewall, entitlements)
     Setup(commands::setup::SetupArgs),
 }
@@ -64,6 +70,9 @@ async fn main() -> anyhow::Result<()> {
         Commands::Trace(args) => commands::trace::handle_trace(args).await?,
         Commands::Top(args) => commands::trace::handle_top(args).await?,
         Commands::Events(args) => commands::trace::handle_events(args).await?,
+        Commands::Logs(args) => commands::logs::handle_logs(args).await?,
+        Commands::Exec(args) => commands::exec::handle_exec(args).await?,
+        Commands::Attach(args) => commands::exec::handle_attach(args).await?,
         Commands::Setup(args) => commands::setup::handle(args).await?,
     }
 

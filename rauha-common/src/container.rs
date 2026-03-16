@@ -44,5 +44,9 @@ pub struct ContainerSpec {
     pub env: Vec<(String, String)>,
     pub working_dir: Option<String>,
     /// Prepared base rootfs path (set by orchestration layer after image extraction).
+    /// Used as fallback when overlayfs is not available.
     pub rootfs_path: Option<PathBuf>,
+    /// Pre-extracted layer paths for overlayfs mount (set by orchestration layer).
+    /// When present, the backend mounts an overlay instead of copying the rootfs.
+    pub overlay_layers: Option<Vec<PathBuf>>,
 }

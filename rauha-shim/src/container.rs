@@ -37,14 +37,23 @@ pub fn fork_and_exec(
         anyhow::bail!("process.args is empty");
     }
 
-    let rootfs = rootfs_root
-        .join("containers")
-        .join(container_id)
-        .join("rootfs");
-
-    if !rootfs.exists() {
-        anyhow::bail!("rootfs not found: {}", rootfs.display());
-    }
+    // Check both overlayfs (merged/) and legacy (rootfs/) paths.
+    let container_dir = rootfs_root.join("containers").join(container_id);
+    let rootfs = {
+        let merged = container_dir.join("merged");
+        let legacy = container_dir.join("rootfs");
+        if merged.exists() {
+            merged
+        } else if legacy.exists() {
+            legacy
+        } else {
+            anyhow::bail!(
+                "rootfs not found: checked {} and {}",
+                merged.display(),
+                legacy.display()
+            );
+        }
+    };
 
     // Set up stdio log directory.
     let log_dir = PathBuf::from("/run/rauha/containers").join(container_id);

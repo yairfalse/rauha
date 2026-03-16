@@ -17,3 +17,4 @@ anyhow = { workspace = true }
 [target.'cfg(target_os = "linux")'.dependencies]
 nix = { workspace = true }
 oci-spec = { workspace = true }
+libc = "0.2"

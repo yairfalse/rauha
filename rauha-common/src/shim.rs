@@ -31,6 +31,22 @@ pub enum ShimRequest {
     Shutdown,
     /// Request resource usage stats from all containers in this zone.
     GetStats,
+    /// Attach to a running container's PTY.
+    /// The shim creates a Unix socket for the attach session and returns its path.
+    Attach {
+        id: String,
+        /// Whether to allocate a PTY for the session.
+        pty: bool,
+    },
+    /// Execute a command in a running container's namespace.
+    /// The shim creates a Unix socket for the exec session and returns its path.
+    Exec {
+        id: String,
+        command: Vec<String>,
+        env: Vec<String>,
+        /// Whether to allocate a PTY for the exec process.
+        pty: bool,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -45,6 +61,9 @@ pub enum ShimResponse {
         memory_bytes: u64,
         pids: u32,
     },
+    /// An attach/exec session is ready. Connect to the socket at `socket_path`
+    /// for bidirectional I/O with the container process.
+    AttachReady { socket_path: String },
 }
 
 /// Encode a message to the wire format: [u32 LE length][postcard bytes].
@@ -157,6 +176,16 @@ mod tests {
             ShimRequest::GetState { id: "c1".into() },
             ShimRequest::Shutdown,
             ShimRequest::GetStats,
+            ShimRequest::Attach {
+                id: "c1".into(),
+                pty: true,
+            },
+            ShimRequest::Exec {
+                id: "c1".into(),
+                command: vec!["/bin/sh".into()],
+                env: vec!["TERM=xterm".into()],
+                pty: true,
+            },
         ];
 
         for req in cases {
@@ -181,6 +210,9 @@ mod tests {
                 cpu_usage_ns: 1_000_000,
                 memory_bytes: 64 * 1024 * 1024,
                 pids: 5,
+            },
+            ShimResponse::AttachReady {
+                socket_path: "/run/rauha/containers/abc/attach-123.sock".into(),
             },
         ];
 

@@ -55,10 +55,22 @@ unsafe impl Send for SendableVm {}
 #[cfg(target_os = "macos")]
 unsafe impl Sync for SendableVm {}
 
+/// Wrapper to make DispatchQueue Send + Sync.
+#[cfg(target_os = "macos")]
+struct SendableQueue(dispatch2::DispatchRetained<dispatch2::DispatchQueue>);
+#[cfg(target_os = "macos")]
+unsafe impl Send for SendableQueue {}
+#[cfg(target_os = "macos")]
+unsafe impl Sync for SendableQueue {}
+
 struct VmEntry {
     vsock_port: u32,
     #[cfg(target_os = "macos")]
     vm: SendableVm,
+    /// The serial dispatch queue this VM is bound to. All VM operations
+    /// (including vsock connect) must be dispatched to this queue.
+    #[cfg(target_os = "macos")]
+    queue: SendableQueue,
 }
 
 /// Manages the lifecycle of one VM per zone.
@@ -96,8 +108,14 @@ impl VmManager {
     }
 
     /// Boot a VM for the given zone.
+    ///
+    /// Virtualization.framework requires that `VZVirtualMachine` is created
+    /// and operated from the dispatch queue it's bound to. We create a
+    /// serial dispatch queue per VM and use `exec_sync` to run the start
+    /// call on that queue.
     #[cfg(target_os = "macos")]
     pub fn boot_vm(&self, zone_name: &str, config: &VmConfig) -> Result<()> {
+        use std::sync::{Arc, Condvar};
         use objc2_foundation::{NSArray, NSString, NSURL};
         use objc2_virtualization::*;
 
@@ -112,6 +130,8 @@ impl VmManager {
             }
         }
 
+        // Build the VM configuration (can happen on any thread).
+        eprintln!("[vm] creating boot loader");
         let kernel_url =
             NSURL::fileURLWithPath(&NSString::from_str(&self.kernel_path.to_string_lossy()));
         let boot_loader = unsafe {
@@ -123,10 +143,11 @@ impl VmManager {
                 &self.initramfs_path.to_string_lossy(),
             ));
             loader.setInitialRamdiskURL(Some(&initramfs_url));
-            loader.setCommandLine(&NSString::from_str("console=hvc0 quiet"));
+            loader.setCommandLine(&NSString::from_str("console=hvc0"));
             loader
         };
 
+        eprintln!("[vm] creating VM configuration (cpus={}, mem={})", config.cpus, config.memory_bytes);
         let vm_config_obj = unsafe {
             let cfg = VZVirtualMachineConfiguration::new();
             cfg.setBootLoader(Some(&boot_loader));
@@ -138,7 +159,7 @@ impl VmManager {
                 objc2::rc::Retained::cast_unchecked(vsock_config),
             ]));
 
-            let shared_dir = VZSharedDirectory::initWithURL_readOnly(
+            let shared_dir_obj = VZSharedDirectory::initWithURL_readOnly(
                 VZSharedDirectory::alloc(),
                 &NSURL::fileURLWithPath(&NSString::from_str(
                     &config.shared_dir.to_string_lossy(),
@@ -147,7 +168,7 @@ impl VmManager {
             );
             let single_dir_share = VZSingleDirectoryShare::initWithDirectory(
                 VZSingleDirectoryShare::alloc(),
-                &shared_dir,
+                &shared_dir_obj,
             );
             let fs_config = VZVirtioFileSystemDeviceConfiguration::initWithTag(
                 VZVirtioFileSystemDeviceConfiguration::alloc(),
@@ -165,9 +186,35 @@ impl VmManager {
                 objc2::rc::Retained::cast_unchecked(net_config),
             ]));
 
+            // Serial console — capture VM output to a log file for debugging.
+            let console_log = config.shared_dir.join("console.log");
+            if let Ok(file) = std::fs::File::create(&console_log) {
+                use std::os::fd::IntoRawFd;
+                let write_fd = file.into_raw_fd();
+                let write_handle = objc2_foundation::NSFileHandle::initWithFileDescriptor(
+                    objc2_foundation::NSFileHandle::alloc(),
+                    write_fd,
+                );
+                // Use /dev/null for the read side (we don't send input).
+                let read_handle = objc2_foundation::NSFileHandle::fileHandleWithNullDevice();
+                let serial_attachment =
+                    VZFileHandleSerialPortAttachment::initWithFileHandleForReading_fileHandleForWriting(
+                        VZFileHandleSerialPortAttachment::alloc(),
+                        Some(&read_handle),
+                        Some(&write_handle),
+                    );
+                let serial_config = VZVirtioConsoleDeviceSerialPortConfiguration::new();
+                serial_config.setAttachment(Some(&serial_attachment));
+                cfg.setSerialPorts(&NSArray::from_retained_slice(&[
+                    objc2::rc::Retained::cast_unchecked(serial_config),
+                ]));
+                eprintln!("[vm] serial console -> {}", console_log.display());
+            }
+
             cfg
         };
 
+        eprintln!("[vm] validating configuration");
         unsafe {
             if let Err(e) = vm_config_obj.validateWithError() {
                 return Err(RauhaError::BackendError(format!(
@@ -176,22 +223,72 @@ impl VmManager {
             }
         }
 
-        let zone = zone_name.to_string();
+        // Create a serial dispatch queue for this VM.
+        let queue = dispatch2::DispatchQueue::new(
+            &format!("com.rauha.vm.{zone_name}"),
+            None,
+        );
+
+        // Create the VM bound to our queue.
+        eprintln!("[vm] creating VZVirtualMachine on dispatch queue");
         let vm = unsafe {
-            let vm = VZVirtualMachine::initWithConfiguration(
+            VZVirtualMachine::initWithConfiguration_queue(
                 VZVirtualMachine::alloc(),
                 &vm_config_obj,
-            );
-            vm.startWithCompletionHandler(&block2::RcBlock::new(
-                move |err: *mut objc2_foundation::NSError| {
-                    if !err.is_null() {
-                        let e = &*err;
-                        tracing::error!(error = %e, zone = %zone, "VM start failed");
-                    }
-                },
-            ));
-            vm
+                &queue,
+            )
         };
+
+        // Start the VM from its queue using exec_sync + condvar for the
+        // async completion handler.
+        let start_result: Arc<Mutex<Option<std::result::Result<(), String>>>> =
+            Arc::new(Mutex::new(None));
+        let start_cond = Arc::new(Condvar::new());
+
+        eprintln!("[vm] starting VM via dispatch queue");
+        let sr = Arc::clone(&start_result);
+        let sc = Arc::clone(&start_cond);
+        // Safety: `vm` is a Retained<VZVirtualMachine> that lives on this
+        // stack frame until after the condvar wait below completes. The
+        // condvar is only signalled from the completion handler inside the
+        // closure, so `vm_ptr` is guaranteed alive for the entire closure.
+        let vm_ptr = objc2::rc::Retained::as_ptr(&vm) as usize;
+        queue.exec_async(move || {
+            eprintln!("[vm] inside dispatch queue — calling startWithCompletionHandler");
+            unsafe {
+                let vm_ref = &*(vm_ptr as *const objc2_virtualization::VZVirtualMachine);
+                vm_ref.startWithCompletionHandler(&block2::RcBlock::new(
+                    move |err: *mut objc2_foundation::NSError| {
+                        let res = if !err.is_null() {
+                            let e = &*err;
+                            eprintln!("[vm] start completion: error = {e}");
+                            Err(format!("VM start failed: {e}"))
+                        } else {
+                            eprintln!("[vm] start completion: success");
+                            Ok(())
+                        };
+                        let mut guard = sr.lock().unwrap();
+                        *guard = Some(res);
+                        sc.notify_one();
+                    },
+                ));
+            }
+        });
+
+        // Wait for the start completion handler.
+        let guard = start_result.lock().unwrap();
+        let (guard, timeout) = start_cond
+            .wait_timeout_while(guard, std::time::Duration::from_secs(30), |r| r.is_none())
+            .unwrap();
+
+        if timeout.timed_out() {
+            return Err(RauhaError::BackendError("VM start timed out (30s)".into()));
+        }
+
+        if let Some(Err(e)) = guard.as_ref() {
+            return Err(RauhaError::BackendError(e.clone()));
+        }
+        drop(guard);
 
         let mut vms = self.vms.lock().unwrap();
         vms.insert(
@@ -199,6 +296,7 @@ impl VmManager {
             VmEntry {
                 vsock_port: GUEST_AGENT_VSOCK_PORT,
                 vm: SendableVm(vm),
+                queue: SendableQueue(queue),
             },
         );
 
@@ -226,9 +324,10 @@ impl VmManager {
 
     /// Connect to the guest agent's vsock port inside a zone's VM.
     ///
-    /// Returns a pair of owned file descriptors (read_fd, write_fd) extracted
-    /// from the VZVirtioSocketConnection. These are plain fds — Send and usable
-    /// from any thread.
+    /// Returns an owned file descriptor from the VZVirtioSocketConnection.
+    /// The vsock connect is dispatched to the VM's serial queue (required by
+    /// Virtualization.framework — VM operations must happen on the queue
+    /// the VM was created on).
     #[cfg(target_os = "macos")]
     pub fn connect_vsock(
         &self,
@@ -243,21 +342,12 @@ impl VmManager {
         })?;
 
         let port = entry.vsock_port;
-        let vm = &entry.vm.0;
 
-        // Get the first socket device from the VM.
-        let socket_devices = unsafe { vm.socketDevices() };
-        if socket_devices.count() == 0 {
-            return Err(RauhaError::BackendError(format!(
-                "VM for zone {zone_name} has no socket devices"
-            )));
-        }
-        // socketDevices returns VZSocketDevice; downcast to VZVirtioSocketDevice.
-        let base_device = socket_devices.objectAtIndex(0);
-        let socket_device: &objc2_virtualization::VZVirtioSocketDevice =
-            unsafe { &*(&*base_device as *const _ as *const _) };
+        // We need to dispatch the vsock connect onto the VM's serial queue.
+        // Use raw pointers to pass the VM reference into the queue closure.
+        let vm_ptr = objc2::rc::Retained::as_ptr(&entry.vm.0) as usize;
+        let queue = &entry.queue.0;
 
-        // connectToPort_completionHandler is async — we use a condvar to wait.
         let result: Arc<Mutex<Option<std::result::Result<i32, String>>>> =
             Arc::new(Mutex::new(None));
         let cond = Arc::new(Condvar::new());
@@ -265,38 +355,60 @@ impl VmManager {
         let result_clone = Arc::clone(&result);
         let cond_clone = Arc::clone(&cond);
 
-        unsafe {
-            socket_device.connectToPort_completionHandler(
-                port,
-                &block2::RcBlock::new(
-                    move |conn: *mut objc2_virtualization::VZVirtioSocketConnection,
-                          err: *mut objc2_foundation::NSError| {
-                        let res = if !err.is_null() {
-                            let e = &*err;
-                            Err(format!("vsock connect failed: {e}"))
-                        } else if conn.is_null() {
-                            Err("vsock connect returned null connection".into())
-                        } else {
-                            let connection = &*conn;
-                            let fd = connection.fileDescriptor();
-                            // Dup the fd so we own it independently of the ObjC object.
-                            let duped = libc::dup(fd);
-                            if duped < 0 {
-                                Err(format!(
-                                    "dup failed: {}",
-                                    std::io::Error::last_os_error()
-                                ))
+        // Dispatch the entire vsock connect operation to the VM's queue.
+        queue.exec_async(move || {
+            unsafe {
+                let vm_ref = &*(vm_ptr as *const objc2_virtualization::VZVirtualMachine);
+                let socket_devices = vm_ref.socketDevices();
+
+                if socket_devices.count() == 0 {
+                    let mut guard = result_clone.lock().unwrap();
+                    *guard = Some(Err("VM has no socket devices".into()));
+                    cond_clone.notify_one();
+                    return;
+                }
+
+                let base_device = socket_devices.objectAtIndex(0);
+                let socket_device: &objc2_virtualization::VZVirtioSocketDevice =
+                    &*(&*base_device as *const _ as *const _);
+
+                let rc = Arc::clone(&result_clone);
+                let cc = Arc::clone(&cond_clone);
+
+                socket_device.connectToPort_completionHandler(
+                    port,
+                    &block2::RcBlock::new(
+                        move |conn: *mut objc2_virtualization::VZVirtioSocketConnection,
+                              err: *mut objc2_foundation::NSError| {
+                            let res = if !err.is_null() {
+                                let e = &*err;
+                                Err(format!("vsock connect failed: {e}"))
+                            } else if conn.is_null() {
+                                Err("vsock connect returned null connection".into())
                             } else {
-                                Ok(duped)
-                            }
-                        };
-                        let mut guard = result_clone.lock().unwrap();
-                        *guard = Some(res);
-                        cond_clone.notify_one();
-                    },
-                ),
-            );
-        }
+                                let connection = &*conn;
+                                let fd = connection.fileDescriptor();
+                                let duped = libc::dup(fd);
+                                if duped < 0 {
+                                    Err(format!(
+                                        "dup failed: {}",
+                                        std::io::Error::last_os_error()
+                                    ))
+                                } else {
+                                    Ok(duped)
+                                }
+                            };
+                            let mut guard = rc.lock().unwrap();
+                            *guard = Some(res);
+                            cc.notify_one();
+                        },
+                    ),
+                );
+            }
+        });
+
+        // Drop the vms lock before waiting — we don't need it anymore.
+        drop(vms);
 
         // Wait for the callback (with timeout).
         let guard = result.lock().unwrap();

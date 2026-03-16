@@ -19,10 +19,37 @@ pub struct ZoneRegistry {
     metadata: Arc<MetadataStore>,
     backend: Arc<dyn IsolationBackend>,
     image_service: Arc<rauha_oci::image::ImageService>,
+    #[allow(dead_code)] // Used on Linux for overlayfs snapshotter paths.
+    root: String,
     /// In-memory cache of zone handles for fast backend operations.
     handles: RwLock<HashMap<String, ZoneHandle>>,
     /// In-memory cache of container handles (needed for start/stop operations).
     container_handles: RwLock<HashMap<Uuid, ContainerHandle>>,
+}
+
+/// Validate that a zone name is safe (no path traversal, no special chars).
+fn validate_zone_name(name: &str) -> Result<()> {
+    if name.is_empty() {
+        return Err(RauhaError::BackendError(
+            "zone name cannot be empty".into(),
+        ));
+    }
+    if name.contains('/') || name.contains('\\') || name.contains('\0') {
+        return Err(RauhaError::BackendError(
+            "zone name must not contain path separators".into(),
+        ));
+    }
+    if name == "." || name == ".." {
+        return Err(RauhaError::BackendError(
+            "zone name must not be '.' or '..'".into(),
+        ));
+    }
+    if name.len() > 128 {
+        return Err(RauhaError::BackendError(
+            "zone name must be 128 characters or fewer".into(),
+        ));
+    }
+    Ok(())
 }
 
 impl ZoneRegistry {
@@ -30,14 +57,22 @@ impl ZoneRegistry {
         metadata: Arc<MetadataStore>,
         backend: Arc<dyn IsolationBackend>,
         image_service: Arc<rauha_oci::image::ImageService>,
+        root: String,
     ) -> Self {
         Self {
             metadata,
             backend,
             image_service,
+            root,
             handles: RwLock::new(HashMap::new()),
             container_handles: RwLock::new(HashMap::new()),
         }
+    }
+
+    /// Return the root data directory path.
+    #[allow(dead_code)] // Used on Linux for overlayfs snapshotter paths.
+    pub fn root_path(&self) -> String {
+        self.root.clone()
     }
 
     /// Reconcile persisted metadata with kernel state on startup.
@@ -88,6 +123,9 @@ impl ZoneRegistry {
     }
 
     pub async fn create_zone(&self, name: &str, zone_type: ZoneType, policy: ZonePolicy) -> Result<Zone> {
+        // Validate zone name: reject path traversal and unsafe characters.
+        validate_zone_name(name)?;
+
         // Check for duplicates.
         if self.metadata.get_zone(name)?.is_some() {
             return Err(RauhaError::ZoneAlreadyExists(name.into()));
@@ -201,16 +239,48 @@ impl ZoneRegistry {
 
         // Prepare rootfs from image if one is specified.
         // Uses spawn_blocking because layer extraction does heavy I/O.
+        //
+        // On Linux, extract per-layer directories for overlayfs (O(1) mount).
+        // On other platforms, fall back to full rootfs copy.
         let mut spec = spec;
         if !spec.image.is_empty() {
             let image_svc = self.image_service.clone();
             let image_ref = spec.image.clone();
-            let base = tokio::task::spawn_blocking(move || {
-                image_svc.prepare_base_rootfs(&image_ref)
-            })
-            .await
-            .map_err(|e| RauhaError::BackendError(format!("rootfs task panicked: {e}")))??;
-            spec.rootfs_path = Some(base);
+            #[cfg(target_os = "linux")]
+            {
+                let zone_root = self.root_path();
+                let zone_name_owned = zone_name.to_string();
+                let layers = tokio::task::spawn_blocking(move || {
+                    let safe_name = image_svc.image_safe_name(&image_ref)?;
+                    let (digests, content_root) = image_svc.layer_digests(&image_ref)?;
+
+                    let zone_data = std::path::PathBuf::from(&zone_root)
+                        .join("zones")
+                        .join(&zone_name_owned);
+                    let snapshotter =
+                        rauha_oci::snapshotter::OverlayfsSnapshotter::new(&zone_data);
+                    let layer_paths =
+                        snapshotter.prepare_layers(&safe_name, &digests, &content_root)?;
+
+                    // Skip prepare_base_rootfs — overlayfs mounts the per-layer
+                    // directories directly. The merged rootfs would be redundant.
+                    Ok::<_, RauhaError>(layer_paths)
+                })
+                .await
+                .map_err(|e| RauhaError::BackendError(format!("rootfs task panicked: {e}")))??;
+
+                spec.overlay_layers = Some(layers);
+            }
+
+            #[cfg(not(target_os = "linux"))]
+            {
+                let base = tokio::task::spawn_blocking(move || {
+                    image_svc.prepare_base_rootfs(&image_ref)
+                })
+                .await
+                .map_err(|e| RauhaError::BackendError(format!("rootfs task panicked: {e}")))??;
+                spec.rootfs_path = Some(base);
+            }
         }
 
         let handles = self.handles.read().await;
@@ -318,6 +388,25 @@ impl ZoneRegistry {
             }
         }
 
+        // Unmount overlayfs if applicable (Linux only, no-op on other platforms).
+        #[cfg(target_os = "linux")]
+        {
+            let zone_name = self.zone_name_for_container(&container.zone_id).await;
+            if let Some(zone_name) = zone_name {
+                let zone_data = std::path::PathBuf::from(&self.root)
+                    .join("zones")
+                    .join(&zone_name);
+                let container_root = zone_data
+                    .join("containers")
+                    .join(container_id.to_string());
+                let snapshotter =
+                    rauha_oci::snapshotter::OverlayfsSnapshotter::new(&zone_data);
+                if let Err(e) = snapshotter.unmount_overlay(&container_root) {
+                    tracing::warn!(container = %container_id, %e, "failed to unmount overlay");
+                }
+            }
+        }
+
         self.container_handles.write().await.remove(container_id);
         self.metadata.delete_container(container_id)?;
 
@@ -358,5 +447,429 @@ impl ZoneRegistry {
             .get(zone_name)
             .ok_or_else(|| RauhaError::ZoneNotFound(zone_name.into()))?;
         self.backend.verify_isolation(handle)
+    }
+
+    /// Look up the zone name for a container's zone_id.
+    pub async fn zone_name_for_container(&self, zone_id: &Uuid) -> Option<String> {
+        let handles = self.handles.read().await;
+        handles
+            .iter()
+            .find(|(_, h)| h.id == *zone_id)
+            .map(|(name, _)| name.clone())
+    }
+
+    /// Send a shim request for a zone. Delegates to the backend.
+    pub async fn shim_request(
+        &self,
+        zone_name: &str,
+        request: &rauha_common::shim::ShimRequest,
+    ) -> Result<rauha_common::shim::ShimResponse> {
+        // The shim communication is handled by the Linux backend.
+        // We need to use a generic approach — send via Unix socket directly.
+        let socket_path = format!("/run/rauha/shim-{zone_name}.sock");
+        let path = std::path::PathBuf::from(&socket_path);
+
+        if !path.exists() {
+            return Err(RauhaError::ShimError {
+                zone: zone_name.into(),
+                message: "shim socket not found".into(),
+            });
+        }
+
+        // Use spawn_blocking since Unix socket I/O is sync.
+        let request_clone = rauha_common::shim::encode(request).map_err(|e| {
+            RauhaError::ShimError {
+                zone: zone_name.into(),
+                message: format!("failed to encode request: {e}"),
+            }
+        })?;
+
+        let zone_name_owned = zone_name.to_string();
+        tokio::task::spawn_blocking(move || {
+            use std::io::Write;
+            let mut stream = std::os::unix::net::UnixStream::connect(&path).map_err(|e| {
+                RauhaError::ShimError {
+                    zone: zone_name_owned.clone(),
+                    message: format!("failed to connect to shim: {e}"),
+                }
+            })?;
+
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(30)))
+                .ok();
+            stream
+                .set_write_timeout(Some(std::time::Duration::from_secs(10)))
+                .ok();
+
+            stream.write_all(&request_clone).map_err(|e| RauhaError::ShimError {
+                zone: zone_name_owned.clone(),
+                message: format!("failed to send request: {e}"),
+            })?;
+            stream.flush().map_err(|e| RauhaError::ShimError {
+                zone: zone_name_owned.clone(),
+                message: format!("failed to flush: {e}"),
+            })?;
+
+            rauha_common::shim::decode_from::<rauha_common::shim::ShimResponse>(&mut stream)
+                .map_err(|e| RauhaError::ShimError {
+                    zone: zone_name_owned,
+                    message: format!("failed to read response: {e}"),
+                })
+        })
+        .await
+        .map_err(|e| RauhaError::BackendError(format!("shim task panicked: {e}")))?
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rauha_common::backend::IsolationBackend;
+    use rauha_common::container::{ContainerHandle, ContainerSpec};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use tempfile::TempDir;
+
+    /// Minimal mock backend for testing registry logic.
+    struct MockBackend {
+        next_id: AtomicU64,
+    }
+
+    impl MockBackend {
+        fn new() -> Self {
+            Self {
+                next_id: AtomicU64::new(1),
+            }
+        }
+    }
+
+    impl IsolationBackend for MockBackend {
+        fn create_zone(&self, _config: &ZoneConfig) -> Result<ZoneHandle> {
+            Ok(ZoneHandle {
+                id: Uuid::new_v4(),
+                name: _config.name.clone(),
+                platform_id: self.next_id.fetch_add(1, Ordering::Relaxed),
+            })
+        }
+
+        fn destroy_zone(&self, _zone: &ZoneHandle) -> Result<()> {
+            Ok(())
+        }
+
+        fn enforce_policy(&self, _zone: &ZoneHandle, _policy: &ZonePolicy) -> Result<()> {
+            Ok(())
+        }
+
+        fn hot_reload_policy(&self, _zone: &ZoneHandle, _policy: &ZonePolicy) -> Result<()> {
+            Ok(())
+        }
+
+        fn create_container(
+            &self,
+            zone: &ZoneHandle,
+            _spec: &ContainerSpec,
+        ) -> Result<ContainerHandle> {
+            Ok(ContainerHandle {
+                id: Uuid::new_v4(),
+                zone_id: zone.id,
+                pid: 9999,
+                platform_id: self.next_id.fetch_add(1, Ordering::Relaxed),
+            })
+        }
+
+        fn start_container(&self, _container: &ContainerHandle) -> Result<()> {
+            Ok(())
+        }
+
+        fn stop_container(&self, _container: &ContainerHandle) -> Result<()> {
+            Ok(())
+        }
+
+        fn zone_stats(&self, zone: &ZoneHandle) -> Result<ZoneStats> {
+            Ok(ZoneStats {
+                zone_id: zone.id,
+                container_count: 0,
+                cpu_usage_percent: 0.0,
+                memory_usage_bytes: 0,
+                memory_limit_bytes: 0,
+                network_rx_bytes: 0,
+                network_tx_bytes: 0,
+                pids_current: 0,
+            })
+        }
+
+        fn verify_isolation(&self, zone: &ZoneHandle) -> Result<IsolationReport> {
+            Ok(IsolationReport {
+                zone_id: zone.id,
+                model: IsolationModel::SyscallPolicy,
+                is_isolated: true,
+                checks: vec![],
+            })
+        }
+
+        fn recover_zone(
+            &self,
+            _zone: &ZoneHandle,
+            _zone_type: ZoneType,
+            _policy: &ZonePolicy,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        fn cleanup_orphans(&self, _known_zones: &[ZoneHandle]) -> Result<()> {
+            Ok(())
+        }
+
+        fn isolation_model(&self) -> IsolationModel {
+            IsolationModel::SyscallPolicy
+        }
+
+        fn name(&self) -> &str {
+            "mock"
+        }
+    }
+
+    fn test_registry(tmp: &TempDir) -> ZoneRegistry {
+        let db_path = tmp.path().join("test.redb");
+        let content_path = tmp.path().join("content");
+        let metadata = Arc::new(MetadataStore::open(&db_path).unwrap());
+        let content = Arc::new(
+            rauha_oci::content::ContentStore::new(&content_path).unwrap(),
+        );
+        let image_svc = Arc::new(rauha_oci::image::ImageService::new(
+            content,
+            tmp.path().to_path_buf(),
+        ));
+        let backend: Arc<dyn IsolationBackend> = Arc::new(MockBackend::new());
+        ZoneRegistry::new(metadata, backend, image_svc, tmp.path().to_string_lossy().into())
+    }
+
+    fn make_spec(name: &str) -> ContainerSpec {
+        ContainerSpec {
+            name: name.into(),
+            image: String::new(), // empty skips rootfs preparation
+            command: vec!["/bin/sh".into()],
+            env: vec![],
+            working_dir: None,
+            rootfs_path: None,
+            overlay_layers: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn create_zone_persists() {
+        let tmp = TempDir::new().unwrap();
+        let reg = test_registry(&tmp);
+
+        let zone = reg
+            .create_zone("alpha", ZoneType::NonGlobal, ZonePolicy::default())
+            .await
+            .unwrap();
+
+        assert_eq!(zone.name, "alpha");
+        assert_eq!(zone.state, ZoneState::Ready);
+
+        // Verify it's in metadata.
+        let loaded = reg.get_zone("alpha").await.unwrap();
+        assert_eq!(loaded.id, zone.id);
+    }
+
+    #[tokio::test]
+    async fn duplicate_zone_rejected() {
+        let tmp = TempDir::new().unwrap();
+        let reg = test_registry(&tmp);
+
+        reg.create_zone("dup", ZoneType::NonGlobal, ZonePolicy::default())
+            .await
+            .unwrap();
+
+        let err = reg
+            .create_zone("dup", ZoneType::NonGlobal, ZonePolicy::default())
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(err, RauhaError::ZoneAlreadyExists(_)),
+            "expected ZoneAlreadyExists, got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_zone_removes_from_metadata() {
+        let tmp = TempDir::new().unwrap();
+        let reg = test_registry(&tmp);
+
+        reg.create_zone("gone", ZoneType::NonGlobal, ZonePolicy::default())
+            .await
+            .unwrap();
+        reg.delete_zone("gone", false).await.unwrap();
+
+        let err = reg.get_zone("gone").await.unwrap_err();
+        assert!(matches!(err, RauhaError::ZoneNotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn delete_nonexistent_zone_errors() {
+        let tmp = TempDir::new().unwrap();
+        let reg = test_registry(&tmp);
+
+        let err = reg.delete_zone("nope", false).await.unwrap_err();
+        assert!(matches!(err, RauhaError::ZoneNotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn create_container_in_zone() {
+        let tmp = TempDir::new().unwrap();
+        let reg = test_registry(&tmp);
+
+        let zone = reg
+            .create_zone("myzone", ZoneType::NonGlobal, ZonePolicy::default())
+            .await
+            .unwrap();
+
+        let container = reg
+            .create_container("myzone", make_spec("ctr1"))
+            .await
+            .unwrap();
+
+        assert_eq!(container.zone_id, zone.id);
+        assert_eq!(container.name, "ctr1");
+        assert_eq!(container.state, rauha_common::container::ContainerState::Created);
+
+        // Verify persisted.
+        let loaded = reg.get_container(&container.id).unwrap();
+        assert_eq!(loaded.id, container.id);
+    }
+
+    #[tokio::test]
+    async fn create_container_in_missing_zone() {
+        let tmp = TempDir::new().unwrap();
+        let reg = test_registry(&tmp);
+
+        let err = reg
+            .create_container("ghost", make_spec("ctr1"))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, RauhaError::ZoneNotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn delete_zone_blocked_by_containers() {
+        let tmp = TempDir::new().unwrap();
+        let reg = test_registry(&tmp);
+
+        reg.create_zone("busy", ZoneType::NonGlobal, ZonePolicy::default())
+            .await
+            .unwrap();
+        reg.create_container("busy", make_spec("ctr1"))
+            .await
+            .unwrap();
+
+        let err = reg.delete_zone("busy", false).await.unwrap_err();
+        assert!(matches!(err, RauhaError::ZoneNotEmpty { .. }));
+    }
+
+    #[tokio::test]
+    async fn force_delete_zone_with_containers() {
+        let tmp = TempDir::new().unwrap();
+        let reg = test_registry(&tmp);
+
+        reg.create_zone("forceme", ZoneType::NonGlobal, ZonePolicy::default())
+            .await
+            .unwrap();
+        let ctr = reg
+            .create_container("forceme", make_spec("ctr1"))
+            .await
+            .unwrap();
+
+        reg.delete_zone("forceme", true).await.unwrap();
+
+        // Zone gone.
+        assert!(reg.get_zone("forceme").await.is_err());
+        // Container gone.
+        assert!(reg.get_container(&ctr.id).is_err());
+    }
+
+    #[tokio::test]
+    async fn container_lifecycle_states() {
+        let tmp = TempDir::new().unwrap();
+        let reg = test_registry(&tmp);
+
+        reg.create_zone("lc", ZoneType::NonGlobal, ZonePolicy::default())
+            .await
+            .unwrap();
+        let ctr = reg.create_container("lc", make_spec("ctr")).await.unwrap();
+        assert_eq!(ctr.state, rauha_common::container::ContainerState::Created);
+
+        // Start.
+        reg.start_container(&ctr.id).await.unwrap();
+        let running = reg.get_container(&ctr.id).unwrap();
+        assert_eq!(running.state, rauha_common::container::ContainerState::Running);
+        assert!(running.started_at.is_some());
+
+        // Stop.
+        reg.stop_container(&ctr.id, 10).await.unwrap();
+        let stopped = reg.get_container(&ctr.id).unwrap();
+        assert_eq!(stopped.state, rauha_common::container::ContainerState::Stopped);
+        assert!(stopped.finished_at.is_some());
+
+        // Delete.
+        reg.delete_container(&ctr.id, false).await.unwrap();
+        assert!(reg.get_container(&ctr.id).is_err());
+    }
+
+    #[tokio::test]
+    async fn list_containers_filters_by_zone() {
+        let tmp = TempDir::new().unwrap();
+        let reg = test_registry(&tmp);
+
+        reg.create_zone("z1", ZoneType::NonGlobal, ZonePolicy::default())
+            .await
+            .unwrap();
+        reg.create_zone("z2", ZoneType::NonGlobal, ZonePolicy::default())
+            .await
+            .unwrap();
+
+        reg.create_container("z1", make_spec("a")).await.unwrap();
+        reg.create_container("z1", make_spec("b")).await.unwrap();
+        reg.create_container("z2", make_spec("c")).await.unwrap();
+
+        assert_eq!(reg.list_containers(Some("z1")).unwrap().len(), 2);
+        assert_eq!(reg.list_containers(Some("z2")).unwrap().len(), 1);
+        assert_eq!(reg.list_containers(None).unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn zone_name_for_container_lookup() {
+        let tmp = TempDir::new().unwrap();
+        let reg = test_registry(&tmp);
+
+        let zone = reg
+            .create_zone("lookup", ZoneType::NonGlobal, ZonePolicy::default())
+            .await
+            .unwrap();
+
+        let name = reg.zone_name_for_container(&zone.id).await;
+        assert_eq!(name.as_deref(), Some("lookup"));
+
+        // Unknown zone_id.
+        assert!(reg.zone_name_for_container(&Uuid::new_v4()).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn apply_policy_updates_metadata() {
+        let tmp = TempDir::new().unwrap();
+        let reg = test_registry(&tmp);
+
+        reg.create_zone("pol", ZoneType::NonGlobal, ZonePolicy::default())
+            .await
+            .unwrap();
+
+        let mut new_policy = ZonePolicy::default();
+        new_policy.resources.pids_max = 999;
+
+        reg.apply_policy("pol", new_policy).await.unwrap();
+
+        let zone = reg.get_zone("pol").await.unwrap();
+        assert_eq!(zone.policy.resources.pids_max, 999);
     }
 }

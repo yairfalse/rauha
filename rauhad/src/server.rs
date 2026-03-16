@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
-use tonic::{Request, Response, Status};
+use tonic::{Request, Response, Status, Streaming};
 
 use crate::zone::registry::ZoneRegistry;
 
@@ -267,6 +267,7 @@ impl ContainerService for ContainerServiceImpl {
                 Some(req.working_dir)
             },
             rootfs_path: None,
+            overlay_layers: None,
         };
 
         let container = self
@@ -405,13 +406,283 @@ impl ContainerService for ContainerServiceImpl {
         }))
     }
 
+    type ContainerLogsStream = ReceiverStream<Result<pb::container::ContainerLogEntry, Status>>;
+
+    async fn container_logs(
+        &self,
+        request: Request<pb::container::ContainerLogsRequest>,
+    ) -> Result<Response<Self::ContainerLogsStream>, Status> {
+        let req = request.into_inner();
+        let container_id = req
+            .container_id
+            .parse::<uuid::Uuid>()
+            .map_err(|e| Status::invalid_argument(format!("invalid container ID: {e}")))?;
+
+        // Verify container exists.
+        self.registry
+            .get_container(&container_id)
+            .map_err(|e| Status::not_found(e.to_string()))?;
+
+        let (tx, rx) = mpsc::channel(256);
+        let follow = req.follow;
+        let tail = req.tail;
+        let id_str = container_id.to_string();
+
+        // Cancellation flag: set when the tx channel is dropped (client disconnects).
+        let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cancelled_clone = cancelled.clone();
+
+        // Monitor the receiver: when the client drops, signal cancellation.
+        let tx_clone = tx.clone();
+        tokio::spawn(async move {
+            tx_clone.closed().await;
+            cancelled_clone.store(true, std::sync::atomic::Ordering::Relaxed);
+        });
+
+        tokio::task::spawn_blocking(move || {
+            crate::logs::tail_logs(&id_str, follow, tail, &cancelled, |log_line| {
+                tx.blocking_send(Ok(pb::container::ContainerLogEntry {
+                    source: log_line.source,
+                    line: log_line.line,
+                    timestamp: log_line.timestamp,
+                }))
+                .is_ok()
+            });
+        });
+
+        Ok(Response::new(ReceiverStream::new(rx)))
+    }
+
     async fn exec_in_container(
         &self,
         _request: Request<pb::container::ExecInContainerRequest>,
     ) -> Result<Response<pb::container::ExecInContainerResponse>, Status> {
         Err(Status::unimplemented(
-            "exec_in_container is planned for Phase 4",
+            "exec_in_container: use ExecStream for interactive exec",
         ))
+    }
+
+    type ExecStreamStream = ReceiverStream<Result<pb::container::ExecStreamResponse, Status>>;
+
+    async fn exec_stream(
+        &self,
+        request: Request<Streaming<pb::container::ExecStreamRequest>>,
+    ) -> Result<Response<Self::ExecStreamStream>, Status> {
+        use tokio_stream::StreamExt;
+
+        let mut in_stream = request.into_inner();
+
+        // First message must be ExecStreamStart.
+        let start = match in_stream.next().await {
+            Some(Ok(msg)) => match msg.message {
+                Some(pb::container::exec_stream_request::Message::Start(s)) => s,
+                _ => return Err(Status::invalid_argument("first message must be ExecStreamStart")),
+            },
+            _ => return Err(Status::invalid_argument("empty stream")),
+        };
+
+        let container_id = start
+            .container_id
+            .parse::<uuid::Uuid>()
+            .map_err(|e| Status::invalid_argument(format!("invalid container ID: {e}")))?;
+
+        // Verify container exists and get its zone.
+        let container = self
+            .registry
+            .get_container(&container_id)
+            .map_err(|e| Status::not_found(e.to_string()))?;
+
+        // Look up zone name.
+        let zone_name = self
+            .registry
+            .zone_name_for_container(&container.zone_id)
+            .await
+            .ok_or_else(|| Status::internal("zone not found for container"))?;
+
+        // Send Exec request to shim.
+        let exec_req = rauha_common::shim::ShimRequest::Exec {
+            id: container_id.to_string(),
+            command: start.command,
+            env: start.env.into_iter().map(|(k, v)| format!("{k}={v}")).collect(),
+            pty: start.tty,
+        };
+
+        let response = self
+            .registry
+            .shim_request(&zone_name, &exec_req)
+            .await
+            .map_err(|e| Status::internal(format!("shim exec failed: {e}")))?;
+
+        let socket_path = match response {
+            rauha_common::shim::ShimResponse::AttachReady { socket_path } => socket_path,
+            rauha_common::shim::ShimResponse::Error { message } => {
+                return Err(Status::internal(format!("exec failed: {message}")));
+            }
+            _ => return Err(Status::internal("unexpected shim response")),
+        };
+
+        // Connect to the attach socket.
+        let stream = tokio::net::UnixStream::connect(&socket_path)
+            .await
+            .map_err(|e| Status::internal(format!("failed to connect to attach socket: {e}")))?;
+
+        let (read_half, write_half) = stream.into_split();
+
+        let (tx, rx) = mpsc::channel(256);
+
+        // Read from attach socket → send to gRPC client.
+        tokio::spawn(async move {
+            use tokio::io::AsyncReadExt;
+            let mut reader = read_half;
+            let mut buf = [0u8; 4096];
+            loop {
+                match reader.read(&mut buf).await {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        let resp = pb::container::ExecStreamResponse {
+                            message: Some(
+                                pb::container::exec_stream_response::Message::StdoutData(
+                                    buf[..n].to_vec(),
+                                ),
+                            ),
+                        };
+                        if tx.send(Ok(resp)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        // Read from gRPC client → write to attach socket.
+        tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt;
+            let mut writer = write_half;
+            while let Some(Ok(msg)) = in_stream.next().await {
+                match msg.message {
+                    Some(pb::container::exec_stream_request::Message::StdinData(data)) => {
+                        if writer.write_all(&data).await.is_err() {
+                            break;
+                        }
+                    }
+                    Some(pb::container::exec_stream_request::Message::Resize(_resize)) => {
+                        // TODO: send TIOCSWINSZ to PTY via shim
+                    }
+                    _ => {}
+                }
+            }
+        });
+
+        Ok(Response::new(ReceiverStream::new(rx)))
+    }
+
+    type AttachStream = ReceiverStream<Result<pb::container::AttachResponse, Status>>;
+
+    async fn attach(
+        &self,
+        request: Request<Streaming<pb::container::AttachRequest>>,
+    ) -> Result<Response<Self::AttachStream>, Status> {
+        use tokio_stream::StreamExt;
+
+        let mut in_stream = request.into_inner();
+
+        // First message must be AttachStart.
+        let start = match in_stream.next().await {
+            Some(Ok(msg)) => match msg.message {
+                Some(pb::container::attach_request::Message::Start(s)) => s,
+                _ => return Err(Status::invalid_argument("first message must be AttachStart")),
+            },
+            _ => return Err(Status::invalid_argument("empty stream")),
+        };
+
+        let container_id = start
+            .container_id
+            .parse::<uuid::Uuid>()
+            .map_err(|e| Status::invalid_argument(format!("invalid container ID: {e}")))?;
+
+        let container = self
+            .registry
+            .get_container(&container_id)
+            .map_err(|e| Status::not_found(e.to_string()))?;
+
+        let zone_name = self
+            .registry
+            .zone_name_for_container(&container.zone_id)
+            .await
+            .ok_or_else(|| Status::internal("zone not found for container"))?;
+
+        let attach_req = rauha_common::shim::ShimRequest::Attach {
+            id: container_id.to_string(),
+            pty: true,
+        };
+
+        let response = self
+            .registry
+            .shim_request(&zone_name, &attach_req)
+            .await
+            .map_err(|e| Status::internal(format!("shim attach failed: {e}")))?;
+
+        match response {
+            rauha_common::shim::ShimResponse::AttachReady { socket_path } => {
+                let stream = tokio::net::UnixStream::connect(&socket_path)
+                    .await
+                    .map_err(|e| {
+                        Status::internal(format!("failed to connect to attach socket: {e}"))
+                    })?;
+
+                let (read_half, write_half) = stream.into_split();
+                let (tx, rx) = mpsc::channel(256);
+
+                tokio::spawn(async move {
+                    use tokio::io::AsyncReadExt;
+                    let mut reader = read_half;
+                    let mut buf = [0u8; 4096];
+                    loop {
+                        match reader.read(&mut buf).await {
+                            Ok(0) => break,
+                            Ok(n) => {
+                                let resp = pb::container::AttachResponse {
+                                    message: Some(
+                                        pb::container::attach_response::Message::StdoutData(
+                                            buf[..n].to_vec(),
+                                        ),
+                                    ),
+                                };
+                                if tx.send(Ok(resp)).await.is_err() {
+                                    break;
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                });
+
+                tokio::spawn(async move {
+                    use tokio::io::AsyncWriteExt;
+                    let mut writer = write_half;
+                    while let Some(Ok(msg)) = in_stream.next().await {
+                        match msg.message {
+                            Some(pb::container::attach_request::Message::StdinData(data)) => {
+                                if writer.write_all(&data).await.is_err() {
+                                    break;
+                                }
+                            }
+                            Some(pb::container::attach_request::Message::Resize(_resize)) => {
+                                // TODO: send TIOCSWINSZ to PTY via shim
+                            }
+                            _ => {}
+                        }
+                    }
+                });
+
+                Ok(Response::new(ReceiverStream::new(rx)))
+            }
+            rauha_common::shim::ShimResponse::Error { message } => {
+                Err(Status::internal(format!("attach failed: {message}")))
+            }
+            _ => Err(Status::internal("unexpected shim response")),
+        }
     }
 }
 

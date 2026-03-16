@@ -153,10 +153,22 @@ fn handle_request(state: &mut AgentState, request: ShimRequest) -> ShimResponse 
                 pids,
             }
         }
+        ShimRequest::Attach { .. } => ShimResponse::Error {
+            message: "attach not yet supported in guest agent".into(),
+        },
+        ShimRequest::Exec { .. } => ShimResponse::Error {
+            message: "exec not yet supported in guest agent".into(),
+        },
     }
 }
 
 fn main() -> anyhow::Result<()> {
+    // When running as PID 1 inside a VM, mount essential filesystems first.
+    #[cfg(target_os = "linux")]
+    if std::process::id() == 1 {
+        init_filesystems();
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter("rauha_guest_agent=info")
         .init();
@@ -167,22 +179,154 @@ fn main() -> anyhow::Result<()> {
     let rootfs_root = PathBuf::from("/mnt/rauha");
     let mut state = AgentState::new(rootfs_root);
 
-    // In a real VM, we'd listen on vsock CID=3 (VMADDR_CID_HOST) port 5123.
-    // For now, we listen on a Unix socket as a fallback for testing, and
-    // attempt vsock if /dev/vsock is available.
-    let socket_path = "/run/rauha-guest-agent.sock";
-
-    if std::path::Path::new("/dev/vsock").exists() {
+    // Listen on vsock for connections from the host rauhad daemon.
+    #[cfg(target_os = "linux")]
+    {
         tracing::info!(port = VSOCK_PORT, "listening on vsock");
-        // vsock listening requires raw socket via libc::socket(AF_VSOCK, ...).
-        // Fall back to Unix socket for initial testing.
-        listen_unix(socket_path, &mut state)?;
-    } else {
-        tracing::info!(path = socket_path, "listening on unix socket (vsock not available)");
+        listen_vsock(VSOCK_PORT, &mut state)?;
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let socket_path = "/run/rauha-guest-agent.sock";
+        tracing::info!(path = socket_path, "listening on unix socket (not Linux)");
         listen_unix(socket_path, &mut state)?;
     }
 
     tracing::info!("guest agent exited");
+    Ok(())
+}
+
+/// Mount essential filesystems when running as PID 1 (init) inside a VM.
+#[cfg(target_os = "linux")]
+fn init_filesystems() {
+    use nix::mount::{mount, MsFlags};
+
+    eprintln!("rauha-guest-agent: running as PID 1, mounting filesystems");
+
+    let mounts = [
+        ("proc", "/proc", "proc", MsFlags::empty()),
+        ("sysfs", "/sys", "sysfs", MsFlags::empty()),
+        ("devtmpfs", "/dev", "devtmpfs", MsFlags::empty()),
+    ];
+
+    for (src, target, fstype, flags) in &mounts {
+        let _ = std::fs::create_dir_all(target);
+        if let Err(e) = mount(
+            Some(*src),
+            *target,
+            Some(*fstype),
+            *flags,
+            None::<&str>,
+        ) {
+            eprintln!("  mount {target}: {e}");
+        }
+    }
+
+    // devpts for PTY support.
+    let _ = std::fs::create_dir_all("/dev/pts");
+    let _ = mount(
+        Some("devpts"),
+        "/dev/pts",
+        Some("devpts"),
+        MsFlags::empty(),
+        None::<&str>,
+    );
+
+    // Mount virtio-fs share from host.
+    let _ = std::fs::create_dir_all("/mnt/rauha");
+    if let Err(e) = mount(
+        Some("rauha"),
+        "/mnt/rauha",
+        Some("virtiofs"),
+        MsFlags::empty(),
+        None::<&str>,
+    ) {
+        eprintln!("  mount /mnt/rauha (virtiofs): {e}");
+    }
+
+    // /run for socket files.
+    let _ = std::fs::create_dir_all("/run");
+}
+
+/// Listen on virtio-vsock for connections from the host.
+#[cfg(target_os = "linux")]
+fn listen_vsock(port: u16, state: &mut AgentState) -> anyhow::Result<()> {
+    const AF_VSOCK: i32 = 40;
+    const VMADDR_CID_ANY: u32 = 0xFFFFFFFF;
+
+    #[repr(C)]
+    struct SockaddrVm {
+        svm_family: u16,
+        svm_reserved1: u16,
+        svm_port: u32,
+        svm_cid: u32,
+        svm_zero: [u8; 4],
+    }
+
+    let fd = unsafe { libc::socket(AF_VSOCK, libc::SOCK_STREAM, 0) };
+    if fd < 0 {
+        anyhow::bail!("failed to create vsock socket: {}", std::io::Error::last_os_error());
+    }
+
+    let addr = SockaddrVm {
+        svm_family: AF_VSOCK as u16,
+        svm_reserved1: 0,
+        svm_port: port as u32,
+        svm_cid: VMADDR_CID_ANY,
+        svm_zero: [0; 4],
+    };
+
+    let ret = unsafe {
+        libc::bind(
+            fd,
+            &addr as *const _ as *const libc::sockaddr,
+            std::mem::size_of::<SockaddrVm>() as u32,
+        )
+    };
+    if ret < 0 {
+        unsafe { libc::close(fd); }
+        anyhow::bail!("failed to bind vsock: {}", std::io::Error::last_os_error());
+    }
+
+    let ret = unsafe { libc::listen(fd, 5) };
+    if ret < 0 {
+        unsafe { libc::close(fd); }
+        anyhow::bail!("failed to listen on vsock: {}", std::io::Error::last_os_error());
+    }
+
+    tracing::info!(port, "vsock listening");
+
+    loop {
+        let client_fd = unsafe { libc::accept(fd, std::ptr::null_mut(), std::ptr::null_mut()) };
+        if client_fd < 0 {
+            tracing::error!("vsock accept failed: {}", std::io::Error::last_os_error());
+            continue;
+        }
+
+        // Wrap the fd in a File for Read + Write.
+        let mut stream = unsafe { <std::fs::File as std::os::fd::FromRawFd>::from_raw_fd(client_fd) };
+
+        match shim::decode_from::<ShimRequest>(&mut stream) {
+            Ok(request) => {
+                let response = handle_request(state, request);
+                if let Err(e) = shim::encode_to(&mut stream, &response) {
+                    tracing::error!(%e, "failed to send response");
+                }
+                if state.shutdown {
+                    tracing::info!("shutting down");
+                    break;
+                }
+            }
+            Err(e) => {
+                tracing::error!(%e, "failed to decode request");
+            }
+        }
+
+        state.reap_children();
+    }
+
+    unsafe { libc::close(fd); }
     Ok(())
 }
 

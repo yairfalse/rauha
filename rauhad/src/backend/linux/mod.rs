@@ -519,23 +519,36 @@ impl IsolationBackend for LinuxBackend {
         let container_id = Uuid::new_v4();
 
         // Prepare rootfs for this container.
-        let rootfs_dir = PathBuf::from(&self.root)
+        // If overlay_layers is available, mount overlayfs (O(1) creation).
+        // Otherwise, fall back to copying the base rootfs.
+        let container_dir = PathBuf::from(&self.root)
             .join("zones")
             .join(&zone.name)
             .join("containers")
-            .join(container_id.to_string())
-            .join("rootfs");
+            .join(container_id.to_string());
 
-        if let Some(ref base_rootfs) = spec.rootfs_path {
+        let rootfs_dir = if let Some(ref overlay_layers) = spec.overlay_layers {
+            let snapshotter = rauha_oci::snapshotter::OverlayfsSnapshotter::new(
+                &PathBuf::from(&self.root).join("zones").join(&zone.name),
+            );
+            snapshotter.mount_overlay(
+                &container_id.to_string(),
+                overlay_layers,
+                &container_dir,
+            )?
+        } else if let Some(ref base_rootfs) = spec.rootfs_path {
+            let rootfs_dir = container_dir.join("rootfs");
             copy_dir_recursive(base_rootfs, &rootfs_dir)?;
+            rootfs_dir
         } else {
+            let rootfs_dir = container_dir.join("rootfs");
             std::fs::create_dir_all(&rootfs_dir).map_err(|e| RauhaError::RootfsError {
                 message: format!("failed to create rootfs dir: {e}"),
             })?;
-        }
+            rootfs_dir
+        };
 
-        // Generate OCI runtime spec (will be populated with image config by the caller).
-        // For now, create a minimal spec with the container's command.
+        // Generate OCI runtime spec.
         let spec_json = serde_json::to_string(
             &oci_spec::runtime::SpecBuilder::default()
                 .version("1.0.2")

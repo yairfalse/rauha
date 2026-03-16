@@ -35,14 +35,23 @@ pub fn fork_and_exec(
         anyhow::bail!("process.args is empty");
     }
 
-    let rootfs = rootfs_root
-        .join("containers")
-        .join(container_id)
-        .join("rootfs");
-
-    if !rootfs.exists() {
-        anyhow::bail!("rootfs not found: {}", rootfs.display());
-    }
+    // Check both overlayfs (merged/) and legacy (rootfs/) paths.
+    let container_dir = rootfs_root.join("containers").join(container_id);
+    let rootfs = {
+        let merged = container_dir.join("merged");
+        let legacy = container_dir.join("rootfs");
+        if merged.exists() {
+            merged
+        } else if legacy.exists() {
+            legacy
+        } else {
+            anyhow::bail!(
+                "rootfs not found: checked {} and {}",
+                merged.display(),
+                legacy.display()
+            );
+        }
+    };
 
     let log_dir = PathBuf::from("/run/rauha/containers").join(container_id);
     std::fs::create_dir_all(&log_dir)?;
@@ -69,14 +78,12 @@ pub fn fork_and_exec(
 
     let hostname = spec.hostname().cloned();
 
-    let rd_raw = pipe_rd.as_raw_fd();
-    let wr_raw = pipe_wr.as_raw_fd();
 
     match unsafe { unistd::fork() }? {
         ForkResult::Child => {
             drop(pipe_wr);
             let mut buf = [0u8; 1];
-            let _ = nix::unistd::read(rd_raw, &mut buf);
+            let _ = nix::unistd::read(pipe_rd.as_raw_fd(), &mut buf);
             drop(pipe_rd);
 
             let _ = nix::unistd::setsid();
@@ -110,7 +117,7 @@ pub fn fork_and_exec(
         ForkResult::Parent { child } => {
             drop(pipe_rd);
             let child_pid = child.as_raw() as u32;
-            let _ = nix::unistd::write(wr_raw, &[1u8]);
+            let _ = nix::unistd::write(&pipe_wr, &[1u8]);
             drop(pipe_wr);
             tracing::info!(pid = child_pid, container = container_id, "child forked");
             Ok(child_pid)
