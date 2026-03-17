@@ -79,6 +79,7 @@ version = "0.2"
 # macOS Virtualization.framework bindings
 [workspace.dependencies.objc2]
 version = "0.6"
+features = ["exception"]
 [workspace.dependencies.block2]
 version = "0.6"
 [workspace.dependencies.objc2-virtualization]

@@ -115,10 +115,6 @@ impl VmManager {
     /// call on that queue.
     #[cfg(target_os = "macos")]
     pub fn boot_vm(&self, zone_name: &str, config: &VmConfig) -> Result<()> {
-        use std::sync::{Arc, Condvar};
-        use objc2_foundation::{NSArray, NSString, NSURL};
-        use objc2_virtualization::*;
-
         self.verify_assets()?;
 
         {
@@ -130,89 +126,131 @@ impl VmManager {
             }
         }
 
-        // Build the VM configuration (can happen on any thread).
-        eprintln!("[vm] creating boot loader");
-        let kernel_url =
-            NSURL::fileURLWithPath(&NSString::from_str(&self.kernel_path.to_string_lossy()));
-        let boot_loader = unsafe {
-            let loader = VZLinuxBootLoader::initWithKernelURL(
-                VZLinuxBootLoader::alloc(),
-                &kernel_url,
-            );
-            let initramfs_url = NSURL::fileURLWithPath(&NSString::from_str(
-                &self.initramfs_path.to_string_lossy(),
-            ));
-            loader.setInitialRamdiskURL(Some(&initramfs_url));
-            loader.setCommandLine(&NSString::from_str("console=hvc0"));
-            loader
-        };
+        // Wrap all ObjC calls in exception handling. Virtualization.framework
+        // throws NSExceptions for invalid configurations instead of returning
+        // NSError, which would abort the Rust process without this.
+        self.boot_vm_inner(zone_name, config)
+    }
 
-        eprintln!("[vm] creating VM configuration (cpus={}, mem={})", config.cpus, config.memory_bytes);
-        let vm_config_obj = unsafe {
-            let cfg = VZVirtualMachineConfiguration::new();
-            cfg.setBootLoader(Some(&boot_loader));
-            cfg.setCPUCount(config.cpus as usize);
-            cfg.setMemorySize(config.memory_bytes);
+    #[cfg(target_os = "macos")]
+    fn boot_vm_inner(&self, zone_name: &str, config: &VmConfig) -> Result<()> {
+        use std::sync::{Arc, Condvar};
+        use objc2_foundation::{NSArray, NSString, NSURL};
+        use objc2_virtualization::*;
 
-            let vsock_config = VZVirtioSocketDeviceConfiguration::new();
-            cfg.setSocketDevices(&NSArray::from_retained_slice(&[
-                objc2::rc::Retained::cast_unchecked(vsock_config),
-            ]));
+        eprintln!("[vm] creating boot loader + VM configuration (cpus={}, mem={})", config.cpus, config.memory_bytes);
 
-            let shared_dir_obj = VZSharedDirectory::initWithURL_readOnly(
-                VZSharedDirectory::alloc(),
-                &NSURL::fileURLWithPath(&NSString::from_str(
-                    &config.shared_dir.to_string_lossy(),
-                )),
-                false,
-            );
-            let single_dir_share = VZSingleDirectoryShare::initWithDirectory(
-                VZSingleDirectoryShare::alloc(),
-                &shared_dir_obj,
-            );
-            let fs_config = VZVirtioFileSystemDeviceConfiguration::initWithTag(
-                VZVirtioFileSystemDeviceConfiguration::alloc(),
-                &NSString::from_str("rauha"),
-            );
-            fs_config.setShare(Some(&single_dir_share));
-            cfg.setDirectorySharingDevices(&NSArray::from_retained_slice(&[
-                objc2::rc::Retained::cast_unchecked(fs_config),
-            ]));
+        // Capture paths as strings so the closure is UnwindSafe.
+        let kernel_path_str = self.kernel_path.to_string_lossy().to_string();
+        let initramfs_path_str = self.initramfs_path.to_string_lossy().to_string();
+        let shared_dir_str = config.shared_dir.to_string_lossy().to_string();
+        let shared_dir_clone = config.shared_dir.clone();
+        let cpus = config.cpus;
+        let memory_bytes = config.memory_bytes;
 
-            let net_config = VZVirtioNetworkDeviceConfiguration::new();
-            let nat_attachment = VZNATNetworkDeviceAttachment::new();
-            net_config.setAttachment(Some(&nat_attachment));
-            cfg.setNetworkDevices(&NSArray::from_retained_slice(&[
-                objc2::rc::Retained::cast_unchecked(net_config),
-            ]));
-
-            // Serial console — capture VM output to a log file for debugging.
-            let console_log = config.shared_dir.join("console.log");
-            if let Ok(file) = std::fs::File::create(&console_log) {
-                use std::os::fd::IntoRawFd;
-                let write_fd = file.into_raw_fd();
-                let write_handle = objc2_foundation::NSFileHandle::initWithFileDescriptor(
-                    objc2_foundation::NSFileHandle::alloc(),
-                    write_fd,
-                );
-                // Use /dev/null for the read side (we don't send input).
-                let read_handle = objc2_foundation::NSFileHandle::fileHandleWithNullDevice();
-                let serial_attachment =
-                    VZFileHandleSerialPortAttachment::initWithFileHandleForReading_fileHandleForWriting(
-                        VZFileHandleSerialPortAttachment::alloc(),
-                        Some(&read_handle),
-                        Some(&write_handle),
+        // Catch ObjC exceptions from VZ configuration setup.
+        // Virtualization.framework throws NSExceptions for invalid
+        // configurations instead of returning NSError.
+        let vm_config_result = unsafe {
+            objc2::exception::catch(move || {
+                let kernel_url =
+                    NSURL::fileURLWithPath(&NSString::from_str(&kernel_path_str));
+                let boot_loader = {
+                    let loader = VZLinuxBootLoader::initWithKernelURL(
+                        VZLinuxBootLoader::alloc(),
+                        &kernel_url,
                     );
-                let serial_config = VZVirtioConsoleDeviceSerialPortConfiguration::new();
-                serial_config.setAttachment(Some(&serial_attachment));
-                cfg.setSerialPorts(&NSArray::from_retained_slice(&[
-                    objc2::rc::Retained::cast_unchecked(serial_config),
-                ]));
-                eprintln!("[vm] serial console -> {}", console_log.display());
-            }
+                    let initramfs_url = NSURL::fileURLWithPath(&NSString::from_str(
+                        &initramfs_path_str,
+                    ));
+                    loader.setInitialRamdiskURL(Some(&initramfs_url));
+                    loader.setCommandLine(&NSString::from_str("console=hvc0"));
+                    loader
+                };
 
-            cfg
+                let cfg = VZVirtualMachineConfiguration::new();
+                cfg.setBootLoader(Some(&boot_loader));
+                cfg.setCPUCount(cpus as usize);
+                cfg.setMemorySize(memory_bytes);
+
+                let vsock_config = VZVirtioSocketDeviceConfiguration::new();
+                cfg.setSocketDevices(&NSArray::from_retained_slice(&[
+                    objc2::rc::Retained::cast_unchecked(vsock_config),
+                ]));
+
+                let shared_dir_obj = VZSharedDirectory::initWithURL_readOnly(
+                    VZSharedDirectory::alloc(),
+                    &NSURL::fileURLWithPath(&NSString::from_str(&shared_dir_str)),
+                    false,
+                );
+                let single_dir_share = VZSingleDirectoryShare::initWithDirectory(
+                    VZSingleDirectoryShare::alloc(),
+                    &shared_dir_obj,
+                );
+                let fs_config = VZVirtioFileSystemDeviceConfiguration::initWithTag(
+                    VZVirtioFileSystemDeviceConfiguration::alloc(),
+                    &NSString::from_str("rauha"),
+                );
+                fs_config.setShare(Some(&single_dir_share));
+                cfg.setDirectorySharingDevices(&NSArray::from_retained_slice(&[
+                    objc2::rc::Retained::cast_unchecked(fs_config),
+                ]));
+
+                let net_config = VZVirtioNetworkDeviceConfiguration::new();
+                let nat_attachment = VZNATNetworkDeviceAttachment::new();
+                net_config.setAttachment(Some(&nat_attachment));
+                cfg.setNetworkDevices(&NSArray::from_retained_slice(&[
+                    objc2::rc::Retained::cast_unchecked(net_config),
+                ]));
+
+                // Serial console — capture VM output to a log file for debugging.
+                // Use a pipe for the read side since VZ rejects null device handles.
+                let console_log = shared_dir_clone.join("console.log");
+                if let Ok(file) = std::fs::File::create(&console_log) {
+                    use std::os::fd::IntoRawFd;
+                    let write_fd = file.into_raw_fd();
+                    let write_handle = objc2_foundation::NSFileHandle::initWithFileDescriptor(
+                        objc2_foundation::NSFileHandle::alloc(),
+                        write_fd,
+                    );
+                    // Create a pipe — we never write to it, but VZ needs a valid fd.
+                    let mut fds = [0i32; 2];
+                    libc::pipe(fds.as_mut_ptr());
+                    let read_pipe = fds[0];
+                    let write_pipe_fd = fds[1];
+                    let read_handle = objc2_foundation::NSFileHandle::initWithFileDescriptor(
+                        objc2_foundation::NSFileHandle::alloc(),
+                        read_pipe,
+                    );
+                    let serial_attachment =
+                        VZFileHandleSerialPortAttachment::initWithFileHandleForReading_fileHandleForWriting(
+                            VZFileHandleSerialPortAttachment::alloc(),
+                            Some(&read_handle),
+                            Some(&write_handle),
+                        );
+                    let serial_config = VZVirtioConsoleDeviceSerialPortConfiguration::new();
+                    serial_config.setAttachment(Some(&serial_attachment));
+                    cfg.setSerialPorts(&NSArray::from_retained_slice(&[
+                        objc2::rc::Retained::cast_unchecked(serial_config),
+                    ]));
+                    // Close the write end of the pipe — we only need the read end.
+                    libc::close(write_pipe_fd);
+                    eprintln!("[vm] serial console -> {}", console_log.display());
+                }
+
+                cfg
+            })
         };
+
+        let vm_config_obj = vm_config_result.map_err(|exc| {
+            let detail = exc
+                .map(|e| format!("{e:?}"))
+                .unwrap_or_else(|| "unknown ObjC exception".into());
+            RauhaError::BackendError(format!(
+                "VM configuration failed (ObjC exception): {detail}. \
+                 Check entitlements and macOS version (15+ required)."
+            ))
+        })?;
 
         eprintln!("[vm] validating configuration");
         unsafe {
@@ -442,25 +480,49 @@ impl VmManager {
     }
 
     /// Shut down a zone's VM.
+    ///
+    /// VM operations must be dispatched on the VM's serial queue.
     #[cfg(target_os = "macos")]
     pub fn shutdown_vm(&self, zone_name: &str) -> Result<()> {
-        use objc2_virtualization::VZVirtualMachineState;
+        use std::sync::{Arc, Condvar};
 
         let mut vms = self.vms.lock().unwrap();
         if let Some(entry) = vms.remove(zone_name) {
-            let vm = &entry.vm.0;
-            unsafe {
-                if vm.canRequestStop() {
-                    let _ = vm.requestStopWithError();
+            let vm_ptr = objc2::rc::Retained::as_ptr(&entry.vm.0) as usize;
+            let done = Arc::new((Mutex::new(false), Condvar::new()));
+            let done_clone = Arc::clone(&done);
+
+            // Dispatch stop to the VM's serial queue (required by VZ).
+            entry.queue.0.exec_async(move || {
+                unsafe {
+                    let vm_ref = &*(vm_ptr
+                        as *const objc2_virtualization::VZVirtualMachine);
+                    // Try graceful stop first. Use AssertUnwindSafe since
+                    // we're crossing the ObjC exception boundary with a raw ptr.
+                    let vm_ref_safe = std::panic::AssertUnwindSafe(vm_ref);
+                    let _ = objc2::exception::catch(move || {
+                        if vm_ref_safe.canRequestStop() {
+                            let _ = vm_ref_safe.requestStopWithError();
+                        }
+                    });
                 }
-            }
-            // Brief wait, then force stop if still running.
-            std::thread::sleep(std::time::Duration::from_secs(2));
-            unsafe {
-                if vm.state() != VZVirtualMachineState::Stopped {
-                    vm.stopWithCompletionHandler(&block2::RcBlock::new(|_err| {}));
-                }
-            }
+                let (lock, cvar) = &*done_clone;
+                let mut finished = lock.lock().unwrap();
+                *finished = true;
+                cvar.notify_one();
+            });
+
+            // Wait for the stop to complete (with timeout).
+            let (lock, cvar) = &*done;
+            let guard = lock.lock().unwrap();
+            let _ = cvar.wait_timeout_while(
+                guard,
+                std::time::Duration::from_secs(5),
+                |finished| !*finished,
+            );
+
+            // Drop the entry (releases the VM and queue).
+            drop(entry);
             tracing::info!(zone = zone_name, "VM shut down");
         }
         Ok(())
