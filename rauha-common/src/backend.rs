@@ -23,8 +23,8 @@ pub trait IsolationBackend: Send + Sync {
     /// Create a container within a zone.
     fn create_container(&self, zone: &ZoneHandle, spec: &ContainerSpec) -> Result<ContainerHandle>;
 
-    /// Start a previously created container.
-    fn start_container(&self, container: &ContainerHandle) -> Result<()>;
+    /// Start a previously created container. Returns the container's PID.
+    fn start_container(&self, container: &ContainerHandle) -> Result<u32>;
 
     /// Stop a running container.
     fn stop_container(&self, container: &ContainerHandle) -> Result<()>;

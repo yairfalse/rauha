@@ -214,7 +214,7 @@ impl IsolationBackend for MacosBackend {
         }
     }
 
-    fn start_container(&self, container: &ContainerHandle) -> Result<()> {
+    fn start_container(&self, container: &ContainerHandle) -> Result<u32> {
         tracing::info!(container = %container.id, "starting container");
 
         // We need to find which zone this container belongs to.
@@ -230,7 +230,8 @@ impl IsolationBackend for MacosBackend {
         )?;
 
         match response {
-            ShimResponse::Created { .. } | ShimResponse::Ok => Ok(()),
+            ShimResponse::Created { pid } => Ok(pid),
+            ShimResponse::Ok => Ok(0),
             ShimResponse::Error { message } => Err(RauhaError::ContainerExecError {
                 container: container.id.to_string(),
                 message,

@@ -22,12 +22,17 @@ cargo build --bin rauha-guest-agent  # Build the macOS VM guest agent
 cargo xtask build-ebpf               # Debug build
 cargo xtask build-ebpf --release     # Release build
 
+# macOS: sign rauhad after every build (required for Virtualization.framework)
+codesign --entitlements rauhad/rauhad.entitlements -s - target/debug/rauhad
+
 # Run the daemon (development, listens on [::1]:9876)
 RUST_LOG=rauhad=debug cargo run --bin rauhad
 
 # Use the CLI (connects to RAUHA_ADDR or http://[::1]:9876)
 cargo run --bin rauha -- zone create --name test
 cargo run --bin rauha -- zone list
+cargo run --bin rauha -- image pull alpine:latest
+cargo run --bin rauha -- run --zone test alpine:latest /bin/echo hello
 
 # Integration tests (Linux only, require root + running rauhad)
 bash tests/integration/test-image-pull.sh
@@ -79,13 +84,20 @@ The `rauha-guest-agent` runs inside the VM and handles `ShimRequest`/`ShimRespon
 
 Resource limits (CPU/memory) are set at VM boot and require restart to change. Filesystem sharing uses virtio-fs, mounting the container rootfs from host into the VM at `/mnt/rauha`.
 
-macOS requires the `com.apple.security.virtualization` entitlement — see `rauhad/rauhad.entitlements`.
+macOS requires the `com.apple.security.virtualization` entitlement — see `rauhad/rauhad.entitlements`. After every build of rauhad, re-sign: `codesign --entitlements rauhad/rauhad.entitlements -s - target/debug/rauhad`.
+
+ObjC exceptions from Virtualization.framework are caught via `objc2::exception::catch` — without this, they abort the Rust process. All VZ API calls in `vm.rs` must go through exception-safe wrappers. VM operations (start, stop, vsock connect) must be dispatched to the VM's serial dispatch queue.
+
+pf firewall rules require root. When running rauhad without root (development), pf errors are logged as warnings and network isolation is inactive.
 
 ### Data Stores
 
-- **redb** (`/var/lib/rauha/metadata/rauha.redb`) — persisted zone/container metadata. Source of truth on crash recovery.
-- **BPF maps** (pinned at `/sys/fs/bpf/rauha/`) — in-kernel enforcement state. Reconciled from redb on daemon startup.
-- **Content store** (`/var/lib/rauha/content/blobs/sha256/`) — content-addressable OCI blob storage.
+- **redb** (`{root}/metadata/rauha.redb`) — persisted zone/container metadata. Source of truth on crash recovery.
+- **BPF maps** (pinned at `/sys/fs/bpf/rauha/`) — in-kernel enforcement state. Reconciled from redb on daemon startup. Linux only.
+- **Content store** (`{root}/content/blobs/sha256/`) — content-addressable OCI blob storage.
+- **VM assets** (`/var/lib/rauha/vm/vmlinux`, `initramfs.img`) — kernel and initramfs for macOS VMs. Installed via `rauha setup`.
+
+Root directory: `/var/lib/rauha` on Linux, `/tmp/rauha` on macOS (dev default, override with `RAUHA_ROOT`).
 
 ### eBPF Programs (`rauha-ebpf/src/`)
 
@@ -127,4 +139,6 @@ Built separately via `cargo xtask build-ebpf` targeting `bpfel-unknown-none`. No
 
 - macOS 15+ (Sequoia) for full Containers API support
 - Apple Silicon or Intel with VT-x
-- rauhad binary must be signed with `com.apple.security.virtualization` entitlement
+- rauhad binary must be signed after every build: `codesign --entitlements rauhad/rauhad.entitlements -s - target/debug/rauhad`
+- VM assets must be installed at `/var/lib/rauha/vm/` (vmlinux + initramfs.img) — use `rauha setup`
+- Running without root works for development (pf network isolation will be inactive)

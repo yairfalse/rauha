@@ -331,15 +331,26 @@ impl ZoneRegistry {
             .cloned()
             .ok_or_else(|| RauhaError::ContainerNotFound(*container_id))?;
 
-        self.backend.start_container(&container_handle)?;
+        let pid = self.backend.start_container(&container_handle)?;
 
-        // Update metadata.
+        // Update metadata with PID from the backend.
         let mut updated = container;
         updated.state = ContainerState::Running;
         updated.started_at = Some(Utc::now());
+        if pid > 0 {
+            updated.pid = Some(pid);
+        }
         self.metadata.put_container(&updated)?;
 
-        tracing::info!(container = %container_id, "container started");
+        // Update in-memory cache with the real PID.
+        if pid > 0 {
+            let mut handles = self.container_handles.write().await;
+            if let Some(handle) = handles.get_mut(container_id) {
+                handle.pid = pid;
+            }
+        }
+
+        tracing::info!(container = %container_id, pid, "container started");
         Ok(())
     }
 
@@ -576,8 +587,8 @@ mod tests {
             })
         }
 
-        fn start_container(&self, _container: &ContainerHandle) -> Result<()> {
-            Ok(())
+        fn start_container(&self, _container: &ContainerHandle) -> Result<u32> {
+            Ok(42) // Mock PID
         }
 
         fn stop_container(&self, _container: &ContainerHandle) -> Result<()> {
@@ -805,6 +816,7 @@ mod tests {
         let running = reg.get_container(&ctr.id).unwrap();
         assert_eq!(running.state, rauha_common::container::ContainerState::Running);
         assert!(running.started_at.is_some());
+        assert_eq!(running.pid, Some(42)); // PID from MockBackend::start_container
 
         // Stop.
         reg.stop_container(&ctr.id, 10).await.unwrap();
