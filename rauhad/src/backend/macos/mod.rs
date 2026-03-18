@@ -231,13 +231,12 @@ impl IsolationBackend for MacosBackend {
 
         match response {
             ShimResponse::Created { pid } => Ok(pid),
-            ShimResponse::Ok => Ok(0),
             ShimResponse::Error { message } => Err(RauhaError::ContainerExecError {
                 container: container.id.to_string(),
                 message,
             }),
             other => Err(RauhaError::BackendError(format!(
-                "unexpected response: {other:?}"
+                "unexpected response to StartContainer: {other:?}"
             ))),
         }
     }
@@ -417,7 +416,8 @@ impl MacosBackend {
         if let Ok(entries) = std::fs::read_dir(&containers_dir) {
             for entry in entries.flatten() {
                 let zone_name = entry.file_name().to_string_lossy().to_string();
-                let container_dir = entry.path().join(container.id.to_string());
+                // Container rootfs lives at {zone_dir}/containers/{id}/rootfs.
+                let container_dir = entry.path().join("containers").join(container.id.to_string());
                 if container_dir.exists() {
                     return Ok(zone_name);
                 }

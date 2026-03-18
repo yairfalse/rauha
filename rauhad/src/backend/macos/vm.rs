@@ -215,7 +215,10 @@ impl VmManager {
                     );
                     // Create a pipe — we never write to it, but VZ needs a valid fd.
                     let mut fds = [0i32; 2];
-                    libc::pipe(fds.as_mut_ptr());
+                    if libc::pipe(fds.as_mut_ptr()) != 0 {
+                        eprintln!("[vm] pipe() failed, skipping serial console");
+                        return cfg;
+                    }
                     let read_pipe = fds[0];
                     let write_pipe_fd = fds[1];
                     let read_handle = objc2_foundation::NSFileHandle::initWithFileDescriptor(
@@ -492,13 +495,13 @@ impl VmManager {
             let done = Arc::new((Mutex::new(false), Condvar::new()));
             let done_clone = Arc::clone(&done);
 
-            // Dispatch stop to the VM's serial queue (required by VZ).
-            entry.queue.0.exec_async(move || {
+            // Move entry into the closure so the VM stays alive until
+            // the stop operation completes (avoids use-after-free on timeout).
+            let queue = entry.queue.0.clone();
+            queue.exec_async(move || {
                 unsafe {
                     let vm_ref = &*(vm_ptr
                         as *const objc2_virtualization::VZVirtualMachine);
-                    // Try graceful stop first. Use AssertUnwindSafe since
-                    // we're crossing the ObjC exception boundary with a raw ptr.
                     let vm_ref_safe = std::panic::AssertUnwindSafe(vm_ref);
                     let _ = objc2::exception::catch(move || {
                         if vm_ref_safe.canRequestStop() {
@@ -506,6 +509,8 @@ impl VmManager {
                         }
                     });
                 }
+                // Entry is dropped here, releasing the VM after stop completes.
+                drop(entry);
                 let (lock, cvar) = &*done_clone;
                 let mut finished = lock.lock().unwrap();
                 *finished = true;
@@ -521,8 +526,6 @@ impl VmManager {
                 |finished| !*finished,
             );
 
-            // Drop the entry (releases the VM and queue).
-            drop(entry);
             tracing::info!(zone = zone_name, "VM shut down");
         }
         Ok(())

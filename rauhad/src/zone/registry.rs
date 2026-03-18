@@ -337,13 +337,11 @@ impl ZoneRegistry {
         let mut updated = container;
         updated.state = ContainerState::Running;
         updated.started_at = Some(Utc::now());
-        if pid > 0 {
-            updated.pid = Some(pid);
-        }
+        updated.pid = Some(pid);
         self.metadata.put_container(&updated)?;
 
         // Update in-memory cache with the real PID.
-        if pid > 0 {
+        {
             let mut handles = self.container_handles.write().await;
             if let Some(handle) = handles.get_mut(container_id) {
                 handle.pid = pid;

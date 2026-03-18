@@ -641,14 +641,13 @@ impl IsolationBackend for LinuxBackend {
 
         match response {
             ShimResponse::Created { pid } => Ok(pid),
-            ShimResponse::Ok => Ok(0),
             ShimResponse::Error { message } => Err(RauhaError::ContainerExecError {
                 container: container.id.to_string(),
                 message,
             }),
-            _ => Err(RauhaError::ShimError {
+            other => Err(RauhaError::ShimError {
                 zone: zone_name,
-                message: "unexpected shim response".into(),
+                message: format!("unexpected response to StartContainer: {other:?}"),
             }),
         }
     }
