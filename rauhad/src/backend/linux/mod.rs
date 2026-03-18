@@ -616,7 +616,7 @@ impl IsolationBackend for LinuxBackend {
         }
     }
 
-    fn start_container(&self, container: &ContainerHandle) -> Result<()> {
+    fn start_container(&self, container: &ContainerHandle) -> Result<u32> {
         tracing::info!(container = %container.id, "starting container");
 
         // Look up zone name for this container.
@@ -640,14 +640,14 @@ impl IsolationBackend for LinuxBackend {
         )?;
 
         match response {
-            ShimResponse::Created { .. } | ShimResponse::Ok => Ok(()),
+            ShimResponse::Created { pid } => Ok(pid),
             ShimResponse::Error { message } => Err(RauhaError::ContainerExecError {
                 container: container.id.to_string(),
                 message,
             }),
-            _ => Err(RauhaError::ShimError {
+            other => Err(RauhaError::ShimError {
                 zone: zone_name,
-                message: "unexpected shim response".into(),
+                message: format!("unexpected response to StartContainer: {other:?}"),
             }),
         }
     }

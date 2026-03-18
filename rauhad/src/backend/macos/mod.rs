@@ -62,7 +62,8 @@ impl MacosBackend {
             "process": {
                 "args": spec.command,
                 "env": env,
-                "cwd": cwd
+                "cwd": cwd,
+                "user": { "uid": 0, "gid": 0 }
             },
             "root": {
                 "path": "rootfs"
@@ -88,8 +89,11 @@ impl IsolationBackend for MacosBackend {
         ))?;
 
         // Create pf anchor for network isolation.
-        self.pf_manager
-            .create_zone_rules(&config.name, &config.policy)?;
+        // Non-fatal: pf requires root, and we don't want to block development
+        // testing when running rauhad without root.
+        if let Err(e) = self.pf_manager.create_zone_rules(&config.name, &config.policy) {
+            tracing::warn!(zone = config.name, %e, "pf rules not applied — network isolation inactive (run as root for full isolation)");
+        }
 
         // Boot VM with virtio-vsock + virtio-fs.
         let vm_config = VmConfig::from_policy(&config.policy, zone_dir);
@@ -123,8 +127,10 @@ impl IsolationBackend for MacosBackend {
     fn enforce_policy(&self, zone: &ZoneHandle, policy: &ZonePolicy) -> Result<()> {
         tracing::info!(zone = zone.name, "enforcing policy");
 
-        // Update pf rules.
-        self.pf_manager.update_zone_rules(&zone.name, policy)?;
+        // Update pf rules (non-fatal without root).
+        if let Err(e) = self.pf_manager.update_zone_rules(&zone.name, policy) {
+            tracing::warn!(zone = zone.name, %e, "pf rules not applied");
+        }
 
         // VM resource limits (CPU/memory) can only be set at boot time
         // with Virtualization.framework. Log a warning if they differ.
@@ -139,8 +145,10 @@ impl IsolationBackend for MacosBackend {
     fn hot_reload_policy(&self, zone: &ZoneHandle, policy: &ZonePolicy) -> Result<()> {
         tracing::info!(zone = zone.name, "hot-reloading policy");
 
-        // Network rules can be hot-reloaded.
-        self.pf_manager.update_zone_rules(&zone.name, policy)?;
+        // Network rules can be hot-reloaded (non-fatal without root).
+        if let Err(e) = self.pf_manager.update_zone_rules(&zone.name, policy) {
+            tracing::warn!(zone = zone.name, %e, "pf rules not applied");
+        }
 
         // VM resource limits cannot be hot-reloaded — log this.
         tracing::info!(
@@ -160,10 +168,13 @@ impl IsolationBackend for MacosBackend {
 
         let container_id = Uuid::new_v4();
 
-        // Clone rootfs for this container using APFS CoW.
+        // Place rootfs where the guest agent expects it:
+        // {zone_dir}/containers/{id}/rootfs → /mnt/rauha/containers/{id}/rootfs in VM.
         let container_rootfs = self
-            .apfs_manager
-            .container_rootfs(&zone.name, &container_id.to_string());
+            .zone_dir(&zone.name)
+            .join("containers")
+            .join(container_id.to_string())
+            .join("rootfs");
 
         if let Some(ref base_rootfs) = spec.rootfs_path {
             self.apfs_manager
@@ -203,7 +214,7 @@ impl IsolationBackend for MacosBackend {
         }
     }
 
-    fn start_container(&self, container: &ContainerHandle) -> Result<()> {
+    fn start_container(&self, container: &ContainerHandle) -> Result<u32> {
         tracing::info!(container = %container.id, "starting container");
 
         // We need to find which zone this container belongs to.
@@ -219,13 +230,13 @@ impl IsolationBackend for MacosBackend {
         )?;
 
         match response {
-            ShimResponse::Created { .. } | ShimResponse::Ok => Ok(()),
+            ShimResponse::Created { pid } => Ok(pid),
             ShimResponse::Error { message } => Err(RauhaError::ContainerExecError {
                 container: container.id.to_string(),
                 message,
             }),
             other => Err(RauhaError::BackendError(format!(
-                "unexpected response: {other:?}"
+                "unexpected response to StartContainer: {other:?}"
             ))),
         }
     }
@@ -366,8 +377,10 @@ impl IsolationBackend for MacosBackend {
             self.vm_manager.boot_vm(&zone.name, &vm_config)?;
         }
 
-        // Re-apply pf rules.
-        self.pf_manager.create_zone_rules(&zone.name, policy)?;
+        // Re-apply pf rules (non-fatal without root).
+        if let Err(e) = self.pf_manager.create_zone_rules(&zone.name, policy) {
+            tracing::warn!(zone = zone.name, %e, "pf rules not applied during recovery");
+        }
 
         Ok(())
     }
@@ -403,7 +416,8 @@ impl MacosBackend {
         if let Ok(entries) = std::fs::read_dir(&containers_dir) {
             for entry in entries.flatten() {
                 let zone_name = entry.file_name().to_string_lossy().to_string();
-                let container_dir = entry.path().join(container.id.to_string());
+                // Container rootfs lives at {zone_dir}/containers/{id}/rootfs.
+                let container_dir = entry.path().join("containers").join(container.id.to_string());
                 if container_dir.exists() {
                     return Ok(zone_name);
                 }
