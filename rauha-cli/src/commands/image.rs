@@ -8,6 +8,8 @@ pub mod pb {
 
 use pb::image::image_service_client::ImageServiceClient;
 
+use super::output::{self, OutputMode};
+
 #[derive(Subcommand)]
 pub enum ImageAction {
     /// Pull an image from a registry
@@ -21,13 +23,15 @@ pub enum ImageAction {
     Inspect { reference: String },
 }
 
-pub async fn handle(action: ImageAction) -> anyhow::Result<()> {
+pub async fn handle(action: ImageAction, out: OutputMode) -> anyhow::Result<()> {
     let channel = super::connect().await?;
     let mut client = ImageServiceClient::new(channel);
 
     match action {
         ImageAction::Pull { reference } => {
-            println!("Pulling {reference}...");
+            if out == OutputMode::Human {
+                println!("Pulling {reference}...");
+            }
 
             let mut stream = client
                 .pull(pb::image::PullRequest {
@@ -36,44 +40,55 @@ pub async fn handle(action: ImageAction) -> anyhow::Result<()> {
                 .await?
                 .into_inner();
 
-            use std::io::Write;
             use tokio_stream::StreamExt;
-            let mut last_status = String::new();
-            while let Some(progress) = stream.next().await {
-                match progress {
-                    Ok(p) => {
-                        if p.done {
-                            // Clear the progress line, then print completion.
-                            if !last_status.is_empty() {
-                                print!("\r{}\r", " ".repeat(60));
-                            }
-                            println!("Pull complete: {reference}");
-                        } else if p.total > 0 {
-                            let pct = (p.current as f64 / p.total as f64 * 100.0) as u32;
-                            let size_mb = p.total as f64 / 1_048_576.0;
-                            let msg = format!(
-                                "  {} {:.1}MB {pct}%",
-                                p.status, size_mb,
-                            );
-                            // Overwrite in place with carriage return.
-                            print!("\r{msg:<60}");
-                            let _ = std::io::stdout().flush();
-                            last_status = msg;
-                        } else {
-                            if !last_status.is_empty() {
-                                print!("\r{}\r", " ".repeat(60));
+            if out == OutputMode::Human {
+                use std::io::Write;
+                let mut last_status = String::new();
+                while let Some(progress) = stream.next().await {
+                    match progress {
+                        Ok(p) => {
+                            if p.done {
+                                if !last_status.is_empty() {
+                                    print!("\r{}\r", " ".repeat(60));
+                                }
+                                println!("Pull complete: {reference}");
+                            } else if p.total > 0 {
+                                let pct = (p.current as f64 / p.total as f64 * 100.0) as u32;
+                                let size_mb = p.total as f64 / 1_048_576.0;
+                                let msg = format!("  {} {:.1}MB {pct}%", p.status, size_mb);
+                                print!("\r{msg:<60}");
                                 let _ = std::io::stdout().flush();
+                                last_status = msg;
+                            } else {
+                                if !last_status.is_empty() {
+                                    print!("\r{}\r", " ".repeat(60));
+                                    let _ = std::io::stdout().flush();
+                                }
+                                println!("  {}", p.status);
+                                last_status.clear();
                             }
-                            println!("  {}", p.status);
-                            last_status.clear();
+                        }
+                        Err(e) => {
+                            println!();
+                            return Err(e.into());
                         }
                     }
-                    Err(e) => {
-                        println!();
-                        eprintln!("Pull error: {e}");
+                }
+            } else {
+                // JSON: consume stream silently, emit result at end.
+                while let Some(progress) = stream.next().await {
+                    if let Err(e) = progress {
                         return Err(e.into());
                     }
                 }
+                output::print(
+                    out,
+                    &output::ImagePulled {
+                        ok: true,
+                        reference,
+                    },
+                    || {},
+                );
             }
         }
         ImageAction::List => {
@@ -82,21 +97,34 @@ pub async fn handle(action: ImageAction) -> anyhow::Result<()> {
                 .await?
                 .into_inner();
 
-            if resp.images.is_empty() {
-                println!("No images.");
-            } else {
-                println!("{:<50} {:<20} {:<10}", "REFERENCE", "DIGEST", "SIZE");
-                for img in resp.images {
-                    let tag = img.tags.first().cloned().unwrap_or_default();
-                    let digest_short = if img.digest.len() > 19 {
-                        format!("{}...", &img.digest[..19])
-                    } else {
-                        img.digest.clone()
-                    };
-                    let size_mb = img.size as f64 / 1_048_576.0;
-                    println!("{:<50} {:<20} {:.1}MB", tag, digest_short, size_mb);
+            let images: Vec<output::ImageInfo> = resp
+                .images
+                .iter()
+                .map(|img| output::ImageInfo {
+                    reference: img.tags.first().cloned().unwrap_or_default(),
+                    digest: img.digest.clone(),
+                    size: img.size,
+                    tags: img.tags.clone(),
+                })
+                .collect();
+
+            output::print(out, &output::ImageList { ok: true, images }, || {
+                if resp.images.is_empty() {
+                    println!("No images.");
+                } else {
+                    println!("{:<50} {:<20} {:<10}", "REFERENCE", "DIGEST", "SIZE");
+                    for img in &resp.images {
+                        let tag = img.tags.first().cloned().unwrap_or_default();
+                        let digest_short = if img.digest.len() > 19 {
+                            format!("{}...", &img.digest[..19])
+                        } else {
+                            img.digest.clone()
+                        };
+                        let size_mb = img.size as f64 / 1_048_576.0;
+                        println!("{:<50} {:<20} {:.1}MB", tag, digest_short, size_mb);
+                    }
                 }
-            }
+            });
         }
         ImageAction::Remove { reference } => {
             client
@@ -104,7 +132,15 @@ pub async fn handle(action: ImageAction) -> anyhow::Result<()> {
                     reference: reference.clone(),
                 })
                 .await?;
-            println!("Removed: {reference}");
+
+            output::print(
+                out,
+                &output::ImageRemoved {
+                    ok: true,
+                    reference: reference.clone(),
+                },
+                || println!("Removed: {reference}"),
+            );
         }
         ImageAction::Inspect { reference } => {
             let resp = client
@@ -114,15 +150,33 @@ pub async fn handle(action: ImageAction) -> anyhow::Result<()> {
                 .await?
                 .into_inner();
 
-            println!("Reference: {reference}");
-            if !resp.digest.is_empty() {
-                println!("Digest:    {}", resp.digest);
-            }
-            println!("Size:      {} bytes", resp.size);
-            if !resp.config_json.is_empty() {
-                println!("Config:");
-                println!("{}", resp.config_json);
-            }
+            let config: serde_json::Value = if resp.config_json.is_empty() {
+                serde_json::Value::Null
+            } else {
+                serde_json::from_str(&resp.config_json).unwrap_or(serde_json::Value::Null)
+            };
+
+            output::print(
+                out,
+                &output::ImageInspect {
+                    ok: true,
+                    reference: reference.clone(),
+                    digest: resp.digest.clone(),
+                    size: resp.size,
+                    config,
+                },
+                || {
+                    println!("Reference: {reference}");
+                    if !resp.digest.is_empty() {
+                        println!("Digest:    {}", resp.digest);
+                    }
+                    println!("Size:      {} bytes", resp.size);
+                    if !resp.config_json.is_empty() {
+                        println!("Config:");
+                        println!("{}", resp.config_json);
+                    }
+                },
+            );
         }
     }
     Ok(())

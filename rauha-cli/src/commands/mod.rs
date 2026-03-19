@@ -1,6 +1,7 @@
 pub mod exec;
 pub mod image;
 pub mod logs;
+pub mod output;
 pub mod policy;
 pub mod run;
 pub mod setup;

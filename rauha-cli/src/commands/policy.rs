@@ -1,4 +1,5 @@
 use clap::Subcommand;
+use serde::Serialize;
 
 pub mod pb {
     pub mod zone {
@@ -7,6 +8,8 @@ pub mod pb {
 }
 
 use pb::zone::zone_service_client::ZoneServiceClient;
+
+use super::output::{self, OutputMode};
 
 #[derive(Subcommand)]
 pub enum PolicyAction {
@@ -27,7 +30,20 @@ pub enum PolicyAction {
     },
 }
 
-pub async fn handle(action: PolicyAction) -> anyhow::Result<()> {
+#[derive(Serialize)]
+struct PolicyApplied {
+    ok: bool,
+    zone: String,
+}
+
+#[derive(Serialize)]
+struct PolicyShow {
+    ok: bool,
+    zone: String,
+    policy_toml: String,
+}
+
+pub async fn handle(action: PolicyAction, out: OutputMode) -> anyhow::Result<()> {
     let channel = super::connect().await?;
     let mut client = ZoneServiceClient::new(channel);
 
@@ -44,7 +60,15 @@ pub async fn handle(action: PolicyAction) -> anyhow::Result<()> {
                     policy_toml,
                 })
                 .await?;
-            println!("Policy applied to zone: {}", zone);
+
+            output::print(
+                out,
+                &PolicyApplied {
+                    ok: true,
+                    zone: zone.clone(),
+                },
+                || println!("Policy applied to zone: {}", zone),
+            );
         }
         PolicyAction::Show { zone } => {
             let resp = client
@@ -53,7 +77,16 @@ pub async fn handle(action: PolicyAction) -> anyhow::Result<()> {
                 })
                 .await?
                 .into_inner();
-            println!("{}", resp.policy_toml);
+
+            output::print(
+                out,
+                &PolicyShow {
+                    ok: true,
+                    zone: zone.clone(),
+                    policy_toml: resp.policy_toml.clone(),
+                },
+                || println!("{}", resp.policy_toml),
+            );
         }
     }
 

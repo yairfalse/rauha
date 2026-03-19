@@ -1,6 +1,5 @@
 use clap::Subcommand;
 
-// Import the generated protobuf types.
 pub mod pb {
     pub mod zone {
         tonic::include_proto!("rauha.zone.v1");
@@ -8,6 +7,8 @@ pub mod pb {
 }
 
 use pb::zone::zone_service_client::ZoneServiceClient;
+
+use super::output::{self, OutputMode};
 
 #[derive(Subcommand)]
 pub enum ZoneAction {
@@ -38,7 +39,7 @@ pub enum ZoneAction {
     },
 }
 
-pub async fn handle(action: ZoneAction) -> anyhow::Result<()> {
+pub async fn handle(action: ZoneAction, out: OutputMode) -> anyhow::Result<()> {
     let channel = super::connect().await?;
     let mut client = ZoneServiceClient::new(channel);
 
@@ -62,7 +63,15 @@ pub async fn handle(action: ZoneAction) -> anyhow::Result<()> {
                 .await?
                 .into_inner();
 
-            println!("Zone created: {} (id: {})", resp.name, resp.zone_id);
+            output::print(
+                out,
+                &output::ZoneCreated {
+                    ok: true,
+                    name: resp.name.clone(),
+                    id: resp.zone_id.clone(),
+                },
+                || println!("Zone created: {} (id: {})", resp.name, resp.zone_id),
+            );
         }
 
         ZoneAction::List => {
@@ -71,20 +80,34 @@ pub async fn handle(action: ZoneAction) -> anyhow::Result<()> {
                 .await?
                 .into_inner();
 
-            if resp.zones.is_empty() {
-                println!("No zones found.");
-            } else {
-                println!(
-                    "{:<20} {:<12} {:<12} {:<10} {}",
-                    "NAME", "TYPE", "STATE", "CONTAINERS", "CREATED"
-                );
-                for z in resp.zones {
+            let zones: Vec<output::ZoneInfo> = resp
+                .zones
+                .iter()
+                .map(|z| output::ZoneInfo {
+                    name: z.name.clone(),
+                    zone_type: z.zone_type.clone(),
+                    state: z.state.clone(),
+                    container_count: z.container_count,
+                    created_at: z.created_at.clone(),
+                })
+                .collect();
+
+            output::print(out, &output::ZoneList { ok: true, zones }, || {
+                if resp.zones.is_empty() {
+                    println!("No zones found.");
+                } else {
                     println!(
                         "{:<20} {:<12} {:<12} {:<10} {}",
-                        z.name, z.zone_type, z.state, z.container_count, z.created_at
+                        "NAME", "TYPE", "STATE", "CONTAINERS", "CREATED"
                     );
+                    for z in &resp.zones {
+                        println!(
+                            "{:<20} {:<12} {:<12} {:<10} {}",
+                            z.name, z.zone_type, z.state, z.container_count, z.created_at
+                        );
+                    }
                 }
-            }
+            });
         }
 
         ZoneAction::Inspect { name } => {
@@ -94,29 +117,54 @@ pub async fn handle(action: ZoneAction) -> anyhow::Result<()> {
                 .into_inner();
 
             if let Some(z) = resp.zone {
-                println!("Zone: {}", z.name);
-                println!("  ID:         {}", z.id);
-                println!("  Type:       {}", z.zone_type);
-                println!("  State:      {}", z.state);
-                println!("  Containers: {}", z.container_count);
-                println!("  Created:    {}", z.created_at);
-
-                // Also show policy.
                 let policy_resp = client
                     .get_policy(pb::zone::GetPolicyRequest {
-                        zone_name: name,
+                        zone_name: name.clone(),
                     })
                     .await?
                     .into_inner();
-                println!("\nPolicy:\n{}", policy_resp.policy_toml);
+
+                output::print(
+                    out,
+                    &output::ZoneInspect {
+                        ok: true,
+                        name: z.name.clone(),
+                        id: z.id.clone(),
+                        zone_type: z.zone_type.clone(),
+                        state: z.state.clone(),
+                        container_count: z.container_count,
+                        created_at: z.created_at.clone(),
+                        policy_toml: policy_resp.policy_toml.clone(),
+                    },
+                    || {
+                        println!("Zone: {}", z.name);
+                        println!("  ID:         {}", z.id);
+                        println!("  Type:       {}", z.zone_type);
+                        println!("  State:      {}", z.state);
+                        println!("  Containers: {}", z.container_count);
+                        println!("  Created:    {}", z.created_at);
+                        println!("\nPolicy:\n{}", policy_resp.policy_toml);
+                    },
+                );
             }
         }
 
         ZoneAction::Delete { name, force } => {
             client
-                .delete_zone(pb::zone::DeleteZoneRequest { name: name.clone(), force })
+                .delete_zone(pb::zone::DeleteZoneRequest {
+                    name: name.clone(),
+                    force,
+                })
                 .await?;
-            println!("Zone deleted: {}", name);
+
+            output::print(
+                out,
+                &output::ZoneDeleted {
+                    ok: true,
+                    name: name.clone(),
+                },
+                || println!("Zone deleted: {}", name),
+            );
         }
 
         ZoneAction::Verify { name } => {
@@ -127,23 +175,44 @@ pub async fn handle(action: ZoneAction) -> anyhow::Result<()> {
                 .await?
                 .into_inner();
 
-            println!(
-                "Zone {}: {}",
-                name,
-                if resp.is_isolated {
-                    "ISOLATED"
-                } else {
-                    "NOT ISOLATED"
-                }
+            let checks: Vec<output::IsolationCheck> = resp
+                .checks
+                .iter()
+                .map(|c| output::IsolationCheck {
+                    name: c.name.clone(),
+                    passed: c.passed,
+                    detail: c.detail.clone(),
+                })
+                .collect();
+
+            output::print(
+                out,
+                &output::ZoneVerification {
+                    ok: true,
+                    zone: name.clone(),
+                    isolated: resp.is_isolated,
+                    checks,
+                },
+                || {
+                    println!(
+                        "Zone {}: {}",
+                        name,
+                        if resp.is_isolated {
+                            "ISOLATED"
+                        } else {
+                            "NOT ISOLATED"
+                        }
+                    );
+                    for check in &resp.checks {
+                        println!(
+                            "  {} {} — {}",
+                            if check.passed { "✓" } else { "✗" },
+                            check.name,
+                            check.detail,
+                        );
+                    }
+                },
             );
-            for check in resp.checks {
-                println!(
-                    "  {} {} — {}",
-                    if check.passed { "✓" } else { "✗" },
-                    check.name,
-                    check.detail,
-                );
-            }
         }
     }
 
