@@ -53,12 +53,26 @@ enum Commands {
     Setup(commands::setup::SetupArgs),
 }
 
+/// Commands that do not support --json (streaming or interactive).
+fn is_streaming_command(cmd: &Commands) -> bool {
+    matches!(
+        cmd,
+        Commands::Trace(_)
+            | Commands::Top(_)
+            | Commands::Events(_)
+            | Commands::Logs(_)
+            | Commands::Exec(_)
+            | Commands::Attach(_)
+            | Commands::Setup(_)
+    )
+}
+
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("rauha=info".parse().unwrap()),
+                .add_directive("rauha=info".parse().expect("valid log directive")),
         )
         .init();
 
@@ -68,6 +82,12 @@ async fn main() {
     } else {
         OutputMode::Human
     };
+
+    // Reject --json for streaming/interactive commands.
+    if out == OutputMode::Json && is_streaming_command(&cli.command) {
+        commands::output::print_error("--json is not supported for streaming/interactive commands (trace, top, events, logs, exec, attach, setup)");
+        std::process::exit(1);
+    }
 
     let result = match cli.command {
         Commands::Zone { action } => commands::zone::handle(action, out).await,

@@ -1,5 +1,4 @@
 use clap::Subcommand;
-use serde::Serialize;
 
 pub mod pb {
     pub mod zone {
@@ -30,19 +29,6 @@ pub enum PolicyAction {
     },
 }
 
-#[derive(Serialize)]
-struct PolicyApplied {
-    ok: bool,
-    zone: String,
-}
-
-#[derive(Serialize)]
-struct PolicyShow {
-    ok: bool,
-    zone: String,
-    policy_toml: String,
-}
-
 pub async fn handle(action: PolicyAction, out: OutputMode) -> anyhow::Result<()> {
     let channel = super::connect().await?;
     let mut client = ZoneServiceClient::new(channel);
@@ -63,7 +49,7 @@ pub async fn handle(action: PolicyAction, out: OutputMode) -> anyhow::Result<()>
 
             output::print(
                 out,
-                &PolicyApplied {
+                &output::PolicyApplied {
                     ok: true,
                     zone: zone.clone(),
                 },
@@ -80,7 +66,7 @@ pub async fn handle(action: PolicyAction, out: OutputMode) -> anyhow::Result<()>
 
             output::print(
                 out,
-                &PolicyShow {
+                &output::PolicyShow {
                     ok: true,
                     zone: zone.clone(),
                     policy_toml: resp.policy_toml.clone(),

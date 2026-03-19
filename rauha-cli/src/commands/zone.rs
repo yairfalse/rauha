@@ -116,7 +116,11 @@ pub async fn handle(action: ZoneAction, out: OutputMode) -> anyhow::Result<()> {
                 .await?
                 .into_inner();
 
-            if let Some(z) = resp.zone {
+            let z = resp.zone.ok_or_else(|| {
+                anyhow::anyhow!("zone not found: {}", name)
+            })?;
+
+            {
                 let policy_resp = client
                     .get_policy(pb::zone::GetPolicyRequest {
                         zone_name: name.clone(),

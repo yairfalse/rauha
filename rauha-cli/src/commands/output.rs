@@ -1,8 +1,10 @@
 //! Structured output for human and machine consumers.
 //!
-//! Every command uses `print()` to emit results. In human mode, the caller
-//! provides a closure that prints formatted text. In JSON mode, the value
-//! is serialized to stdout as a single JSON object per line.
+//! Commands that support structured output use `print()` to emit results.
+//! In human mode, the caller provides a closure that prints formatted text.
+//! In JSON mode, the value is serialized to stdout as a single JSON object
+//! per line. Streaming/interactive commands (logs, exec, attach, trace, top,
+//! events, setup) do not support `--json` and reject it at startup.
 
 use serde::Serialize;
 
@@ -26,7 +28,8 @@ pub fn print<T: Serialize>(mode: OutputMode, value: &T, human: impl FnOnce()) {
     }
 }
 
-/// Print a JSON error to stdout (for --json mode) and exit with code 1.
+/// Print a JSON error to stdout (for --json mode).
+/// The caller is responsible for exiting with the appropriate code.
 pub fn print_error(message: &str) {
     let err = serde_json::json!({
         "ok": false,
@@ -164,4 +167,17 @@ pub struct ImageInspect {
     pub digest: String,
     pub size: u64,
     pub config: serde_json::Value,
+}
+
+#[derive(Serialize)]
+pub struct PolicyApplied {
+    pub ok: bool,
+    pub zone: String,
+}
+
+#[derive(Serialize)]
+pub struct PolicyShow {
+    pub ok: bool,
+    pub zone: String,
+    pub policy_toml: String,
 }
