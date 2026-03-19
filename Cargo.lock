@@ -1813,6 +1813,7 @@ dependencies = [
  "prost",
  "rauha-common",
  "serde",
+ "serde_json",
  "tokio",
  "tokio-stream",
  "toml",

@@ -8,6 +8,8 @@ pub mod pb {
 
 use pb::container::container_service_client::ContainerServiceClient;
 
+use super::output::{self, OutputMode};
+
 #[derive(Args)]
 pub struct RunArgs {
     /// Zone to run the container in
@@ -39,7 +41,7 @@ pub struct StopArgs {
     pub timeout: u32,
 }
 
-pub async fn handle_run(args: RunArgs) -> anyhow::Result<()> {
+pub async fn handle_run(args: RunArgs, out: OutputMode) -> anyhow::Result<()> {
     let channel = super::connect().await?;
     let mut client = ContainerServiceClient::new(channel);
 
@@ -59,8 +61,6 @@ pub async fn handle_run(args: RunArgs) -> anyhow::Result<()> {
         .await?
         .into_inner();
 
-    println!("{}", resp.container_id);
-
     // Start the container.
     client
         .start_container(pb::container::StartContainerRequest {
@@ -68,10 +68,22 @@ pub async fn handle_run(args: RunArgs) -> anyhow::Result<()> {
         })
         .await?;
 
+    output::print(
+        out,
+        &output::ContainerCreated {
+            ok: true,
+            container_id: resp.container_id.clone(),
+            name,
+            zone: args.zone,
+            image: args.image,
+        },
+        || println!("{}", resp.container_id),
+    );
+
     Ok(())
 }
 
-pub async fn handle_ps(args: PsArgs) -> anyhow::Result<()> {
+pub async fn handle_ps(args: PsArgs, out: OutputMode) -> anyhow::Result<()> {
     let channel = super::connect().await?;
     let mut client = ContainerServiceClient::new(channel);
 
@@ -82,20 +94,34 @@ pub async fn handle_ps(args: PsArgs) -> anyhow::Result<()> {
         .await?
         .into_inner();
 
-    if resp.containers.is_empty() {
-        println!("No containers running.");
-    } else {
-        println!(
-            "{:<40} {:<15} {:<20} {:<12} {:<8}",
-            "ID", "NAME", "IMAGE", "STATE", "PID"
-        );
-        for c in resp.containers {
+    let containers: Vec<output::ContainerInfo> = resp
+        .containers
+        .iter()
+        .map(|c| output::ContainerInfo {
+            id: c.id.clone(),
+            name: c.name.clone(),
+            image: c.image.clone(),
+            state: c.state.clone(),
+            pid: c.pid,
+        })
+        .collect();
+
+    output::print(out, &output::ContainerList { ok: true, containers }, || {
+        if resp.containers.is_empty() {
+            println!("No containers running.");
+        } else {
             println!(
                 "{:<40} {:<15} {:<20} {:<12} {:<8}",
-                c.id, c.name, c.image, c.state, c.pid
+                "ID", "NAME", "IMAGE", "STATE", "PID"
             );
+            for c in &resp.containers {
+                println!(
+                    "{:<40} {:<15} {:<20} {:<12} {:<8}",
+                    c.id, c.name, c.image, c.state, c.pid
+                );
+            }
         }
-    }
+    });
 
     Ok(())
 }
@@ -109,7 +135,7 @@ pub struct DeleteArgs {
     pub force: bool,
 }
 
-pub async fn handle_stop(args: StopArgs) -> anyhow::Result<()> {
+pub async fn handle_stop(args: StopArgs, out: OutputMode) -> anyhow::Result<()> {
     let channel = super::connect().await?;
     let mut client = ContainerServiceClient::new(channel);
 
@@ -120,11 +146,18 @@ pub async fn handle_stop(args: StopArgs) -> anyhow::Result<()> {
         })
         .await?;
 
-    println!("Stopped: {}", args.container_id);
+    output::print(
+        out,
+        &output::ContainerStopped {
+            ok: true,
+            container_id: args.container_id.clone(),
+        },
+        || println!("Stopped: {}", args.container_id),
+    );
     Ok(())
 }
 
-pub async fn handle_delete(args: DeleteArgs) -> anyhow::Result<()> {
+pub async fn handle_delete(args: DeleteArgs, out: OutputMode) -> anyhow::Result<()> {
     let channel = super::connect().await?;
     let mut client = ContainerServiceClient::new(channel);
 
@@ -135,6 +168,13 @@ pub async fn handle_delete(args: DeleteArgs) -> anyhow::Result<()> {
         })
         .await?;
 
-    println!("Deleted: {}", args.container_id);
+    output::print(
+        out,
+        &output::ContainerDeleted {
+            ok: true,
+            container_id: args.container_id.clone(),
+        },
+        || println!("Deleted: {}", args.container_id),
+    );
     Ok(())
 }
