@@ -168,6 +168,20 @@ fn generate_rules(zone_name: &str, policy: &ZonePolicy) -> String {
                     ));
                 }
             }
+            // TODO(networking): allowed_zones support for macOS VMs.
+            // Cross-VM pf rules need the peer VM's IP, which the guest agent
+            // can report over vsock. Requires:
+            // 1. Guest agent reporting its assigned IP on boot
+            // 2. PfManager tracking VM IPs
+            // 3. Generating pass rules for allowed VM-to-VM traffic
+            // Lower priority since VMs already have NAT networking from
+            // Virtualization.framework.
+            if !policy.network.allowed_zones.is_empty() {
+                rules.push_str(&format!(
+                    "# allowed_zones: {:?} (not yet enforced — follow-up)\n",
+                    policy.network.allowed_zones
+                ));
+            }
             // Always allow DNS to host resolver.
             rules.push_str(&format!(
                 "pass out quick proto udp from <{table_name}> to any port 53\n"

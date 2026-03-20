@@ -230,6 +230,7 @@ mod tests {
             policy: ZonePolicy::default(),
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
+            network_state: None,
         };
 
         db.put_zone(&zone).unwrap();
@@ -343,6 +344,7 @@ mod tests {
                 policy: ZonePolicy::default(),
                 created_at: chrono::Utc::now(),
                 updated_at: chrono::Utc::now(),
+                network_state: None,
             };
             db.put_zone(&zone).unwrap();
         }
