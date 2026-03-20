@@ -8,8 +8,6 @@
 //! syscall policy (file_open, ptrace, etc). This separation keeps each
 //! subsystem doing what it does best.
 
-use std::collections::HashMap;
-use std::net::Ipv4Addr;
 use std::process::Command;
 
 use rauha_common::error::{RauhaError, Result};
@@ -42,10 +40,18 @@ pub fn ensure_nat(subnet_cidr: &str) -> Result<()> {
     run_nft(&["add", "rule", TABLE_FAMILY, TABLE_NAME, "postrouting", &rule])?;
 
     // Create forward chain with default drop policy.
+    // Any traffic not explicitly accepted by a zone chain is dropped.
     run_nft(&[
         "add", "chain", TABLE_FAMILY, TABLE_NAME, "forward",
         "{", "type", "filter", "hook", "forward", "priority", "filter", ";",
-        "policy", "accept", ";", "}",
+        "policy", "drop", ";", "}",
+    ])?;
+
+    // Allow established/related at the top of the forward chain so return
+    // traffic is never blocked.
+    run_nft(&[
+        "add", "rule", TABLE_FAMILY, TABLE_NAME, "forward",
+        "ct state established,related accept",
     ])?;
 
     tracing::info!(subnet = subnet_cidr, "nftables NAT + forward chains created");
@@ -65,11 +71,13 @@ pub fn cleanup_nat() -> Result<()> {
 }
 
 /// Apply nftables forward rules for a zone based on its NetworkPolicy.
+///
+/// Zone names are validated by `validate_zone_name` (alphanumeric + hyphen,
+/// max 128 chars) which produces safe nftables chain identifiers.
 pub fn apply_zone_rules(
     zone_name: &str,
     veth_name: &str,
     policy: &NetworkPolicy,
-    zone_ips: &HashMap<String, Ipv4Addr>,
 ) -> Result<()> {
     // First remove any existing rules for this zone.
     let _ = remove_zone_rules(zone_name);
@@ -109,46 +117,27 @@ pub fn apply_zone_rules(
             ])?;
 
             // Allow cross-zone traffic to specific zones.
+            // Uses veth interface names — no IP lookup needed.
             for allowed_zone in &policy.allowed_zones {
-                if let Some(&peer_ip) = zone_ips.get(allowed_zone) {
-                    let peer_veth = super::network::veth_host_name_for(allowed_zone);
-                    // Allow bidirectional traffic between veths.
-                    run_nft(&[
-                        "add", "rule", TABLE_FAMILY, TABLE_NAME, &chain_name,
-                        &format!("iifname \"{veth_name}\" oifname \"{peer_veth}\" accept"),
-                    ])?;
-                    run_nft(&[
-                        "add", "rule", TABLE_FAMILY, TABLE_NAME, &chain_name,
-                        &format!("iifname \"{peer_veth}\" oifname \"{veth_name}\" accept"),
-                    ])?;
-
-                    let _ = peer_ip; // IP used for logging context.
-                    tracing::debug!(
-                        zone = zone_name,
-                        peer = allowed_zone,
-                        peer_ip = %peer_ip,
-                        "allowed cross-zone traffic"
-                    );
-                }
-            }
-
-            // Allow specific egress destinations.
-            for dest in &policy.allowed_egress {
+                let peer_veth = super::network::veth_host_name_for(allowed_zone);
+                // Allow bidirectional traffic between veths.
                 run_nft(&[
                     "add", "rule", TABLE_FAMILY, TABLE_NAME, &chain_name,
-                    &format!("iifname \"{veth_name}\" ip daddr {dest} accept"),
+                    &format!("iifname \"{veth_name}\" oifname \"{peer_veth}\" accept"),
                 ])?;
-            }
-
-            // If no egress rules specified, allow all outbound (bridged default).
-            if policy.allowed_egress.is_empty() {
                 run_nft(&[
                     "add", "rule", TABLE_FAMILY, TABLE_NAME, &chain_name,
-                    &format!("iifname \"{veth_name}\" accept"),
+                    &format!("iifname \"{peer_veth}\" oifname \"{veth_name}\" accept"),
                 ])?;
+
+                tracing::debug!(
+                    zone = zone_name,
+                    peer = allowed_zone.as_str(),
+                    "allowed cross-zone traffic"
+                );
             }
 
-            // Allow DNS always.
+            // Allow DNS always (before egress rules so it's never blocked).
             run_nft(&[
                 "add", "rule", TABLE_FAMILY, TABLE_NAME, &chain_name,
                 &format!("iifname \"{veth_name}\" udp dport 53 accept"),
@@ -158,7 +147,24 @@ pub fn apply_zone_rules(
                 &format!("iifname \"{veth_name}\" tcp dport 53 accept"),
             ])?;
 
-            // Default: drop remaining.
+            // Allow specific egress destinations.
+            for dest in &policy.allowed_egress {
+                run_nft(&[
+                    "add", "rule", TABLE_FAMILY, TABLE_NAME, &chain_name,
+                    &format!("iifname \"{veth_name}\" ip daddr {dest} accept"),
+                ])?;
+            }
+
+            // If no egress rules specified, allow outbound to non-zone interfaces
+            // (internet) but NOT cross-zone traffic (which must be in allowed_zones).
+            if policy.allowed_egress.is_empty() {
+                run_nft(&[
+                    "add", "rule", TABLE_FAMILY, TABLE_NAME, &chain_name,
+                    &format!("iifname \"{veth_name}\" oifname != \"veth-*\" accept"),
+                ])?;
+            }
+
+            // Default: drop remaining (blocks unlisted cross-zone traffic).
             run_nft(&[
                 "add", "rule", TABLE_FAMILY, TABLE_NAME, &chain_name, "drop",
             ])?;
@@ -186,16 +192,54 @@ pub fn apply_zone_rules(
 pub fn remove_zone_rules(zone_name: &str) -> Result<()> {
     let chain_name = zone_chain_name(zone_name);
 
-    // Flush and delete the zone chain (this also removes jump rules referencing it).
-    // Ignore errors — chain may not exist.
+    // First, remove jump rules in the forward chain that reference this zone chain.
+    let _ = remove_forward_chain_jumps(&chain_name);
+
+    // Flush and delete the zone chain. Ignore errors — chain may not exist.
     let _ = run_nft(&["flush", "chain", TABLE_FAMILY, TABLE_NAME, &chain_name]);
     let _ = run_nft(&["delete", "chain", TABLE_FAMILY, TABLE_NAME, &chain_name]);
 
     Ok(())
 }
 
+/// Remove rules in the forward chain that jump to the given zone chain.
+/// Uses nft handle-based deletion to avoid leaving stale rules.
+fn remove_forward_chain_jumps(chain_name: &str) -> Result<()> {
+    let output = Command::new("nft")
+        .args(["-a", "list", "chain", TABLE_FAMILY, TABLE_NAME, "forward"])
+        .output()
+        .map_err(|e| RauhaError::NetworkError {
+            message: format!("failed to list nftables forward chain: {e}"),
+            hint: "ensure nftables is installed (nft command)".into(),
+        })?;
+
+    if !output.status.success() {
+        return Ok(());
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    for line in stdout.lines() {
+        if line.contains("jump") && line.contains(chain_name) {
+            if let Some(idx) = line.find("# handle ") {
+                let handle = line[idx + "# handle ".len()..].trim();
+                if !handle.is_empty() {
+                    let _ = run_nft(&[
+                        "delete", "rule", TABLE_FAMILY, TABLE_NAME, "forward",
+                        "handle", handle,
+                    ]);
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
 fn zone_chain_name(zone_name: &str) -> String {
-    // nftables chain names can be up to 256 chars; zone names are max 128.
+    // Zone names are validated by validate_zone_name: no path separators,
+    // no NUL, not "." or "..", max 128 chars. This produces safe nftables
+    // chain identifiers (max 256 chars).
     format!("zone-{zone_name}")
 }
 

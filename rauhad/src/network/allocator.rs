@@ -21,6 +21,7 @@ pub struct IpAllocator {
 
 impl IpAllocator {
     pub fn new(subnet: [u8; 4], prefix_len: u8) -> Self {
+        assert!(prefix_len <= 30, "prefix_len must be <= 30 to have usable host addresses");
         let mut allocated = HashSet::new();
         // Reserve offset 0 (network address) and offset 1 (gateway).
         allocated.insert(0);
@@ -76,17 +77,14 @@ impl IpAllocator {
 
     /// Mark an IP as allocated (used during recovery).
     pub fn mark_allocated(&mut self, ip: Ipv4Addr) {
-        let offset = self.ip_to_offset(ip);
-        if offset > 1 {
+        if let Some(offset) = self.validated_offset(ip) {
             self.allocated.insert(offset);
         }
     }
 
     /// Release an IP address back to the pool.
     pub fn release(&mut self, ip: Ipv4Addr) {
-        let offset = self.ip_to_offset(ip);
-        // Never release the network address or gateway.
-        if offset > 1 {
+        if let Some(offset) = self.validated_offset(ip) {
             self.allocated.remove(&offset);
         }
     }
@@ -126,7 +124,18 @@ impl IpAllocator {
     fn ip_to_offset(&self, ip: Ipv4Addr) -> u32 {
         let base = u32::from_be_bytes(self.subnet);
         let addr = u32::from_be_bytes(ip.octets());
-        addr - base
+        addr.wrapping_sub(base)
+    }
+
+    /// Validate that an IP is within this subnet and return its offset (> 1),
+    /// or None if out of range.
+    fn validated_offset(&self, ip: Ipv4Addr) -> Option<u32> {
+        let offset = self.ip_to_offset(ip);
+        if offset > 1 && offset <= self.max_host_offset() {
+            Some(offset)
+        } else {
+            None
+        }
     }
 }
 

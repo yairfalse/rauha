@@ -274,24 +274,10 @@ impl LinuxBackend {
     fn apply_nftables_for_zone(&self, zone: &ZoneHandle, net_policy: &NetworkPolicy) -> Result<()> {
         let veth_name = network::veth_host_name_for(&zone.name);
 
-        // Build a map of zone_name → IP for cross-zone rules.
-        let zone_ips = self.build_zone_ip_map();
-
-        if let Err(e) = nftables::apply_zone_rules(&zone.name, &veth_name, net_policy, &zone_ips) {
+        if let Err(e) = nftables::apply_zone_rules(&zone.name, &veth_name, net_policy) {
             tracing::warn!(%e, zone = zone.name, "failed to apply nftables rules — network filtering inactive");
         }
         Ok(())
-    }
-
-    /// Build a map of zone_name → Ipv4Addr from the allocator's perspective.
-    /// Used for cross-zone nftables rules.
-    fn build_zone_ip_map(&self) -> std::collections::HashMap<String, std::net::Ipv4Addr> {
-        // We don't have zone IPs directly in LinuxBackend, but we can look them up
-        // from the zone_name_map. For now, this returns an empty map and gets populated
-        // as zones are created. The actual IP lookup happens through the ZoneHandle's
-        // network_state, which the caller (registry) maintains.
-        // This is a best-effort lookup for the nftables module.
-        std::collections::HashMap::new()
     }
 
     /// Sync the ZONE_ALLOWED_COMMS BPF map for defense-in-depth.
@@ -481,12 +467,9 @@ impl IsolationBackend for LinuxBackend {
 
             Some(ip_state)
         } else {
-            // Host mode: no namespace or veth needed.
-            if let Err(e) = namespace::create_netns(&config.name) {
-                tracing::warn!(%e, zone = config.name, "failed to create netns — continuing without");
-            } else if let Err(e) = network::create_veth_pair(&config.name, None) {
-                tracing::warn!(%e, zone = config.name, "failed to create veth pair — continuing without");
-            }
+            // Host mode: zone shares the host's network stack.
+            // No network namespace or veth pair — the zone's processes use
+            // the host interfaces directly.
             None
         };
 

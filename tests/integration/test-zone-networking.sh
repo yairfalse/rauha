@@ -7,11 +7,26 @@ RAUHA="${RAUHA_BIN:-cargo run --bin rauha --}"
 ZONE_A="test-net-a-$$"
 ZONE_B="test-net-b-$$"
 IMAGE="${TEST_IMAGE:-alpine:latest}"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+# Create a temporary bridged policy that allows cross-zone and internet.
+POLICY_FILE=$(mktemp /tmp/rauha-test-net-XXXXXX.toml)
+cat > "$POLICY_FILE" <<TOML
+[zone]
+name = "placeholder"
+type = "non-global"
+
+[network]
+mode = "bridged"
+allowed_zones = ["$ZONE_A", "$ZONE_B"]
+allowed_egress = ["0.0.0.0/0"]
+TOML
 
 cleanup() {
     echo "Cleaning up..."
     $RAUHA zone delete --name "$ZONE_A" --force 2>/dev/null || true
     $RAUHA zone delete --name "$ZONE_B" --force 2>/dev/null || true
+    rm -f "$POLICY_FILE"
 }
 trap cleanup EXIT
 
@@ -20,11 +35,11 @@ echo "=== Test: zone networking ==="
 echo "1. Pulling image (if not present)..."
 $RAUHA image pull "$IMAGE" 2>/dev/null || true
 
-echo "2. Creating zone A..."
-$RAUHA zone create --name "$ZONE_A"
+echo "2. Creating zone A (bridged)..."
+$RAUHA zone create --name "$ZONE_A" --policy "$POLICY_FILE"
 
-echo "3. Creating zone B..."
-$RAUHA zone create --name "$ZONE_B"
+echo "3. Creating zone B (bridged)..."
+$RAUHA zone create --name "$ZONE_B" --policy "$POLICY_FILE"
 
 echo "4. Checking bridge has gateway IP..."
 if ip addr show rauha0 | grep -q "10.89.0.1"; then
@@ -55,8 +70,8 @@ $RAUHA run --zone "$ZONE_A" "$IMAGE" /bin/ping -c1 -W5 8.8.8.8
 echo "   Internet ping from zone A: OK"
 
 echo "8. Getting zone IPs from namespaces..."
-ZONE_A_IP=$(ip netns exec "rauha-${ZONE_A}" ip -4 addr show eth0 | grep -oP 'inet \K[0-9.]+')
-ZONE_B_IP=$(ip netns exec "rauha-${ZONE_B}" ip -4 addr show eth0 | grep -oP 'inet \K[0-9.]+')
+ZONE_A_IP=$(ip netns exec "rauha-${ZONE_A}" ip -4 addr show eth0 | awk '/inet / {print $2}' | cut -d/ -f1)
+ZONE_B_IP=$(ip netns exec "rauha-${ZONE_B}" ip -4 addr show eth0 | awk '/inet / {print $2}' | cut -d/ -f1)
 echo "   Zone A IP: $ZONE_A_IP"
 echo "   Zone B IP: $ZONE_B_IP"
 
