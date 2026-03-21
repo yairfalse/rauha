@@ -73,9 +73,17 @@ impl MetadataStore {
             .map_err(|e| RauhaError::MetadataError(e.to_string()))?;
         match table.get(name) {
             Ok(Some(value)) => {
-                let zone: Zone = postcard::from_bytes(value.value())
-                    .map_err(|e| RauhaError::MetadataError(e.to_string()))?;
-                Ok(Some(zone))
+                match postcard::from_bytes::<Zone>(value.value()) {
+                    Ok(zone) => Ok(Some(zone)),
+                    Err(e) => {
+                        tracing::warn!(
+                            zone = name,
+                            error = %e,
+                            "zone metadata is incompatible (schema changed?) — treating as missing"
+                        );
+                        Ok(None)
+                    }
+                }
             }
             Ok(None) => Ok(None),
             Err(e) => Err(RauhaError::MetadataError(e.to_string())),
@@ -111,10 +119,20 @@ impl MetadataStore {
             .map_err(|e| RauhaError::MetadataError(e.to_string()))?;
         let mut zones = Vec::new();
         for entry in table.iter().map_err(|e| RauhaError::MetadataError(e.to_string()))? {
-            let (_, value) = entry.map_err(|e| RauhaError::MetadataError(e.to_string()))?;
-            let zone: Zone = postcard::from_bytes(value.value())
-                .map_err(|e| RauhaError::MetadataError(e.to_string()))?;
-            zones.push(zone);
+            let (key, value) = entry.map_err(|e| RauhaError::MetadataError(e.to_string()))?;
+            match postcard::from_bytes::<Zone>(value.value()) {
+                Ok(zone) => zones.push(zone),
+                Err(e) => {
+                    // Schema migration: old entries may not have new fields.
+                    // Skip them rather than crashing the daemon.
+                    tracing::warn!(
+                        zone = key.value(),
+                        error = %e,
+                        "skipping zone with incompatible metadata (schema changed?) — \
+                         delete stale db or re-create the zone"
+                    );
+                }
+            }
         }
         Ok(zones)
     }

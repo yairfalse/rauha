@@ -1,0 +1,19 @@
+[package]
+name = "rauha-oracle"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# NOT in workspace — oracle is immutable ground truth.
+# Must not be modifiable as a side effect of system changes.
+[workspace]
+
+[dependencies]
+tonic = "0.12"
+prost = "0.13"
+tokio = { version = "1", features = ["full", "test-util"] }
+uuid = { version = "1", features = ["v4"] }
+ulid = "1"
+
+[build-dependencies]
+tonic-build = "0.12"
