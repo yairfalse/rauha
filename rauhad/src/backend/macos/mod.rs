@@ -103,6 +103,7 @@ impl IsolationBackend for MacosBackend {
             id: zone_id,
             name: config.name.clone(),
             platform_id: 0, // VM doesn't have a numeric platform ID
+            network_state: None, // macOS VMs get IPs from Virtualization.framework's NAT
         })
     }
 

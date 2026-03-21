@@ -1,6 +1,31 @@
+use std::net::Ipv4Addr;
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
+
+/// Network state assigned to a zone at creation time.
+/// Persisted in redb so IPs survive daemon restart.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ZoneNetworkState {
+    pub ip: [u8; 4],
+    pub gateway: [u8; 4],
+    pub prefix_len: u8,
+}
+
+impl ZoneNetworkState {
+    pub fn ip(&self) -> Ipv4Addr {
+        Ipv4Addr::from(self.ip)
+    }
+
+    pub fn gateway(&self) -> Ipv4Addr {
+        Ipv4Addr::from(self.gateway)
+    }
+
+    pub fn cidr(&self) -> String {
+        format!("{}/{}", self.ip(), self.prefix_len)
+    }
+}
 
 /// A zone is the first-class isolation boundary. Every container belongs to exactly one zone.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -12,6 +37,8 @@ pub struct Zone {
     pub policy: ZonePolicy,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    /// Assigned network state (IP, gateway). None for Host-mode zones or pre-networking zones.
+    pub network_state: Option<ZoneNetworkState>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -151,6 +178,8 @@ pub struct ZoneHandle {
     pub name: String,
     /// Platform-specific identifier (cgroup id on Linux, VM id on macOS).
     pub platform_id: u64,
+    /// Assigned network state (IP, gateway). Set by the backend during zone creation.
+    pub network_state: Option<ZoneNetworkState>,
 }
 
 /// Runtime statistics for a zone.

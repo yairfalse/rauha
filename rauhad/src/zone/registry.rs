@@ -99,6 +99,7 @@ impl ZoneRegistry {
                 id: zone.id,
                 name: zone.name.clone(),
                 platform_id: 0, // Will be set by recover_zone.
+                network_state: zone.network_state.clone(),
             };
 
             match self.backend.recover_zone(&handle, zone.zone_type, &zone.policy) {
@@ -152,6 +153,7 @@ impl ZoneRegistry {
             policy,
             created_at: now,
             updated_at: now,
+            network_state: handle.network_state.clone(),
         };
 
         // Persist.
@@ -557,6 +559,7 @@ mod tests {
                 id: Uuid::new_v4(),
                 name: _config.name.clone(),
                 platform_id: self.next_id.fetch_add(1, Ordering::Relaxed),
+                network_state: None,
             })
         }
 

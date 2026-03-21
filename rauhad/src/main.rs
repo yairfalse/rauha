@@ -1,6 +1,7 @@
 mod backend;
 mod logs;
 mod metadata;
+mod network;
 mod server;
 mod zone;
 
