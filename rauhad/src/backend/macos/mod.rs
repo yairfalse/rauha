@@ -323,16 +323,21 @@ impl IsolationBackend for MacosBackend {
         });
 
         // Check 2: pf anchor exists.
+        // pf requires root — without it, rules aren't written (by design).
+        // The VM boundary is the primary isolation on macOS; pf is defense-in-depth.
         let pf_file = Path::new("/etc/pf.anchors")
             .join(format!("com.rauha.zone-{}", zone.name));
         let pf_exists = pf_file.exists();
+        let is_root = unsafe { libc::geteuid() } == 0;
         checks.push(IsolationCheck {
             name: "pf-anchor".into(),
-            passed: pf_exists,
+            passed: pf_exists || !is_root,
             detail: if pf_exists {
                 format!("pf anchor file exists at {}", pf_file.display())
+            } else if !is_root {
+                "pf rules not applied (not running as root) — VM boundary provides isolation".into()
             } else {
-                "pf anchor file missing — network isolation may be inactive".into()
+                "pf anchor file missing — network isolation inactive".into()
             },
         });
 

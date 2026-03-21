@@ -449,7 +449,18 @@ impl ZoneRegistry {
         let handle = handles
             .get(zone_name)
             .ok_or_else(|| RauhaError::ZoneNotFound(zone_name.into()))?;
-        self.backend.zone_stats(handle)
+        let mut stats = self.backend.zone_stats(handle)?;
+
+        // Backfill memory_limit from policy if the backend didn't set it.
+        // macOS VM backend returns 0 because limits are set at VM boot,
+        // not readable from the guest agent.
+        if stats.memory_limit_bytes == 0 {
+            if let Ok(Some(zone)) = self.metadata.get_zone(zone_name) {
+                stats.memory_limit_bytes = zone.policy.resources.memory_limit;
+            }
+        }
+
+        Ok(stats)
     }
 
     pub async fn verify_isolation(&self, zone_name: &str) -> Result<IsolationReport> {

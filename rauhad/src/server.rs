@@ -29,14 +29,11 @@ fn to_status(e: RauhaError) -> Status {
         RauhaError::ZoneNotEmpty { .. } => {
             Status::failed_precondition(e.to_string())
         }
-        RauhaError::ImageError(_) | RauhaError::ImagePullError { .. } => {
-            // Image not found vs pull failure — check message for "not found".
-            let msg = e.to_string();
-            if msg.contains("not found") {
-                Status::not_found(msg)
-            } else {
-                Status::internal(msg)
-            }
+        RauhaError::ImagePullError { ref message, .. } if message.contains("not pulled") || message.contains("not found") => {
+            Status::not_found(e.to_string())
+        }
+        RauhaError::ImageError(ref msg) if msg.contains("not found") => {
+            Status::not_found(e.to_string())
         }
         _ => Status::internal(e.to_string()),
     }
@@ -811,20 +808,17 @@ impl ImageService for ImageServiceImpl {
         request: Request<pb::image::InspectImageRequest>,
     ) -> Result<Response<pb::image::InspectImageResponse>, Status> {
         let req = request.into_inner();
-        let config = self
+        let inspection = self
             .image_service
-            .inspect(&req.reference)
-            .map_err(|e| Status::not_found(e.to_string()))?;
-
-        let config_json =
-            serde_json::to_string_pretty(&config).unwrap_or_else(|_| "{}".into());
+            .inspect_full(&req.reference)
+            .map_err(to_status)?;
 
         Ok(Response::new(pb::image::InspectImageResponse {
-            digest: String::new(),
+            digest: inspection.digest,
             tags: vec![req.reference],
-            size: 0,
-            config_json,
-            layers: Vec::new(),
+            size: inspection.size,
+            config_json: inspection.config_json,
+            layers: inspection.layers,
         }))
     }
 }
