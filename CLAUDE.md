@@ -38,6 +38,12 @@ cargo run --bin rauha -- run --zone test alpine:latest /bin/echo hello
 bash tests/integration/test-image-pull.sh
 bash tests/integration/test-container-lifecycle.sh
 bash tests/integration/test-zone-isolation.sh
+bash tests/integration/test-zone-networking.sh
+
+# Oracle tests (require running rauhad, any platform)
+cd eval/oracle
+RAUHA_GRPC_ENDPOINT=http://[::1]:9876 cargo test           # all 13 cases
+RAUHA_GRPC_ENDPOINT=http://[::1]:9876 cargo test -- case_001  # one case
 ```
 
 Proto files are in `proto/` (zone.proto, container.proto, image.proto). They compile automatically via `build.rs` in rauhad and rauha-cli.
@@ -90,9 +96,25 @@ ObjC exceptions from Virtualization.framework are caught via `objc2::exception::
 
 pf firewall rules require root. When running rauhad without root (development), pf errors are logged as warnings and network isolation is inactive.
 
+### Zone Networking (`rauhad/src/network/`, `rauhad/src/backend/linux/nftables.rs`)
+
+Zones get full network connectivity on Linux via: veth pairs → rauha0 bridge (gateway 10.89.0.1) → nftables NAT masquerade → internet. Each zone is assigned a unique IP from the 10.89.0.0/16 subnet by `IpAllocator`, persisted in `Zone.network_state`. DNS resolv.conf is injected into container rootfs (handles systemd-resolved stub detection).
+
+**Enforcement layering:** nftables handles packet filtering (L3/L4). eBPF `ZONE_ALLOWED_COMMS` map is defense-in-depth for cross-zone socket operations. Neither replaces the other.
+
+- **allocator.rs** — stateless IPAM; rebuilds from persisted zone metadata on startup
+- **dns.rs** — generates resolv.conf; filters localhost stubs, falls back to 1.1.1.1/8.8.8.8
+- **nftables.rs** — NAT masquerade + per-zone forward chains; forward chain defaults to drop; jump rules cleaned by handle on zone deletion
+
+On macOS, VMs get NAT from Virtualization.framework. pf handles per-zone firewall rules (requires root). `allowed_zones` cross-VM support is not yet implemented.
+
+### gRPC Error Boundary (`rauhad/src/server.rs`)
+
+`to_status()` maps `RauhaError` variants to correct gRPC status codes. When adding new error variants, update this function — the oracle will catch incorrect mappings. Key mappings: `ZoneNotFound`→`NotFound`, `ZoneAlreadyExists`→`AlreadyExists`, `InvalidPolicy`/`BackendError("zone name...")`→`InvalidArgument`, `ImagePullError("not pulled")`→`NotFound`.
+
 ### Data Stores
 
-- **redb** (`{root}/metadata/rauha.redb`) — persisted zone/container metadata. Source of truth on crash recovery.
+- **redb** (`{root}/metadata/rauha.redb`) — persisted zone/container metadata. Source of truth on crash recovery. Uses postcard serialization — adding fields to `Zone`/`Container` structs can break deserialization of old entries. `list_zones()`/`get_zone()` skip incompatible entries with a warning rather than crashing. If the daemon won't start after schema changes, delete the stale db: `rm {root}/metadata/rauha.redb`.
 - **BPF maps** (pinned at `/sys/fs/bpf/rauha/`) — in-kernel enforcement state. Reconciled from redb on daemon startup. Linux only.
 - **Content store** (`{root}/content/blobs/sha256/`) — content-addressable OCI blob storage.
 - **VM assets** (`/var/lib/rauha/vm/vmlinux`, `initramfs.img`) — kernel and initramfs for macOS VMs. Installed via `rauha setup`.
@@ -118,7 +140,7 @@ Built separately via `cargo xtask build-ebpf` targeting `bpfel-unknown-none`. No
 | Crate | Purpose |
 |-------|---------|
 | `rauha-common` | Shared types, `IsolationBackend` trait, error types, policy parsing, shim IPC protocol |
-| `rauhad` | Daemon — gRPC server, zone registry, metadata (redb), Linux/macOS backends |
+| `rauhad` | Daemon — gRPC server, zone registry, metadata (redb), networking, Linux/macOS backends |
 | `rauha-cli` | CLI binary — connects to rauhad via gRPC |
 | `rauha-shim` | Per-zone sync process — fork/run containers (Linux only) |
 | `rauha-guest-agent` | Guest-side daemon inside macOS VMs — container lifecycle over virtio-vsock |
@@ -126,6 +148,12 @@ Built separately via `cargo xtask build-ebpf` targeting `bpfel-unknown-none`. No
 | `rauha-ebpf` | eBPF LSM programs (kernel-side, not in workspace, separate build) |
 | `rauha-ebpf-common` | Shared `#[repr(C)]` types between eBPF programs and userspace |
 | `xtask` | Build helper for eBPF compilation |
+
+## Oracle (`eval/oracle/`)
+
+Standalone ground-truth test binary (NOT in workspace). Validates rauhad through its gRPC API — never reads source code, never mocks. 13 numbered cases across zone lifecycle (001-003), container lifecycle (004-006), image management (007-009), isolation (010-012), policy (013-015), observability (019-021), and resilience (022-024). When a case fails, it means the system's public contract is broken.
+
+The oracle must not be modified as a side effect of modifying the system. It has its own `[workspace]` in Cargo.toml and its own copy of the proto files.
 
 ## Platform Requirements
 
