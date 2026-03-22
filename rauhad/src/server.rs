@@ -3,7 +3,36 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
 
+use rauha_common::error::RauhaError;
+
 use crate::zone::registry::ZoneRegistry;
+
+/// Convert RauhaError to the appropriate gRPC status code.
+/// The error type system already distinguishes not-found, already-exists,
+/// invalid-argument, etc. — this function preserves that at the gRPC boundary.
+fn to_status(e: RauhaError) -> Status {
+    match &e {
+        RauhaError::ZoneNotFound(_)
+        | RauhaError::ContainerNotFound(_)
+        | RauhaError::ImageNotFound(_) => Status::not_found(e.to_string()),
+
+        RauhaError::ZoneAlreadyExists(_) | RauhaError::ContainerAlreadyExists { .. } => {
+            Status::already_exists(e.to_string())
+        }
+
+        RauhaError::InvalidInput(_) | RauhaError::InvalidPolicy(_) => {
+            Status::invalid_argument(e.to_string())
+        }
+
+        RauhaError::PermissionDenied(_) | RauhaError::CrossZoneAccessDenied { .. } => {
+            Status::permission_denied(e.to_string())
+        }
+
+        RauhaError::ZoneNotEmpty { .. } => Status::failed_precondition(e.to_string()),
+
+        _ => Status::internal(e.to_string()),
+    }
+}
 
 pub mod pb {
     pub mod zone {
@@ -59,7 +88,7 @@ impl ZoneService for ZoneServiceImpl {
             .registry
             .create_zone(&req.name, zone_type, policy)
             .await
-            .map_err(|e| Status::internal(e.to_string()))?;
+            .map_err(to_status)?;
 
         Ok(Response::new(pb::zone::CreateZoneResponse {
             zone_id: zone.id.to_string(),
@@ -76,7 +105,7 @@ impl ZoneService for ZoneServiceImpl {
         self.registry
             .delete_zone(&req.name, req.force)
             .await
-            .map_err(|e| Status::internal(e.to_string()))?;
+            .map_err(to_status)?;
         Ok(Response::new(pb::zone::DeleteZoneResponse {}))
     }
 
@@ -89,12 +118,12 @@ impl ZoneService for ZoneServiceImpl {
             .registry
             .get_zone(&req.name)
             .await
-            .map_err(|e| Status::not_found(e.to_string()))?;
+            .map_err(to_status)?;
 
         let containers = self
             .registry
             .list_containers(Some(&req.name))
-            .map_err(|e| Status::internal(e.to_string()))?;
+            .map_err(to_status)?;
 
         Ok(Response::new(pb::zone::GetZoneResponse {
             zone: Some(pb::zone::ZoneInfo {
@@ -115,7 +144,7 @@ impl ZoneService for ZoneServiceImpl {
         let zones = self
             .registry
             .list_zones()
-            .map_err(|e| Status::internal(e.to_string()))?;
+            .map_err(to_status)?;
 
         let zone_infos = zones
             .into_iter()
@@ -153,7 +182,7 @@ impl ZoneService for ZoneServiceImpl {
         self.registry
             .apply_policy(&req.zone_name, policy)
             .await
-            .map_err(|e| Status::internal(e.to_string()))?;
+            .map_err(to_status)?;
 
         Ok(Response::new(pb::zone::ApplyPolicyResponse {}))
     }
@@ -167,7 +196,7 @@ impl ZoneService for ZoneServiceImpl {
             .registry
             .get_zone(&req.zone_name)
             .await
-            .map_err(|e| Status::not_found(e.to_string()))?;
+            .map_err(to_status)?;
 
         let toml =
             crate::zone::policy::policy_to_toml(&zone.name, zone.zone_type, &zone.policy);
@@ -186,7 +215,7 @@ impl ZoneService for ZoneServiceImpl {
             .registry
             .zone_stats(&req.zone_name)
             .await
-            .map_err(|e| Status::internal(e.to_string()))?;
+            .map_err(to_status)?;
 
         Ok(Response::new(pb::zone::ZoneStatsResponse {
             zone_id: stats.zone_id.to_string(),
@@ -209,7 +238,7 @@ impl ZoneService for ZoneServiceImpl {
             .registry
             .verify_isolation(&req.zone_name)
             .await
-            .map_err(|e| Status::internal(e.to_string()))?;
+            .map_err(to_status)?;
 
         Ok(Response::new(pb::zone::VerifyIsolationResponse {
             is_isolated: report.is_isolated,
@@ -274,7 +303,7 @@ impl ContainerService for ContainerServiceImpl {
             .registry
             .create_container(&req.zone_name, spec)
             .await
-            .map_err(|e| Status::internal(e.to_string()))?;
+            .map_err(to_status)?;
 
         Ok(Response::new(pb::container::CreateContainerResponse {
             container_id: container.id.to_string(),
@@ -296,7 +325,7 @@ impl ContainerService for ContainerServiceImpl {
         self.registry
             .start_container(&container_id)
             .await
-            .map_err(|e| Status::internal(e.to_string()))?;
+            .map_err(to_status)?;
 
         Ok(Response::new(pb::container::StartContainerResponse {}))
     }
@@ -314,7 +343,7 @@ impl ContainerService for ContainerServiceImpl {
         self.registry
             .stop_container(&container_id, req.timeout_seconds)
             .await
-            .map_err(|e| Status::internal(e.to_string()))?;
+            .map_err(to_status)?;
 
         Ok(Response::new(pb::container::StopContainerResponse {}))
     }
@@ -332,7 +361,7 @@ impl ContainerService for ContainerServiceImpl {
         self.registry
             .delete_container(&container_id, req.force)
             .await
-            .map_err(|e| Status::internal(e.to_string()))?;
+            .map_err(to_status)?;
 
         Ok(Response::new(pb::container::DeleteContainerResponse {}))
     }
@@ -350,7 +379,7 @@ impl ContainerService for ContainerServiceImpl {
         let container = self
             .registry
             .get_container(&container_id)
-            .map_err(|e| Status::not_found(e.to_string()))?;
+            .map_err(to_status)?;
 
         Ok(Response::new(pb::container::GetContainerResponse {
             container: Some(pb::container::ContainerInfo {
@@ -384,7 +413,7 @@ impl ContainerService for ContainerServiceImpl {
         let containers = self
             .registry
             .list_containers(zone_filter)
-            .map_err(|e| Status::internal(e.to_string()))?;
+            .map_err(to_status)?;
 
         let infos = containers
             .into_iter()
@@ -421,7 +450,7 @@ impl ContainerService for ContainerServiceImpl {
         // Verify container exists.
         self.registry
             .get_container(&container_id)
-            .map_err(|e| Status::not_found(e.to_string()))?;
+            .map_err(to_status)?;
 
         let (tx, rx) = mpsc::channel(256);
         let follow = req.follow;
@@ -490,7 +519,7 @@ impl ContainerService for ContainerServiceImpl {
         let container = self
             .registry
             .get_container(&container_id)
-            .map_err(|e| Status::not_found(e.to_string()))?;
+            .map_err(to_status)?;
 
         // Look up zone name.
         let zone_name = self
@@ -604,7 +633,7 @@ impl ContainerService for ContainerServiceImpl {
         let container = self
             .registry
             .get_container(&container_id)
-            .map_err(|e| Status::not_found(e.to_string()))?;
+            .map_err(to_status)?;
 
         let zone_name = self
             .registry
@@ -741,7 +770,7 @@ impl ImageService for ImageServiceImpl {
         let images = self
             .image_service
             .list_images()
-            .map_err(|e| Status::internal(e.to_string()))?;
+            .map_err(to_status)?;
 
         let infos = images
             .into_iter()
@@ -765,7 +794,7 @@ impl ImageService for ImageServiceImpl {
         let req = request.into_inner();
         self.image_service
             .remove_image(&req.reference)
-            .map_err(|e| Status::internal(e.to_string()))?;
+            .map_err(to_status)?;
         Ok(Response::new(pb::image::RemoveImageResponse {}))
     }
 
@@ -774,20 +803,17 @@ impl ImageService for ImageServiceImpl {
         request: Request<pb::image::InspectImageRequest>,
     ) -> Result<Response<pb::image::InspectImageResponse>, Status> {
         let req = request.into_inner();
-        let config = self
+        let inspection = self
             .image_service
-            .inspect(&req.reference)
-            .map_err(|e| Status::not_found(e.to_string()))?;
-
-        let config_json =
-            serde_json::to_string_pretty(&config).unwrap_or_else(|_| "{}".into());
+            .inspect_full(&req.reference)
+            .map_err(to_status)?;
 
         Ok(Response::new(pb::image::InspectImageResponse {
-            digest: String::new(),
+            digest: inspection.digest,
             tags: vec![req.reference],
-            size: 0,
-            config_json,
-            layers: Vec::new(),
+            size: inspection.size,
+            config_json: inspection.config_json,
+            layers: inspection.layers,
         }))
     }
 }

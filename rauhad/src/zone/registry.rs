@@ -30,22 +30,22 @@ pub struct ZoneRegistry {
 /// Validate that a zone name is safe (no path traversal, no special chars).
 fn validate_zone_name(name: &str) -> Result<()> {
     if name.is_empty() {
-        return Err(RauhaError::BackendError(
+        return Err(RauhaError::InvalidInput(
             "zone name cannot be empty".into(),
         ));
     }
     if name.contains('/') || name.contains('\\') || name.contains('\0') {
-        return Err(RauhaError::BackendError(
+        return Err(RauhaError::InvalidInput(
             "zone name must not contain path separators".into(),
         ));
     }
     if name == "." || name == ".." {
-        return Err(RauhaError::BackendError(
+        return Err(RauhaError::InvalidInput(
             "zone name must not be '.' or '..'".into(),
         ));
     }
     if name.len() > 128 {
-        return Err(RauhaError::BackendError(
+        return Err(RauhaError::InvalidInput(
             "zone name must be 128 characters or fewer".into(),
         ));
     }
@@ -449,7 +449,28 @@ impl ZoneRegistry {
         let handle = handles
             .get(zone_name)
             .ok_or_else(|| RauhaError::ZoneNotFound(zone_name.into()))?;
-        self.backend.zone_stats(handle)
+        let mut stats = self.backend.zone_stats(handle)?;
+
+        // Backfill memory_limit from policy if the backend didn't set it.
+        // macOS VM backend returns 0 because limits are set at VM boot,
+        // not readable from the guest agent.
+        if stats.memory_limit_bytes == 0 {
+            match self.metadata.get_zone(zone_name) {
+                Ok(Some(zone)) => {
+                    stats.memory_limit_bytes = zone.policy.resources.memory_limit;
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        zone = zone_name,
+                        error = %e,
+                        "failed to read zone metadata for stats backfill"
+                    );
+                }
+            }
+        }
+
+        Ok(stats)
     }
 
     pub async fn verify_isolation(&self, zone_name: &str) -> Result<IsolationReport> {

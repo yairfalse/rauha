@@ -27,6 +27,16 @@ pub struct ImageInfo {
     pub size: u64,
 }
 
+/// Full inspection result including manifest metadata and config.
+#[derive(Debug, Clone)]
+pub struct ImageInspection {
+    pub digest: String,
+    pub config: OciImageConfig,
+    pub config_json: String,
+    pub layers: Vec<String>,
+    pub size: u64,
+}
+
 /// Orchestrates image pull, storage, and rootfs preparation.
 pub struct ImageService {
     content: Arc<ContentStore>,
@@ -365,10 +375,9 @@ impl ImageService {
                 .map_err(|e| RauhaError::ContentError {
                     message: format!("failed to read manifest: {e}"),
                 })?
-                .ok_or_else(|| RauhaError::ImagePullError {
-                    reference: reference_str.into(),
-                    message: "image not pulled".into(),
-                })?;
+                .ok_or_else(|| RauhaError::ImageNotFound(
+                    reference_str.into(),
+                ))?;
 
         let manifest: OciManifest =
             serde_json::from_slice(&manifest_bytes).map_err(|e| RauhaError::ContentError {
@@ -389,6 +398,68 @@ impl ImageService {
 
         serde_json::from_slice(&config_bytes).map_err(|e| RauhaError::ContentError {
             message: format!("corrupt image config: {e}"),
+        })
+    }
+
+    /// Get full image inspection: config, digest, layers, size.
+    pub fn inspect_full(&self, reference_str: &str) -> Result<ImageInspection, RauhaError> {
+        let canonical = {
+            let reference = ImageReference::parse(reference_str).map_err(|e| {
+                RauhaError::ImagePullError {
+                    reference: reference_str.into(),
+                    message: e,
+                }
+            })?;
+            reference.to_string_canonical()
+        };
+
+        let manifest_bytes =
+            self.content
+                .get_manifest(&canonical)
+                .map_err(|e| RauhaError::ContentError {
+                    message: format!("failed to read manifest: {e}"),
+                })?
+                .ok_or_else(|| RauhaError::ImageNotFound(
+                    reference_str.into(),
+                ))?;
+
+        let manifest: OciManifest =
+            serde_json::from_slice(&manifest_bytes).map_err(|e| RauhaError::ContentError {
+                message: format!("corrupt manifest: {e}"),
+            })?;
+
+        let config_digest =
+            Digest::parse(&manifest.config.digest).ok_or_else(|| RauhaError::ContentError {
+                message: format!("invalid config digest: {}", manifest.config.digest),
+            })?;
+
+        let config_bytes =
+            self.content
+                .get_blob(&config_digest)
+                .map_err(|e| RauhaError::ContentError {
+                    message: format!("failed to read config blob: {e}"),
+                })?;
+
+        let config: OciImageConfig =
+            serde_json::from_slice(&config_bytes).map_err(|e| RauhaError::ContentError {
+                message: format!("corrupt image config: {e}"),
+            })?;
+
+        let config_json = String::from_utf8_lossy(&config_bytes).into_owned();
+
+        let layers: Vec<String> = manifest.layers.iter().map(|l| l.digest.clone()).collect();
+        let size: u64 = manifest.layers.iter().map(|l| l.size).sum();
+
+        // Compute the manifest digest (not config digest) — this is what
+        // callers expect as the image identifier.
+        let manifest_digest = Digest::from_data(&manifest_bytes);
+
+        Ok(ImageInspection {
+            digest: manifest_digest.as_str().to_string(),
+            config,
+            config_json,
+            layers,
+            size,
         })
     }
 
