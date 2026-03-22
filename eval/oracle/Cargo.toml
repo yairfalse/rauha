@@ -12,7 +12,6 @@ publish = false
 tonic = "0.12"
 prost = "0.13"
 tokio = { version = "1", features = ["full", "test-util"] }
-uuid = { version = "1", features = ["v4"] }
 ulid = "1"
 
 [build-dependencies]

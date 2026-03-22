@@ -375,10 +375,9 @@ impl ImageService {
                 .map_err(|e| RauhaError::ContentError {
                     message: format!("failed to read manifest: {e}"),
                 })?
-                .ok_or_else(|| RauhaError::ImagePullError {
-                    reference: reference_str.into(),
-                    message: "image not pulled".into(),
-                })?;
+                .ok_or_else(|| RauhaError::ImageNotFound(
+                    reference_str.into(),
+                ))?;
 
         let manifest: OciManifest =
             serde_json::from_slice(&manifest_bytes).map_err(|e| RauhaError::ContentError {
@@ -420,10 +419,9 @@ impl ImageService {
                 .map_err(|e| RauhaError::ContentError {
                     message: format!("failed to read manifest: {e}"),
                 })?
-                .ok_or_else(|| RauhaError::ImagePullError {
-                    reference: reference_str.into(),
-                    message: "image not pulled".into(),
-                })?;
+                .ok_or_else(|| RauhaError::ImageNotFound(
+                    reference_str.into(),
+                ))?;
 
         let manifest: OciManifest =
             serde_json::from_slice(&manifest_bytes).map_err(|e| RauhaError::ContentError {
@@ -452,8 +450,12 @@ impl ImageService {
         let layers: Vec<String> = manifest.layers.iter().map(|l| l.digest.clone()).collect();
         let size: u64 = manifest.layers.iter().map(|l| l.size).sum();
 
+        // Compute the manifest digest (not config digest) — this is what
+        // callers expect as the image identifier.
+        let manifest_digest = Digest::from_data(&manifest_bytes);
+
         Ok(ImageInspection {
-            digest: manifest.config.digest.clone(),
+            digest: manifest_digest.as_str().to_string(),
             config,
             config_json,
             layers,

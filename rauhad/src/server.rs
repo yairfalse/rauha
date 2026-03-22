@@ -12,29 +12,24 @@ use crate::zone::registry::ZoneRegistry;
 /// invalid-argument, etc. — this function preserves that at the gRPC boundary.
 fn to_status(e: RauhaError) -> Status {
     match &e {
-        RauhaError::ZoneNotFound(_) | RauhaError::ContainerNotFound(_) => {
-            Status::not_found(e.to_string())
-        }
+        RauhaError::ZoneNotFound(_)
+        | RauhaError::ContainerNotFound(_)
+        | RauhaError::ImageNotFound(_) => Status::not_found(e.to_string()),
+
         RauhaError::ZoneAlreadyExists(_) | RauhaError::ContainerAlreadyExists { .. } => {
             Status::already_exists(e.to_string())
         }
-        RauhaError::InvalidPolicy(_) => Status::invalid_argument(e.to_string()),
-        RauhaError::BackendError(msg) if msg.contains("zone name") => {
-            // Validation errors from validate_zone_name come through BackendError.
+
+        RauhaError::InvalidInput(_) | RauhaError::InvalidPolicy(_) => {
             Status::invalid_argument(e.to_string())
         }
+
         RauhaError::PermissionDenied(_) | RauhaError::CrossZoneAccessDenied { .. } => {
             Status::permission_denied(e.to_string())
         }
-        RauhaError::ZoneNotEmpty { .. } => {
-            Status::failed_precondition(e.to_string())
-        }
-        RauhaError::ImagePullError { ref message, .. } if message.contains("not pulled") || message.contains("not found") => {
-            Status::not_found(e.to_string())
-        }
-        RauhaError::ImageError(ref msg) if msg.contains("not found") => {
-            Status::not_found(e.to_string())
-        }
+
+        RauhaError::ZoneNotEmpty { .. } => Status::failed_precondition(e.to_string()),
+
         _ => Status::internal(e.to_string()),
     }
 }
@@ -123,7 +118,7 @@ impl ZoneService for ZoneServiceImpl {
             .registry
             .get_zone(&req.name)
             .await
-            .map_err(|e| Status::not_found(e.to_string()))?;
+            .map_err(to_status)?;
 
         let containers = self
             .registry
@@ -201,7 +196,7 @@ impl ZoneService for ZoneServiceImpl {
             .registry
             .get_zone(&req.zone_name)
             .await
-            .map_err(|e| Status::not_found(e.to_string()))?;
+            .map_err(to_status)?;
 
         let toml =
             crate::zone::policy::policy_to_toml(&zone.name, zone.zone_type, &zone.policy);
@@ -384,7 +379,7 @@ impl ContainerService for ContainerServiceImpl {
         let container = self
             .registry
             .get_container(&container_id)
-            .map_err(|e| Status::not_found(e.to_string()))?;
+            .map_err(to_status)?;
 
         Ok(Response::new(pb::container::GetContainerResponse {
             container: Some(pb::container::ContainerInfo {
@@ -455,7 +450,7 @@ impl ContainerService for ContainerServiceImpl {
         // Verify container exists.
         self.registry
             .get_container(&container_id)
-            .map_err(|e| Status::not_found(e.to_string()))?;
+            .map_err(to_status)?;
 
         let (tx, rx) = mpsc::channel(256);
         let follow = req.follow;
@@ -524,7 +519,7 @@ impl ContainerService for ContainerServiceImpl {
         let container = self
             .registry
             .get_container(&container_id)
-            .map_err(|e| Status::not_found(e.to_string()))?;
+            .map_err(to_status)?;
 
         // Look up zone name.
         let zone_name = self
@@ -638,7 +633,7 @@ impl ContainerService for ContainerServiceImpl {
         let container = self
             .registry
             .get_container(&container_id)
-            .map_err(|e| Status::not_found(e.to_string()))?;
+            .map_err(to_status)?;
 
         let zone_name = self
             .registry

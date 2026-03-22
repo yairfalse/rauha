@@ -18,11 +18,17 @@ pub enum RauhaError {
     #[error("zone is not empty, contains {count} container(s)")]
     ZoneNotEmpty { count: usize },
 
+    #[error("invalid input: {0}")]
+    InvalidInput(String),
+
     #[error("invalid policy: {0}")]
     InvalidPolicy(String),
 
     #[error("isolation backend error: {0}")]
     BackendError(String),
+
+    #[error("image not found: {0}")]
+    ImageNotFound(String),
 
     #[error("metadata store error: {0}")]
     MetadataError(String),
