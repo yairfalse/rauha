@@ -526,16 +526,29 @@ mod image_management {
     }
 
     /// Remove an image → it disappears from list → inspect fails.
+    /// Uses busybox (not alpine) to avoid racing with other tests that depend on alpine.
     #[tokio::test]
     async fn case_009_remove_image() {
         let mut client = image_client().await;
+        let image_ref = "busybox:latest";
 
-        ensure_alpine(&mut client).await;
+        // Pull busybox for this test.
+        let mut stream = client
+            .pull(pb::image::PullRequest {
+                reference: image_ref.into(),
+            })
+            .await
+            .expect("Pull must succeed")
+            .into_inner();
+        while let Some(p) = stream.message().await.expect("stream error") {
+            if p.done { break; }
+        }
+        sleep(Duration::from_millis(500)).await;
 
         // Remove.
         client
             .remove(pb::image::RemoveImageRequest {
-                reference: "alpine:latest".into(),
+                reference: image_ref.into(),
             })
             .await
             .expect("Remove must succeed");
@@ -545,14 +558,11 @@ mod image_management {
         // Inspect must now fail.
         let result = client
             .inspect(pb::image::InspectImageRequest {
-                reference: "alpine:latest".into(),
+                reference: image_ref.into(),
             })
             .await;
 
         assert_grpc_error(result, tonic::Code::NotFound, "inspect after remove");
-
-        // Re-pull so other tests aren't broken.
-        ensure_alpine(&mut client).await;
     }
 }
 
