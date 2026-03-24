@@ -137,18 +137,6 @@ memory_limit = "{mem}"
 "#)
     }
 
-    pub fn policy_with_capabilities(caps: &[&str]) -> String {
-        let caps_str = caps.iter().map(|c| format!("\"{c}\"")).collect::<Vec<_>>().join(", ");
-        format!(r#"
-[zone]
-name = "oracle"
-type = "non-global"
-
-[capabilities]
-allowed = [{caps_str}]
-"#)
-    }
-
     // --- Protocol wrappers (must-succeed variants) ---
 
     pub async fn create_zone(
@@ -167,16 +155,32 @@ allowed = [{caps_str}]
             .into_inner()
     }
 
-    pub async fn delete_zone(
+    /// Cleanup helper — logs failures instead of silently eating them.
+    /// Verifies the zone is actually gone after deletion.
+    pub async fn delete_zone_checked(
         client: &mut pb::zone::zone_service_client::ZoneServiceClient<Channel>,
         name: &str,
     ) {
-        let _ = client
+        match client
             .delete_zone(pb::zone::DeleteZoneRequest {
                 name: name.into(),
                 force: true,
             })
-            .await;
+            .await
+        {
+            Ok(_) => {}
+            Err(status) if status.code() == tonic::Code::NotFound => {
+                // Already gone — fine.
+            }
+            Err(status) => {
+                panic!(
+                    "delete_zone cleanup failed for '{}': {:?}: {}",
+                    name,
+                    status.code(),
+                    status.message()
+                );
+            }
+        }
     }
 
     pub async fn get_zone(
@@ -212,7 +216,7 @@ allowed = [{caps_str}]
         while let Some(p) = stream.message().await.expect("stream error") {
             if p.done { break; }
         }
-        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+        tokio::time::sleep(tokio::time::Duration::from_millis(IMAGE_PULL_SETTLE_MS)).await;
     }
 
     pub async fn create_and_start_container(
@@ -286,6 +290,7 @@ mod zone_lifecycle {
         let resp = create_zone(&mut client, &name, &isolated_policy_toml()).await;
         assert_eq!(resp.name, name, "created zone name must match request");
         assert!(!resp.zone_id.is_empty(), "zone_id must not be empty");
+        assert!(!resp.state.is_empty(), "CreateZoneResponse.state must not be empty");
 
         sleep(Duration::from_millis(ZONE_SETTLE_MS)).await;
 
@@ -297,7 +302,7 @@ mod zone_lifecycle {
         assert_eq!(zone.name, name);
         assert_eq!(zone.state, "Ready");
 
-        delete_zone(&mut client, &name).await;
+        delete_zone_checked(&mut client, &name).await;
         sleep(Duration::from_millis(ZONE_SETTLE_MS)).await;
 
         let zones = list_zones(&mut client).await;
@@ -322,7 +327,7 @@ mod zone_lifecycle {
             .await;
 
         assert_grpc_error(result, tonic::Code::AlreadyExists, "duplicate zone");
-        delete_zone(&mut client, &name).await;
+        delete_zone_checked(&mut client, &name).await;
     }
 
     /// Delete nonexistent zone must return NotFound.
@@ -352,7 +357,7 @@ mod container_lifecycle {
     use super::pb;
     use tokio::time::{sleep, Duration};
 
-    /// Create container in a zone → start → list → stop.
+    /// Create container → start → verify in list → stop → verify stopped.
     #[tokio::test]
     async fn case_004_create_start_list_stop() {
         let mut zone_cl = zone_client().await;
@@ -386,16 +391,31 @@ mod container_lifecycle {
             "container must appear in ListContainers"
         );
 
-        // Stop.
+        // Stop and verify.
         ctr_cl
             .stop_container(pb::container::StopContainerRequest {
-                container_id: ctr_id,
+                container_id: ctr_id.clone(),
                 timeout_seconds: 5,
             })
             .await
             .expect("StopContainer must succeed");
 
-        delete_zone(&mut zone_cl, &zone_name).await;
+        sleep(Duration::from_millis(STOP_SETTLE_MS)).await;
+
+        // After stop, container state must not be "Running".
+        let get_resp = ctr_cl
+            .get_container(pb::container::GetContainerRequest {
+                container_id: ctr_id,
+            })
+            .await;
+        // Container may be gone (cleaned up) or in stopped state — both are valid.
+        // What's NOT valid is it still being "Running".
+        if let Ok(resp) = get_resp {
+            let info = resp.into_inner().container.unwrap();
+            assert_ne!(info.state, "Running", "container must not be Running after stop");
+        }
+
+        delete_zone_checked(&mut zone_cl, &zone_name).await;
     }
 
     /// Container in nonexistent zone must fail.
@@ -417,7 +437,7 @@ mod container_lifecycle {
         assert_grpc_error(result, tonic::Code::NotFound, "container in missing zone");
     }
 
-    /// Container runs a command and exits — process lifecycle is sound.
+    /// Short-lived container runs a command and exits.
     #[tokio::test]
     async fn case_006_container_runs_and_exits() {
         let mut zone_cl = zone_client().await;
@@ -429,7 +449,6 @@ mod container_lifecycle {
         create_zone(&mut zone_cl, &zone_name, &bridged_policy_toml()).await;
         sleep(Duration::from_millis(ZONE_SETTLE_MS)).await;
 
-        // Run a short-lived command.
         let resp = ctr_cl
             .create_container(pb::container::CreateContainerRequest {
                 zone_name: zone_name.clone(),
@@ -452,17 +471,26 @@ mod container_lifecycle {
             .await
             .expect("StartContainer must succeed");
 
+        // Wait for the short-lived process to exit.
         sleep(Duration::from_millis(EXEC_SETTLE_MS)).await;
 
-        // Container should have exited naturally — cleanup should not error.
-        let _ = ctr_cl
-            .stop_container(pb::container::StopContainerRequest {
-                container_id: resp.container_id,
-                timeout_seconds: 2,
+        // Verify the container is no longer Running (it exited naturally).
+        let get_result = ctr_cl
+            .get_container(pb::container::GetContainerRequest {
+                container_id: resp.container_id.clone(),
             })
             .await;
 
-        delete_zone(&mut zone_cl, &zone_name).await;
+        if let Ok(get_resp) = get_result {
+            let info = get_resp.into_inner().container.unwrap();
+            assert_ne!(
+                info.state, "Running",
+                "short-lived container must not be Running after exec_settle"
+            );
+        }
+        // If GetContainer returns NotFound, the container was cleaned up — also valid.
+
+        delete_zone_checked(&mut zone_cl, &zone_name).await;
     }
 }
 
@@ -483,7 +511,6 @@ mod image_management {
 
         ensure_alpine(&mut client).await;
 
-        // List — alpine must appear.
         let images = client
             .list(pb::image::ListImagesRequest {})
             .await
@@ -496,7 +523,6 @@ mod image_management {
             "pulled alpine must appear in image list"
         );
 
-        // Inspect.
         let inspect = client
             .inspect(pb::image::InspectImageRequest {
                 reference: "alpine:latest".into(),
@@ -509,6 +535,7 @@ mod image_management {
         assert!(inspect.digest.starts_with("sha256:"), "digest must be sha256");
         assert!(!inspect.layers.is_empty(), "alpine must have at least one layer");
         assert!(inspect.layers.iter().all(|l| l.starts_with("sha256:")), "layer digests must be sha256");
+        assert!(inspect.size > 0, "image size must be non-zero");
     }
 
     /// Inspect a nonexistent image must fail.
@@ -525,8 +552,7 @@ mod image_management {
         assert_grpc_error(result, tonic::Code::NotFound, "inspect missing image");
     }
 
-    /// Remove an image → it disappears from list → inspect fails.
-    /// Uses busybox (not alpine) to avoid racing with other tests that depend on alpine.
+    /// Remove an image → inspect fails. Uses busybox to avoid racing with alpine users.
     #[tokio::test]
     async fn case_009_remove_image() {
         let mut client = image_client().await;
@@ -543,7 +569,15 @@ mod image_management {
         while let Some(p) = stream.message().await.expect("stream error") {
             if p.done { break; }
         }
-        sleep(Duration::from_millis(500)).await;
+        sleep(Duration::from_millis(IMAGE_PULL_SETTLE_MS)).await;
+
+        // Verify it's there before removing.
+        client
+            .inspect(pb::image::InspectImageRequest {
+                reference: image_ref.into(),
+            })
+            .await
+            .expect("busybox must be inspectable before remove");
 
         // Remove.
         client
@@ -599,10 +633,13 @@ mod isolation {
             resp.checks.iter().filter(|c| !c.passed).collect::<Vec<_>>()
         );
 
-        // Must return at least one check.
         assert!(!resp.checks.is_empty(), "isolation report must include checks");
+        assert!(
+            resp.checks.iter().all(|c| c.passed),
+            "all isolation checks must pass"
+        );
 
-        delete_zone(&mut client, &name).await;
+        delete_zone_checked(&mut client, &name).await;
     }
 
     /// VerifyIsolation on nonexistent zone must return NotFound.
@@ -619,7 +656,7 @@ mod isolation {
         assert_grpc_error(result, tonic::Code::NotFound, "verify nonexistent zone");
     }
 
-    /// Policy hot-reload does not break isolation.
+    /// Policy hot-reload does not break isolation. Verifies reload actually took effect.
     #[tokio::test]
     async fn case_012_isolation_survives_policy_reload() {
         let mut client = zone_client().await;
@@ -639,6 +676,21 @@ mod isolation {
 
         sleep(Duration::from_millis(ZONE_SETTLE_MS)).await;
 
+        // Confirm the reload actually changed the policy.
+        let policy_resp = client
+            .get_policy(pb::zone::GetPolicyRequest {
+                zone_name: name.clone(),
+            })
+            .await
+            .expect("GetPolicy must succeed")
+            .into_inner();
+
+        assert!(
+            policy_resp.policy_toml.contains(r#"mode = "bridged""#),
+            "policy must have been reloaded to bridged mode, got: {}",
+            policy_resp.policy_toml
+        );
+
         // Isolation must still hold after reload.
         let resp = client
             .verify_isolation(pb::zone::VerifyIsolationRequest {
@@ -654,7 +706,7 @@ mod isolation {
             resp.checks.iter().filter(|c| !c.passed).collect::<Vec<_>>()
         );
 
-        delete_zone(&mut client, &name).await;
+        delete_zone_checked(&mut client, &name).await;
     }
 }
 
@@ -668,7 +720,7 @@ mod policy {
     use super::pb;
     use tokio::time::{sleep, Duration};
 
-    /// Apply a policy → GetPolicy returns the applied TOML.
+    /// Apply a policy → GetPolicy returns the applied TOML with correct mode.
     #[tokio::test]
     async fn case_013_apply_and_get_policy() {
         let mut client = zone_client().await;
@@ -677,6 +729,22 @@ mod policy {
         create_zone(&mut client, &name, &isolated_policy_toml()).await;
         sleep(Duration::from_millis(ZONE_SETTLE_MS)).await;
 
+        // Verify initial policy is isolated.
+        let initial = client
+            .get_policy(pb::zone::GetPolicyRequest {
+                zone_name: name.clone(),
+            })
+            .await
+            .expect("GetPolicy must succeed")
+            .into_inner();
+
+        assert!(
+            initial.policy_toml.contains(r#"mode = "isolated""#),
+            "initial policy must be isolated mode, got: {}",
+            initial.policy_toml
+        );
+
+        // Apply bridged policy.
         client
             .apply_policy(pb::zone::ApplyPolicyRequest {
                 zone_name: name.clone(),
@@ -687,7 +755,8 @@ mod policy {
 
         sleep(Duration::from_millis(ZONE_SETTLE_MS)).await;
 
-        let resp = client
+        // Verify updated policy.
+        let updated = client
             .get_policy(pb::zone::GetPolicyRequest {
                 zone_name: name.clone(),
             })
@@ -696,12 +765,12 @@ mod policy {
             .into_inner();
 
         assert!(
-            resp.policy_toml.contains("bridged"),
-            "GetPolicy must reflect updated policy, got: {}",
-            resp.policy_toml
+            updated.policy_toml.contains(r#"mode = "bridged""#),
+            "updated policy must be bridged mode, got: {}",
+            updated.policy_toml
         );
 
-        delete_zone(&mut client, &name).await;
+        delete_zone_checked(&mut client, &name).await;
     }
 
     /// Memory limit in policy is reflected in ZoneStats.
@@ -710,7 +779,6 @@ mod policy {
         let mut client = zone_client().await;
         let name = unique_zone_name("014");
 
-        // Create zone with 256Mi memory limit.
         create_zone(&mut client, &name, &policy_with_memory("256Mi")).await;
         sleep(Duration::from_millis(ZONE_SETTLE_MS)).await;
 
@@ -728,10 +796,10 @@ mod policy {
             "memory_limit_bytes must be 256Mi (268435456)"
         );
 
-        delete_zone(&mut client, &name).await;
+        delete_zone_checked(&mut client, &name).await;
     }
 
-    /// Apply invalid policy to existing zone → INVALID_ARGUMENT.
+    /// Apply invalid policy to existing zone → INVALID_ARGUMENT, zone survives.
     #[tokio::test]
     async fn case_015_apply_invalid_policy() {
         let mut client = zone_client().await;
@@ -751,9 +819,10 @@ mod policy {
 
         // Zone must still work after rejected policy.
         let get_resp = get_zone(&mut client, &name).await;
-        assert!(get_resp.zone.is_some(), "zone must survive rejected policy apply");
+        let zone = get_resp.zone.expect("zone must survive rejected policy apply");
+        assert_eq!(zone.state, "Ready", "zone must still be Ready after rejected apply");
 
-        delete_zone(&mut client, &name).await;
+        delete_zone_checked(&mut client, &name).await;
     }
 }
 
@@ -767,7 +836,7 @@ mod networking {
     use super::pb;
     use tokio::time::{sleep, Duration};
 
-    /// Bridged zone creation succeeds and zone is reachable.
+    /// Bridged zone creation succeeds and isolation passes.
     #[tokio::test]
     async fn case_016_bridged_zone_creation() {
         let mut client = zone_client().await;
@@ -776,12 +845,10 @@ mod networking {
         create_zone(&mut client, &name, &bridged_policy_toml()).await;
         sleep(Duration::from_millis(ZONE_SETTLE_MS)).await;
 
-        // Zone must be Ready.
         let get_resp = get_zone(&mut client, &name).await;
         let zone = get_resp.zone.expect("zone must exist");
         assert_eq!(zone.state, "Ready", "bridged zone must reach Ready state");
 
-        // Isolation must pass.
         let iso = client
             .verify_isolation(pb::zone::VerifyIsolationRequest {
                 zone_name: name.clone(),
@@ -792,10 +859,10 @@ mod networking {
 
         assert!(iso.is_isolated, "bridged zone must be isolated");
 
-        delete_zone(&mut client, &name).await;
+        delete_zone_checked(&mut client, &name).await;
     }
 
-    /// Zone created with host networking mode.
+    /// Zone created with host networking mode — policy round-trips correctly.
     #[tokio::test]
     async fn case_017_host_network_mode() {
         let mut client = zone_client().await;
@@ -812,7 +879,6 @@ mode = "host"
         create_zone(&mut client, &name, host_policy).await;
         sleep(Duration::from_millis(ZONE_SETTLE_MS)).await;
 
-        // GetPolicy must reflect host mode.
         let resp = client
             .get_policy(pb::zone::GetPolicyRequest {
                 zone_name: name.clone(),
@@ -821,14 +887,18 @@ mode = "host"
             .expect("GetPolicy must succeed")
             .into_inner();
 
-        assert!(resp.policy_toml.contains("host"), "policy must contain host mode");
+        assert!(
+            resp.policy_toml.contains(r#"mode = "host""#),
+            "policy must contain host mode as key-value, got: {}",
+            resp.policy_toml
+        );
 
-        delete_zone(&mut client, &name).await;
+        delete_zone_checked(&mut client, &name).await;
     }
 
-    /// Container in bridged zone gets DNS (resolv.conf injected).
+    /// Container in bridged zone can be created (rootfs + DNS injection succeeds).
     #[tokio::test]
-    async fn case_018_container_gets_dns() {
+    async fn case_018_container_in_bridged_zone() {
         let mut zone_cl = zone_client().await;
         let mut ctr_cl = container_client().await;
         let mut img_cl = image_client().await;
@@ -838,25 +908,32 @@ mode = "host"
         create_zone(&mut zone_cl, &zone_name, &bridged_policy_toml()).await;
         sleep(Duration::from_millis(ZONE_SETTLE_MS)).await;
 
-        // Create container that reads resolv.conf.
-        let resp = ctr_cl
-            .create_container(pb::container::CreateContainerRequest {
+        // Create and start a container that reads resolv.conf.
+        let ctr_id = create_and_start_container(
+            &mut ctr_cl,
+            &zone_name,
+            "dns-test",
+            vec!["/bin/cat".into(), "/etc/resolv.conf".into()],
+        ).await;
+
+        // If we got here, the container was created, rootfs was prepared
+        // (including DNS injection), and the process started successfully.
+        // Verify the container actually ran by checking it's in the list.
+        let containers = ctr_cl
+            .list_containers(pb::container::ListContainersRequest {
                 zone_name: zone_name.clone(),
-                name: "dns-test".into(),
-                image: "alpine:latest".into(),
-                command: vec!["/bin/cat".into(), "/etc/resolv.conf".into()],
-                env: Default::default(),
-                working_dir: String::new(),
             })
             .await
-            .expect("CreateContainer must succeed")
-            .into_inner();
+            .expect("ListContainers must succeed")
+            .into_inner()
+            .containers;
 
-        // If container creation succeeded, DNS was injected
-        // (resolv.conf is written to rootfs before container start).
-        assert!(!resp.container_id.is_empty(), "container with DNS must be created");
+        assert!(
+            containers.iter().any(|c| c.id == ctr_id),
+            "container must appear in zone listing after start"
+        );
 
-        delete_zone(&mut zone_cl, &zone_name).await;
+        delete_zone_checked(&mut zone_cl, &zone_name).await;
     }
 }
 
@@ -870,13 +947,13 @@ mod observability {
     use super::pb;
     use tokio::time::{sleep, Duration};
 
-    /// ZoneStats returns non-zero memory limit for a zone.
+    /// ZoneStats returns non-zero memory limit and valid zone_id.
     #[tokio::test]
     async fn case_019_zone_stats() {
         let mut client = zone_client().await;
         let name = unique_zone_name("019");
 
-        create_zone(&mut client, &name, &isolated_policy_toml()).await;
+        let create_resp = create_zone(&mut client, &name, &isolated_policy_toml()).await;
         sleep(Duration::from_millis(ZONE_SETTLE_MS)).await;
 
         let stats = client
@@ -888,9 +965,9 @@ mod observability {
             .into_inner();
 
         assert!(stats.memory_limit_bytes > 0, "zone must have non-zero memory limit");
-        assert!(!stats.zone_id.is_empty(), "stats must include zone_id");
+        assert_eq!(stats.zone_id, create_resp.zone_id, "stats zone_id must match created zone_id");
 
-        delete_zone(&mut client, &name).await;
+        delete_zone_checked(&mut client, &name).await;
     }
 
     /// ZoneStats on nonexistent zone returns NotFound.
@@ -930,131 +1007,77 @@ mod observability {
 mod resilience {
     use super::helpers::*;
     use super::pb;
-    use tokio::time::{sleep, Duration};
 
-    /// Empty zone name must be rejected.
     #[tokio::test]
     async fn case_022_empty_zone_name_rejected() {
         let mut client = zone_client().await;
-
-        let result = client
-            .create_zone(pb::zone::CreateZoneRequest {
-                name: String::new(),
-                zone_type: "non-global".into(),
-                policy_toml: isolated_policy_toml(),
-            })
-            .await;
-
+        let result = client.create_zone(pb::zone::CreateZoneRequest {
+            name: String::new(), zone_type: "non-global".into(), policy_toml: isolated_policy_toml(),
+        }).await;
         assert_grpc_error(result, tonic::Code::InvalidArgument, "empty zone name");
     }
 
-    /// Zone name with path traversal must be rejected.
     #[tokio::test]
     async fn case_023_path_traversal_rejected() {
         let mut client = zone_client().await;
-
-        let result = client
-            .create_zone(pb::zone::CreateZoneRequest {
-                name: "../escape".into(),
-                zone_type: "non-global".into(),
-                policy_toml: isolated_policy_toml(),
-            })
-            .await;
-
+        let result = client.create_zone(pb::zone::CreateZoneRequest {
+            name: "../escape".into(), zone_type: "non-global".into(), policy_toml: isolated_policy_toml(),
+        }).await;
         assert_grpc_error(result, tonic::Code::InvalidArgument, "path traversal zone name");
     }
 
-    /// Invalid policy TOML must be rejected.
     #[tokio::test]
     async fn case_024_invalid_policy_rejected() {
         let mut client = zone_client().await;
-        let name = unique_zone_name("024");
-
-        let result = client
-            .create_zone(pb::zone::CreateZoneRequest {
-                name,
-                zone_type: "non-global".into(),
-                policy_toml: "this is not valid TOML {{{".into(),
-            })
-            .await;
-
+        let result = client.create_zone(pb::zone::CreateZoneRequest {
+            name: unique_zone_name("024"), zone_type: "non-global".into(),
+            policy_toml: "this is not valid TOML {{{".into(),
+        }).await;
         assert_grpc_error(result, tonic::Code::InvalidArgument, "invalid policy TOML");
     }
 
-    /// Zone name with NUL byte must be rejected.
     #[tokio::test]
     async fn case_025_nul_byte_rejected() {
         let mut client = zone_client().await;
-
-        let result = client
-            .create_zone(pb::zone::CreateZoneRequest {
-                name: "bad\0name".into(),
-                zone_type: "non-global".into(),
-                policy_toml: isolated_policy_toml(),
-            })
-            .await;
-
+        let result = client.create_zone(pb::zone::CreateZoneRequest {
+            name: "bad\0name".into(), zone_type: "non-global".into(), policy_toml: isolated_policy_toml(),
+        }).await;
         assert_grpc_error(result, tonic::Code::InvalidArgument, "NUL byte in zone name");
     }
 
-    /// Zone name "." must be rejected.
     #[tokio::test]
     async fn case_026_dot_name_rejected() {
         let mut client = zone_client().await;
-
-        let result = client
-            .create_zone(pb::zone::CreateZoneRequest {
-                name: ".".into(),
-                zone_type: "non-global".into(),
-                policy_toml: isolated_policy_toml(),
-            })
-            .await;
-
+        let result = client.create_zone(pb::zone::CreateZoneRequest {
+            name: ".".into(), zone_type: "non-global".into(), policy_toml: isolated_policy_toml(),
+        }).await;
         assert_grpc_error(result, tonic::Code::InvalidArgument, "dot zone name");
     }
 
-    /// Zone name >128 chars must be rejected.
     #[tokio::test]
     async fn case_027_long_name_rejected() {
         let mut client = zone_client().await;
-
-        let result = client
-            .create_zone(pb::zone::CreateZoneRequest {
-                name: "a".repeat(129),
-                zone_type: "non-global".into(),
-                policy_toml: isolated_policy_toml(),
-            })
-            .await;
-
+        let result = client.create_zone(pb::zone::CreateZoneRequest {
+            name: "a".repeat(129), zone_type: "non-global".into(), policy_toml: isolated_policy_toml(),
+        }).await;
         assert_grpc_error(result, tonic::Code::InvalidArgument, "name too long");
     }
 
-    /// Apply policy to nonexistent zone → NotFound.
     #[tokio::test]
     async fn case_028_apply_policy_missing_zone() {
         let mut client = zone_client().await;
-
-        let result = client
-            .apply_policy(pb::zone::ApplyPolicyRequest {
-                zone_name: "oracle-028-ghost".into(),
-                policy_toml: isolated_policy_toml(),
-            })
-            .await;
-
+        let result = client.apply_policy(pb::zone::ApplyPolicyRequest {
+            zone_name: "oracle-028-ghost".into(), policy_toml: isolated_policy_toml(),
+        }).await;
         assert_grpc_error(result, tonic::Code::NotFound, "apply policy to missing zone");
     }
 
-    /// Get nonexistent zone → NotFound.
     #[tokio::test]
     async fn case_029_get_missing_zone() {
         let mut client = zone_client().await;
-
-        let result = client
-            .get_zone(pb::zone::GetZoneRequest {
-                name: "oracle-029-ghost".into(),
-            })
-            .await;
-
+        let result = client.get_zone(pb::zone::GetZoneRequest {
+            name: "oracle-029-ghost".into(),
+        }).await;
         assert_grpc_error(result, tonic::Code::NotFound, "get missing zone");
     }
 }
@@ -1084,8 +1107,8 @@ mod multi_zone {
         assert!(zones.iter().any(|z| z.name == name_a), "zone A must be in list");
         assert!(zones.iter().any(|z| z.name == name_b), "zone B must be in list");
 
-        delete_zone(&mut client, &name_a).await;
-        delete_zone(&mut client, &name_b).await;
+        delete_zone_checked(&mut client, &name_a).await;
+        delete_zone_checked(&mut client, &name_b).await;
     }
 
     /// Deleting one zone does not affect another.
@@ -1099,19 +1122,17 @@ mod multi_zone {
         create_zone(&mut client, &name_b, &isolated_policy_toml()).await;
         sleep(Duration::from_millis(ZONE_SETTLE_MS)).await;
 
-        // Delete A.
-        delete_zone(&mut client, &name_a).await;
+        delete_zone_checked(&mut client, &name_a).await;
         sleep(Duration::from_millis(ZONE_SETTLE_MS)).await;
 
-        // B must still exist and be healthy.
         let get_resp = get_zone(&mut client, &name_b).await;
         let zone = get_resp.zone.expect("zone B must survive deletion of A");
         assert_eq!(zone.state, "Ready");
 
-        delete_zone(&mut client, &name_b).await;
+        delete_zone_checked(&mut client, &name_b).await;
     }
 
-    /// Zones with different policies can coexist.
+    /// Zones with different policies both pass isolation.
     #[tokio::test]
     async fn case_032_mixed_policy_zones() {
         let mut client = zone_client().await;
@@ -1122,7 +1143,6 @@ mod multi_zone {
         create_zone(&mut client, &bridged, &bridged_policy_toml()).await;
         sleep(Duration::from_millis(ZONE_SETTLE_MS)).await;
 
-        // Both must pass isolation verification.
         for name in [&isolated, &bridged] {
             let resp = client
                 .verify_isolation(pb::zone::VerifyIsolationRequest {
@@ -1132,19 +1152,14 @@ mod multi_zone {
                 .expect("VerifyIsolation must succeed")
                 .into_inner();
 
-            assert!(
-                resp.is_isolated,
-                "zone {} must be isolated. Failed: {:?}",
-                name,
-                resp.checks.iter().filter(|c| !c.passed).collect::<Vec<_>>()
-            );
+            assert!(resp.is_isolated, "zone {} must be isolated", name);
         }
 
-        delete_zone(&mut client, &isolated).await;
-        delete_zone(&mut client, &bridged).await;
+        delete_zone_checked(&mut client, &isolated).await;
+        delete_zone_checked(&mut client, &bridged).await;
     }
 
-    /// Containers are scoped to their zone in ListContainers.
+    /// Containers are scoped to their zone — list A doesn't show B's containers.
     #[tokio::test]
     async fn case_033_containers_scoped_to_zone() {
         let mut zone_cl = zone_client().await;
@@ -1170,32 +1185,36 @@ mod multi_zone {
             .list_containers(pb::container::ListContainersRequest {
                 zone_name: zone_a.clone(),
             })
-            .await
-            .expect("ListContainers must succeed")
-            .into_inner()
-            .containers;
+            .await.expect("ListContainers must succeed")
+            .into_inner().containers;
 
         assert!(list_a.iter().any(|c| c.id == ctr_a), "zone A must contain ctr_a");
         assert!(!list_a.iter().any(|c| c.id == ctr_b), "zone A must NOT contain ctr_b");
+
+        // Verify zone_name field in the response is correct.
+        let ctr_a_info = list_a.iter().find(|c| c.id == ctr_a).unwrap();
+        assert!(
+            ctr_a_info.zone_name == zone_a || ctr_a_info.zone_name.is_empty(),
+            "container zone_name must match zone A or be empty (TODO), got: {}",
+            ctr_a_info.zone_name
+        );
 
         // List zone B — must see ctr_b but NOT ctr_a.
         let list_b = ctr_cl
             .list_containers(pb::container::ListContainersRequest {
                 zone_name: zone_b.clone(),
             })
-            .await
-            .expect("ListContainers must succeed")
-            .into_inner()
-            .containers;
+            .await.expect("ListContainers must succeed")
+            .into_inner().containers;
 
         assert!(list_b.iter().any(|c| c.id == ctr_b), "zone B must contain ctr_b");
         assert!(!list_b.iter().any(|c| c.id == ctr_a), "zone B must NOT contain ctr_a");
 
-        delete_zone(&mut zone_cl, &zone_a).await;
-        delete_zone(&mut zone_cl, &zone_b).await;
+        delete_zone_checked(&mut zone_cl, &zone_a).await;
+        delete_zone_checked(&mut zone_cl, &zone_b).await;
     }
 
-    /// Force-delete zone with running container succeeds.
+    /// Force-delete zone with running container — zone gone, container gone.
     #[tokio::test]
     async fn case_034_force_delete_zone_with_container() {
         let mut zone_cl = zone_client().await;
@@ -1207,11 +1226,11 @@ mod multi_zone {
         create_zone(&mut zone_cl, &zone_name, &bridged_policy_toml()).await;
         sleep(Duration::from_millis(ZONE_SETTLE_MS)).await;
 
-        let _ctr_id = create_and_start_container(
+        let ctr_id = create_and_start_container(
             &mut ctr_cl, &zone_name, "doomed", vec!["/bin/sleep".into(), "300".into()],
         ).await;
 
-        // Force delete must succeed even with running container.
+        // Force delete.
         zone_cl
             .delete_zone(pb::zone::DeleteZoneRequest {
                 name: zone_name.clone(),
@@ -1228,6 +1247,18 @@ mod multi_zone {
             !zones.iter().any(|z| z.name == zone_name),
             "force-deleted zone must not appear in list"
         );
+
+        // Container must also be gone (or at least not findable).
+        let ctr_result = ctr_cl
+            .get_container(pb::container::GetContainerRequest {
+                container_id: ctr_id,
+            })
+            .await;
+
+        assert!(
+            ctr_result.is_err(),
+            "container in force-deleted zone must not be retrievable"
+        );
     }
 }
 
@@ -1239,7 +1270,6 @@ mod multi_zone {
 mod container_edge_cases {
     use super::helpers::*;
     use super::pb;
-    use tokio::time::{sleep, Duration};
 
     /// Stop nonexistent container → NotFound.
     #[tokio::test]
@@ -1270,12 +1300,11 @@ mod container_edge_cases {
         assert_grpc_error(result, tonic::Code::NotFound, "get nonexistent container");
     }
 
-    /// ListContainers with empty zone_name returns all containers.
+    /// ListContainers with empty zone_name returns a valid list (not an error).
     #[tokio::test]
     async fn case_037_list_all_containers() {
         let mut ctr_cl = container_client().await;
 
-        // Must not error — returns empty or populated list.
         let resp = ctr_cl
             .list_containers(pb::container::ListContainersRequest {
                 zone_name: String::new(),
@@ -1283,8 +1312,11 @@ mod container_edge_cases {
             .await
             .expect("ListContainers with empty zone must succeed");
 
-        // Just verify it returns a valid response.
-        let _ = resp.into_inner().containers;
+        let containers = resp.into_inner().containers;
+        // Every container in the global list must have a non-empty id.
+        for ctr in &containers {
+            assert!(!ctr.id.is_empty(), "container in global list must have non-empty id");
+        }
     }
 
     /// Delete nonexistent container → NotFound.
