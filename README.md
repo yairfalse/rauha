@@ -2,200 +2,167 @@
 
 **Isolation-first container runtime for Linux and macOS.**
 
-Linux containers bolt isolation onto a kernel that wasn't designed for it — namespaces, cgroups, and seccomp are independent mechanisms duct-taped together. Solaris got this right in 2005 with Zones: isolation was a first-class kernel concept, not an afterthought.
+Containers bolt isolation onto a kernel that wasn't designed for it — namespaces, cgroups, and seccomp are independent mechanisms duct-taped together. Solaris got this right in 2005 with Zones: isolation was a first-class kernel concept, not an afterthought.
 
-Rauha brings that philosophy to modern systems. One runtime, two native backends: eBPF on Linux, Virtualization.framework on macOS. Container UX, zones security model, Rust performance.
+Rauha brings that philosophy to modern systems. **Zones** are the core primitive — a unified isolation boundary that ties together cgroups, namespaces, and eBPF enforcement under one API. Two native backends: eBPF LSM hooks on Linux, Virtualization.framework VMs on macOS.
 
 > *Rauha* (Finnish) — peace, calm. What your production systems should be.
-
----
-
-## Why
-
-Every container runtime today works the same way: create a namespace, attach a cgroup, bolt on a seccomp filter, hope nothing falls through the cracks. The isolation primitives don't know about each other. A process in container A can't *see* container B's processes (PID namespace), but the kernel has no concept of "these two things are isolated from each other" — it's enforced by separate, uncoordinated mechanisms.
-
-This creates real problems:
-
-- **Escape vectors** live in the gaps between mechanisms. A process that manipulates its cgroup can sidestep namespace restrictions. A mount namespace escape can bypass seccomp filters. Each mechanism is secure in isolation; the composition is where things break.
-
-- **Cross-container visibility** requires explicit, per-mechanism blocking. Want to prevent container A from signaling container B? That's a seccomp rule. From accessing B's files? That's a mount namespace + MAC policy. From seeing B's network traffic? That's a network namespace. Miss one mechanism and you have a hole.
-
-- **macOS doesn't have any of this.** Docker Desktop runs a hidden Linux VM. Every file access goes through virtio-fs. Every network packet crosses a VM boundary. Debugging is painful. Performance suffers. It's a Linux runtime pretending to be native.
-
-Rauha introduces the **zone** — a first-class isolation boundary that unifies all these mechanisms under one concept.
-
----
 
 ## The Zone Model
 
 A zone is not a namespace. It's not a cgroup. It's the *concept* that ties them together.
 
 ```
-                     ┌──────────────────────────────────────────────────┐
-                     │               Global Zone (Host)                │
-                     │                                                 │
-                     │  rauhad                   system processes       │
-                     │                                                 │
-                     │  ┌───────────────────┐  ┌───────────────────┐   │
-                     │  │      Zone A       │  │      Zone B       │   │
-                     │  │                   │  │                   │   │
-                     │  │  nginx            │  │  postgres         │   │
-                     │  │  app-server       │  │  redis            │   │
-                     │  │                   │  │                   │   │
-                     │  │  own cgroup       │  │  own cgroup       │   │
-                     │  │  own netns        │  │  own netns        │   │
-                     │  │  own rootfs       │  │  own rootfs       │   │
-                     │  └───────────────────┘  └───────────────────┘   │
-                     │            ╳ denied by default ╳                │
-                     └──────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────┐
+│                   Global Zone (Host)                    │
+│                                                         │
+│   rauhad ─── gRPC :9876 ──── rauha CLI                 │
+│                                                         │
+│   ┌─────────────────────┐   ┌─────────────────────┐    │
+│   │       Zone A        │   │       Zone B         │    │
+│   │                     │   │                      │    │
+│   │   nginx             │   │   postgres           │    │
+│   │   app-server        │   │   redis              │    │
+│   │                     │   │                      │    │
+│   │   10.89.0.2/16      │   │   10.89.0.3/16       │    │
+│   │   own cgroup        │   │   own cgroup          │    │
+│   │   own netns         │   │   own netns           │    │
+│   │   own rootfs        │   │   own rootfs          │    │
+│   └─────────────────────┘   └──────────────────────┘    │
+│              ╳ denied by default ╳                       │
+└─────────────────────────────────────────────────────────┘
 ```
 
 Every container belongs to exactly one zone. Zones are the unit of:
 
-| Property | Meaning |
-|----------|---------|
+| Concern | What it means |
+|---------|---------------|
 | **Visibility** | Processes in Zone A cannot see Zone B's processes |
 | **Access** | Files, IPC, and signals cannot cross zone boundaries |
-| **Networking** | Cross-zone traffic is denied by default |
-| **Resources** | Each zone has its own CPU, memory, I/O, and PID limits |
+| **Networking** | Each zone gets its own IP, bridge connectivity, and firewall rules |
+| **Resources** | CPU, memory, I/O, and PID limits scoped per zone |
+| **Policy** | TOML-based, allow-list only, hot-reloadable without restart |
 
-Cross-zone communication is never implicit. It requires an explicit policy rule — allow-list, not deny-list.
-
----
+Cross-zone communication requires an explicit policy rule — allow-list, not deny-list.
 
 ## How It Works
 
 ### Linux: eBPF makes the kernel zone-aware
 
-On Linux, Rauha loads eBPF programs into kernel hook points that enforce zone boundaries at the syscall level. Every `open()`, `kill()`, `connect()`, and `ptrace()` checks zone membership before proceeding.
+Rauha loads eBPF programs into kernel LSM hooks that enforce zone boundaries at the syscall level. Every `open()`, `kill()`, `connect()`, and `ptrace()` checks zone membership before proceeding.
 
 ```
 Process in Zone A calls open("/data/file.txt")
-  -> kernel reaches file_open LSM hook
-  -> rauha_file_open eBPF program fires
-  -> looks up process cgroup -> zone_id = A
-  -> looks up file inode -> file_zone = B
-  -> A != B -> returns -EACCES
-  -> process gets "Permission denied"
+  │
+  ├─ kernel reaches file_open LSM hook
+  ├─ rauha eBPF program fires
+  ├─ lookup: process cgroup → zone_id = A
+  ├─ lookup: file inode → file_zone = B
+  ├─ A ≠ B → return -EACCES
+  │
+  └─ process gets "Permission denied"
 ```
 
-This isn't a userspace check. It's enforced in the kernel, on every access, with no daemon round-trip. The eBPF programs read from shared BPF maps that `rauhad` populates — policy changes are a map update, not a process restart.
+This isn't a userspace check — it's enforced in the kernel on every access with no daemon round-trip. Policy changes are a BPF map update, not a process restart.
 
-**eBPF enforcement programs (implemented):**
-
-| Program | LSM Hook | What it blocks |
-|---------|----------|---------------|
+| eBPF Program | LSM Hook | Blocks |
+|-------------|----------|--------|
 | `rauha_file_open` | `file_open` | Cross-zone file access |
 | `rauha_bprm_check` | `bprm_check_security` | Cross-zone binary execution |
 | `rauha_ptrace_check` | `ptrace_access_check` | Cross-zone debugging/tracing |
 | `rauha_task_kill` | `task_kill` | Cross-zone signals |
 | `rauha_cgroup_attach` | `cgroup_attach_task` | Zone escape via cgroup manipulation |
 
-**Planned:** `sb_mount` (mount guard), `ipc_permission` (IPC guard), cgroup skb/sock (network policy), `getdents64` (/proc filtering).
-
 Requires Linux 6.1+ with `CONFIG_BPF_LSM=y`.
 
-### macOS: native isolation via Virtualization.framework
+### macOS: native VMs via Virtualization.framework
 
-On macOS, each zone is a lightweight Linux VM via Apple's Virtualization.framework. Not a hidden shared VM like Docker Desktop — each zone gets its own VM with hardware-enforced isolation.
+Each zone is a lightweight Linux VM — not a hidden shared VM like Docker Desktop. Each zone gets its own VM with hardware-enforced isolation.
 
-The `rauha-guest-agent` runs inside each VM and manages container processes over virtio-vsock (port 5123), using the same `ShimRequest`/`ShimResponse` postcard protocol as the Linux shim. APFS `clonefile()` provides instant, zero-copy rootfs clones. Network isolation uses pf firewall anchors per zone.
+The `rauha-guest-agent` runs inside each VM and manages container processes over virtio-vsock, using the same postcard IPC protocol as the Linux shim. APFS `clonefile()` provides instant, zero-copy rootfs clones. Network isolation uses pf firewall anchors per zone.
 
-Same `rauha zone create` command. Same policy format. Same isolation guarantees.
+Same CLI. Same policy format. Same guarantees.
 
----
+### Zone Networking
+
+Each zone gets a unique IP from the `10.89.0.0/16` subnet. The `rauha0` bridge acts as gateway. nftables handles NAT masquerade for internet access and per-zone forward chains for traffic filtering.
+
+```
+Zone A (10.89.0.2)                    Zone B (10.89.0.3)
+    │                                     │
+  eth0 ──── veth-a ─┐       ┌── veth-b ── eth0
+                    │       │
+              ┌─────┴───────┴─────┐
+              │     rauha0        │
+              │   10.89.0.1/16    │
+              │   (bridge+gw)     │
+              └────────┬──────────┘
+                       │
+                 IP forwarding
+                       │
+                nftables NAT
+                (masquerade)
+                       │
+                 host interface
+                       │
+                    internet
+```
+
+**Enforcement layering:** nftables handles packet filtering (L3/L4). eBPF `ZONE_ALLOWED_COMMS` map provides defense-in-depth for cross-zone socket operations. Network namespaces provide structural isolation. Three independent layers — if one is bypassed, the others still hold.
 
 ## Architecture
 
 ```
-                          ┌────────────────────────┐
-                          │       rauha CLI         │
-                          │  (one binary, all OS)   │
-                          └───────────┬────────────┘
-                                      │ gRPC (TCP :9876)
-                          ┌───────────▼────────────┐
-                          │         rauhad          │
-                          │   (zone manager daemon) │
-                          │                         │
-                          │  ┌───────────────────┐  │
-                          │  │   Zone Registry    │  │
-                          │  │                    │  │
-                          │  │  zones + containers│  │
-                          │  │  policy engine     │  │
-                          │  └────────┬──────────┘  │
-                          │           │              │
-                          │  ┌────────▼──────────┐  │
-                          │  │  IsolationBackend  │  │  ◄── trait object
-                          │  └────────┬──────────┘  │
-                          │           │              │
-                          │  ┌────────▼──────────┐  │     ┌──────────────────────┐
-                          │  │   Image Service    │──│────>│  Content Store        │
-                          │  │  (pull/unpack OCI) │  │     │  /var/lib/rauha/     │
-                          │  └───────────────────┘  │     │   content/blobs/     │
-                          │                         │     │   content/manifests/ │
-                          │  ┌───────────────────┐  │     └──────────────────────┘
-                          │  │  Metadata (redb)   │  │
-                          │  │  /var/lib/rauha/   │  │
-                          │  │   metadata/rauha.  │  │
-                          │  │   redb             │  │
-                          │  └───────────────────┘  │
-                          └───────────┬────────────┘
-                                      │
-                   ┌──────────────────┴──────────────────┐
-                   │                                     │
-          ┌────────▼─────────┐                ┌─────────▼────────┐
-          │   Linux Backend   │                │  macOS Backend    │
-          │                   │                │                   │
-          │  eBPF LSM hooks   │                │  Virt.framework   │
-          │  cgroups v2       │                │  APFS clonefile   │
-          │  network ns       │                │  pf firewall      │
-          │  shim management  │                │  virtio-vsock     │
-          └────────┬─────────┘                └─────────┬─────────┘
-                   │                                     │
-                   │ spawns one per zone                  │ one VM per zone
-                   │                                     │
-          ┌────────▼───────────────────────┐  ┌─────────▼──────────────────┐
-          │         rauha-shim             │  │     rauha-guest-agent      │
-          │    (sync, single-threaded)     │  │    (inside Linux VM)       │
-          │                                │  │                            │
-          │  Unix socket IPC               │  │  virtio-vsock (port 5123)  │
-          │  length-prefixed postcard      │  │  length-prefixed postcard  │
-          │                                │  │                            │
-          │  fork() -> cgroup enroll       │  │  fork() -> pivot_root      │
-          │        -> sync pipe            │  │        -> exec             │
-          │        -> pivot_root + exec    │  │  (no cgroup — VM isolates) │
-          └────────────────────────────────┘  └────────────────────────────┘
+┌──────────────────┐
+│    rauha CLI     │
+└────────┬─────────┘
+         │ gRPC :9876
+┌────────▼─────────────────────────────────────────────┐
+│                        rauhad                        │
+│                                                      │
+│  Zone Registry ── Policy Engine ── Metadata (redb)   │
+│       │                                              │
+│  IsolationBackend (trait)                            │
+│       │                                              │
+│  Image Service ── Content Store ── IP Allocator      │
+└───────┬──────────────────────────────────┬───────────┘
+        │                                  │
+┌───────▼──────────┐            ┌──────────▼───────────┐
+│  Linux Backend   │            │   macOS Backend      │
+│                  │            │                      │
+│  eBPF LSM hooks  │            │  Virtualization.fw   │
+│  cgroups v2      │            │  APFS clonefile      │
+│  network ns      │            │  pf firewall         │
+│  nftables NAT    │            │  virtio-vsock        │
+│  IP allocator    │            │  VM-per-zone         │
+└───────┬──────────┘            └──────────┬───────────┘
+        │ one per zone                     │ one VM per zone
+┌───────▼──────────┐            ┌──────────▼───────────┐
+│   rauha-shim     │            │ rauha-guest-agent    │
+│ sync, fork-safe  │            │   inside Linux VM    │
+│ Unix socket IPC  │            │   vsock port 5123    │
+│ postcard codec   │            │   postcard codec     │
+└──────────────────┘            └──────────────────────┘
 ```
 
 ### The `IsolationBackend` trait
 
-The key abstraction. Both backends implement the same interface — `rauhad` doesn't know or care which platform it's running on.
+The key abstraction. Both backends implement the same interface — `rauhad` is platform-agnostic.
 
 ```rust
 trait IsolationBackend: Send + Sync {
-    // Zone lifecycle
     fn create_zone(&self, config: &ZoneConfig) -> Result<ZoneHandle>;
     fn destroy_zone(&self, zone: &ZoneHandle) -> Result<()>;
-
-    // Policy
     fn enforce_policy(&self, zone: &ZoneHandle, policy: &ZonePolicy) -> Result<()>;
     fn hot_reload_policy(&self, zone: &ZoneHandle, policy: &ZonePolicy) -> Result<()>;
-
-    // Containers
     fn create_container(&self, zone: &ZoneHandle, spec: &ContainerSpec) -> Result<ContainerHandle>;
-    fn start_container(&self, container: &ContainerHandle) -> Result<()>;
+    fn start_container(&self, container: &ContainerHandle) -> Result<u32>;
     fn stop_container(&self, container: &ContainerHandle) -> Result<()>;
-
-    // Observability
     fn zone_stats(&self, zone: &ZoneHandle) -> Result<ZoneStats>;
     fn verify_isolation(&self, zone: &ZoneHandle) -> Result<IsolationReport>;
-
-    // Crash recovery
     fn recover_zone(&self, zone: &ZoneHandle, zone_type: ZoneType, policy: &ZonePolicy) -> Result<()>;
     fn cleanup_orphans(&self, known_zones: &[ZoneHandle]) -> Result<()>;
-
-    // Platform identity
-    fn isolation_model(&self) -> IsolationModel;
+    fn isolation_model(&self) -> IsolationModel; // SyscallPolicy | HardwareBoundary
     fn name(&self) -> &str;
 }
 ```
@@ -205,36 +172,19 @@ trait IsolationBackend: Send + Sync {
 | Crate | Purpose |
 |-------|---------|
 | `rauha-common` | Shared types, `IsolationBackend` trait, policy parsing, shim IPC protocol |
-| `rauhad` | Daemon — gRPC server, zone registry, metadata store (redb), backends |
+| `rauhad` | Daemon — gRPC server, zone registry, metadata (redb), networking, backends |
 | `rauha-cli` | CLI binary |
-| `rauha-shim` | Per-zone shim process (sync, single-threaded, Linux only) |
-| `rauha-guest-agent` | Guest-side daemon inside macOS VMs — container lifecycle over virtio-vsock |
-| `rauha-oci` | OCI image pull, content store, rootfs preparation, runtime spec generation |
-| `rauha-ebpf` | eBPF LSM programs (kernel-side, separate build target) |
-| `rauha-ebpf-common` | Shared `#[repr(C)]` types between eBPF programs and userspace |
+| `rauha-shim` | Per-zone sync process — fork/run containers (Linux only) |
+| `rauha-guest-agent` | Guest-side daemon inside macOS VMs |
+| `rauha-oci` | OCI image pull, content store, rootfs preparation |
+| `rauha-ebpf` | eBPF LSM programs (kernel-side, separate build) |
+| `rauha-ebpf-common` | Shared `#[repr(C)]` types between eBPF and userspace |
 | `xtask` | Build helper for eBPF compilation |
-
-### Key Dependencies
-
-| Crate | Why |
-|-------|-----|
-| `aya` / `aya-ebpf` | eBPF in pure Rust — no libbpf, no C |
-| `tonic` / `prost` | gRPC (daemon ↔ CLI, future CRI compatibility) |
-| `redb` | Metadata store — pure Rust, ACID, zero C deps |
-| `tokio` | Async runtime (daemon and CLI) |
-| `postcard` | Binary serialization for shim ↔ daemon IPC |
-| `nix` | Linux syscalls (fork, setns, pivot_root, mount) |
-| `oci-spec` | OCI runtime spec types |
-| `reqwest` | OCI registry HTTP client |
-| `objc2-virtualization` | macOS Virtualization.framework bindings (Rust ↔ ObjC) |
-| `dispatch2` | GCD serial queues for VZVirtualMachine operations |
-
----
 
 ## Usage
 
 ```bash
-# Create zones
+# Create zones with policies
 rauha zone create --name frontend --policy policies/standard.toml
 rauha zone create --name database --policy policies/strict.toml
 
@@ -242,27 +192,23 @@ rauha zone create --name database --policy policies/strict.toml
 rauha run --zone frontend nginx:latest
 rauha run --zone database postgres:16
 
-# Containers are isolated by default
-rauha zone verify frontend    # ISOLATED
+# Verify isolation
+rauha zone verify frontend
 
 # Image management
 rauha image pull alpine:latest
 rauha image ls
 rauha image inspect alpine:latest
 
-# Explicit cross-zone communication
-rauha policy apply --zone frontend --allow-zone database
-
 # Observe
 rauha ps --zone frontend
-rauha top --zone database
-rauha trace --zone frontend
-rauha events
+rauha logs <container-id> --follow
+rauha exec -it <container-id> /bin/sh
 ```
 
 ### Zone Policies
 
-Policies are declarative TOML files. Allow-list model — nothing is permitted unless explicitly listed.
+Declarative TOML. Allow-list model — nothing is permitted unless explicitly listed.
 
 ```toml
 [zone]
@@ -278,81 +224,73 @@ memory_limit = "4Gi"
 pids_max = 512
 
 [network]
-mode = "isolated"
+mode = "bridged"
 allowed_zones = ["frontend"]
 allowed_egress = ["0.0.0.0/0:443"]
 
 [filesystem]
 writable_paths = ["/data", "/tmp", "/var/log"]
 
-[devices]
-allowed = ["/dev/null", "/dev/zero", "/dev/urandom"]
-
 [syscalls]
 deny = ["mount", "umount2", "pivot_root"]
 ```
 
----
+## Oracle Test Suite
 
-## Roadmap
+Rauha includes a ground-truth oracle (`eval/oracle/`) — a standalone Rust binary that validates rauhad through its gRPC API. 54 numbered test cases across 11 categories. The oracle never reads source code, never mocks. When a case fails, it means the system's public contract is broken.
 
-- [x] **Phase 1: Foundation** — workspace, shared types, `IsolationBackend` trait, redb metadata, zone registry, gRPC skeleton, CLI
-- [x] **Phase 2: Linux Isolation** — eBPF programs (Aya), BPF map management, LSM enforcement, network namespaces, cgroup hierarchy, crash recovery
-- [x] **Phase 3: Container Runtime** — OCI image pull, content store, image service, zone shim, container lifecycle
-- [ ] **Phase 4: Integration & Hardening** — end-to-end testing, overlayfs snapshotter, PTY attach, streaming logs
-- [x] **Phase 5: macOS Backend** — Virtualization.framework, sandbox profiles, APFS clone snapshotter, Network.framework + pf
-- [ ] **Phase 6: Observability** — `rauha trace` (eBPF/DTrace), `rauha top`, event streaming
+```bash
+cd eval/oracle
+RAUHA_GRPC_ENDPOINT=http://[::1]:9876 cargo test           # all cases
+RAUHA_GRPC_ENDPOINT=http://[::1]:9876 cargo test -- case_001  # one case
+```
 
----
-
-## Honest Trade-offs
-
-**eBPF is not a kernel primitive.** Zone identity is reconstructed via BPF map lookup on every enforcement call. A process that could manipulate cgroup membership could theoretically escape — defended by the `zone_cgroup_lock` LSM hook, but it's defense-in-depth, not a hardware boundary.
-
-**LSM is additive-only.** eBPF LSM programs can deny access but cannot override SELinux/AppArmor denials. Zone policy must be a subset of existing MAC policy.
-
-**Struct offsets are hardcoded.** eBPF programs use fixed offsets for kernel structs (e.g., `file->f_inode` at +32). Correct for Linux 6.1+ but may break on future kernels until CO-RE BTF support is added.
-
-**macOS backend requires macOS 15+** for the Containers API. Older versions get Virtualization.framework VMs only.
-
-**Covert channels** via shared kernel resources (CPU cache timing, memory pressure) are not addressable by eBPF. Same limitation as all OS-level isolation.
-
-**eBPF verifier complexity ceiling.** Programs accessing deep kernel structs must be carefully bounded to pass the BPF verifier. This constrains how sophisticated individual enforcement programs can be.
-
-See [SECURITY.md](SECURITY.md) for a detailed analysis of the security model and known limitations.
-
----
+| Range | Category | Cases |
+|-------|----------|-------|
+| 001-003 | Zone lifecycle | create, list, delete, duplicates |
+| 004-006 | Container lifecycle | create, start, stop, exit |
+| 007-009 | Image management | pull, inspect, remove |
+| 010-012 | Isolation verification | healthy, nonexistent, policy reload |
+| 013-015 | Policy enforcement | apply, memory limits, invalid rejection |
+| 016-018 | Networking | bridged, host mode, DNS |
+| 019-021 | Observability | stats, NotFound paths |
+| 022-029 | Resilience | input validation (8 cases) |
+| 030-034 | Multi-zone | coexistence, scoping, force-delete |
+| 035-039 | Container edge cases | NotFound, invalid UUID |
+| 040-054 | Invariants & stress | ID consistency, boundaries, rapid cycles |
 
 ## Building
 
 ```bash
-# Requires: Rust 1.75+, protoc
+# Build all workspace crates
 cargo build
+
+# Run unit tests
 cargo test
 
-# Start the daemon (development)
+# Start the daemon
 RUST_LOG=rauhad=debug cargo run --bin rauhad
 
-# Use the CLI
-cargo run --bin rauha -- zone create --name test
-cargo run --bin rauha -- zone list
+# macOS: sign after every build
+codesign --entitlements rauhad/rauhad.entitlements -s - target/debug/rauhad
 
-# Build eBPF programs (requires nightly Rust)
+# Build eBPF programs (requires nightly)
 cargo xtask build-ebpf
-cargo xtask build-ebpf --release
 ```
 
-**Linux eBPF requirements:**
-- Linux 6.1+ kernel
-- `CONFIG_BPF_LSM=y`, `CONFIG_BPF_SYSCALL=y`, `CONFIG_DEBUG_INFO_BTF=y`
-- Boot parameter: `lsm=lockdown,capability,bpf`
+**Linux:** kernel 6.1+, `CONFIG_BPF_LSM=y`, `CONFIG_BPF_SYSCALL=y`, `CONFIG_DEBUG_INFO_BTF=y`, boot with `lsm=lockdown,capability,bpf`
 
-**macOS requirements:**
-- macOS 15+ (Sequoia) for full Containers API support
-- Apple Silicon or Intel with VT-x
-- rauhad binary must be signed with `com.apple.security.virtualization` entitlement (see `rauhad/rauhad.entitlements`)
+**macOS:** macOS 15+ (Sequoia), Apple Silicon or Intel with VT-x, `com.apple.security.virtualization` entitlement
 
----
+## Trade-offs
+
+**eBPF is not a kernel primitive.** Zone identity is reconstructed via BPF map lookup on every enforcement call. Defended by the `zone_cgroup_lock` LSM hook, but it's defense-in-depth, not a hardware boundary.
+
+**LSM is additive-only.** eBPF LSM programs can deny access but cannot override SELinux/AppArmor denials. Zone policy must be a subset of existing MAC policy.
+
+**Struct offsets are hardcoded.** eBPF programs use fixed offsets for kernel structs (e.g., `file->f_inode` at +32). Correct for Linux 6.1+; CO-RE BTF support is planned.
+
+**Covert channels** via shared kernel resources (CPU cache timing, memory pressure) are not addressable by eBPF. Same limitation as all OS-level isolation.
 
 ## License
 
