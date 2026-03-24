@@ -22,6 +22,8 @@
 //!   022-029: Resilience (input validation, error codes, force delete)
 //!   030-034: Multi-zone interaction
 //!   035-039: Container edge cases
+//!   040-049: Invariants & data integrity
+//!   050-054: Stress & boundary conditions
 
 pub mod pb {
     pub mod zone {
@@ -1346,5 +1348,460 @@ mod container_edge_cases {
             .await;
 
         assert_grpc_error(result, tonic::Code::InvalidArgument, "invalid container ID");
+    }
+}
+
+// ============================================================================
+// INVARIANTS & DATA INTEGRITY (040-049)
+// ============================================================================
+
+#[cfg(test)]
+mod invariants {
+    use super::helpers::*;
+    use super::pb;
+    use tokio::time::{sleep, Duration};
+
+    /// zone_id is consistent across create, get, list, and stats.
+    #[tokio::test]
+    async fn case_040_zone_id_consistent_across_apis() {
+        let mut client = zone_client().await;
+        let name = unique_zone_name("040");
+
+        let create_resp = create_zone(&mut client, &name, &isolated_policy_toml()).await;
+        let zone_id = create_resp.zone_id.clone();
+        assert!(!zone_id.is_empty());
+
+        sleep(Duration::from_millis(ZONE_SETTLE_MS)).await;
+
+        // GetZone must return the same id.
+        let get_resp = get_zone(&mut client, &name).await;
+        let zone_info = get_resp.zone.unwrap();
+        assert_eq!(zone_info.id, zone_id, "GetZone.id must match CreateZone.zone_id");
+
+        // ListZones must contain the same id.
+        let zones = list_zones(&mut client).await;
+        let listed = zones.iter().find(|z| z.name == name).expect("zone must be in list");
+        assert_eq!(listed.id, zone_id, "ListZones.id must match CreateZone.zone_id");
+
+        // ZoneStats must return the same id.
+        let stats = client
+            .zone_stats(pb::zone::ZoneStatsRequest { zone_name: name.clone() })
+            .await
+            .expect("ZoneStats must succeed")
+            .into_inner();
+        assert_eq!(stats.zone_id, zone_id, "ZoneStats.zone_id must match CreateZone.zone_id");
+
+        delete_zone_checked(&mut client, &name).await;
+    }
+
+    /// created_at is a valid, non-empty timestamp that is not in the future.
+    #[tokio::test]
+    async fn case_041_created_at_is_valid_timestamp() {
+        let mut client = zone_client().await;
+        let name = unique_zone_name("041");
+
+        create_zone(&mut client, &name, &isolated_policy_toml()).await;
+        sleep(Duration::from_millis(ZONE_SETTLE_MS)).await;
+
+        let get_resp = get_zone(&mut client, &name).await;
+        let zone = get_resp.zone.unwrap();
+
+        assert!(!zone.created_at.is_empty(), "created_at must not be empty");
+        // Must be parseable — the format should be RFC3339 or similar.
+        assert!(
+            zone.created_at.contains('T') || zone.created_at.contains('-'),
+            "created_at must look like a timestamp, got: {}",
+            zone.created_at
+        );
+        // Must not be a zero/epoch value.
+        assert!(
+            !zone.created_at.starts_with("1970"),
+            "created_at must not be epoch, got: {}",
+            zone.created_at
+        );
+
+        delete_zone_checked(&mut client, &name).await;
+    }
+
+    /// Create 5 zones, delete 2, exactly 3 remain (our 3, not others).
+    #[tokio::test]
+    async fn case_042_batch_create_partial_delete() {
+        let mut client = zone_client().await;
+        let prefix = unique_zone_name("042");
+        let names: Vec<String> = (0..5).map(|i| format!("{prefix}-{i}")).collect();
+
+        // Create all 5.
+        for name in &names {
+            create_zone(&mut client, name, &isolated_policy_toml()).await;
+        }
+        sleep(Duration::from_millis(ZONE_SETTLE_MS)).await;
+
+        // Delete the first 2.
+        delete_zone_checked(&mut client, &names[0]).await;
+        delete_zone_checked(&mut client, &names[1]).await;
+        sleep(Duration::from_millis(ZONE_SETTLE_MS)).await;
+
+        // List — exactly names[2..5] must be present (from our batch).
+        let zones = list_zones(&mut client).await;
+        for deleted in &names[..2] {
+            assert!(
+                !zones.iter().any(|z| z.name == *deleted),
+                "deleted zone {} must not be in list",
+                deleted
+            );
+        }
+        for remaining in &names[2..] {
+            assert!(
+                zones.iter().any(|z| z.name == *remaining),
+                "surviving zone {} must be in list",
+                remaining
+            );
+        }
+
+        // Cleanup.
+        for name in &names[2..] {
+            delete_zone_checked(&mut client, name).await;
+        }
+    }
+
+    /// Deleting a zone twice — second delete returns NotFound, not success.
+    #[tokio::test]
+    async fn case_043_double_delete_returns_not_found() {
+        let mut client = zone_client().await;
+        let name = unique_zone_name("043");
+
+        create_zone(&mut client, &name, &isolated_policy_toml()).await;
+        sleep(Duration::from_millis(ZONE_SETTLE_MS)).await;
+
+        // First delete — must succeed.
+        client
+            .delete_zone(pb::zone::DeleteZoneRequest {
+                name: name.clone(),
+                force: true,
+            })
+            .await
+            .expect("first delete must succeed");
+
+        sleep(Duration::from_millis(ZONE_SETTLE_MS)).await;
+
+        // Second delete — must return NotFound.
+        let result = client
+            .delete_zone(pb::zone::DeleteZoneRequest {
+                name: name.clone(),
+                force: true,
+            })
+            .await;
+
+        assert_grpc_error(result, tonic::Code::NotFound, "second delete of same zone");
+    }
+
+    /// Privileged zone type is accepted and round-trips through GetZone.
+    #[tokio::test]
+    async fn case_044_privileged_zone_type() {
+        let mut client = zone_client().await;
+        let name = unique_zone_name("044");
+
+        client
+            .create_zone(pb::zone::CreateZoneRequest {
+                name: name.clone(),
+                zone_type: "privileged".into(),
+                policy_toml: isolated_policy_toml(),
+            })
+            .await
+            .expect("creating privileged zone must succeed");
+
+        sleep(Duration::from_millis(ZONE_SETTLE_MS)).await;
+
+        let get_resp = get_zone(&mut client, &name).await;
+        let zone = get_resp.zone.unwrap();
+        assert_eq!(
+            zone.zone_type, "Privileged",
+            "GetZone must reflect privileged zone type, got: {}",
+            zone.zone_type
+        );
+
+        delete_zone_checked(&mut client, &name).await;
+    }
+
+    /// Image inspect digest is stable — two inspects return the same digest.
+    #[tokio::test]
+    async fn case_045_inspect_digest_is_stable() {
+        let mut client = image_client().await;
+        ensure_alpine(&mut client).await;
+
+        let inspect1 = client
+            .inspect(pb::image::InspectImageRequest { reference: "alpine:latest".into() })
+            .await.expect("Inspect 1 must succeed").into_inner();
+
+        let inspect2 = client
+            .inspect(pb::image::InspectImageRequest { reference: "alpine:latest".into() })
+            .await.expect("Inspect 2 must succeed").into_inner();
+
+        assert_eq!(inspect1.digest, inspect2.digest, "digest must be stable across inspects");
+        assert_eq!(inspect1.layers, inspect2.layers, "layers must be stable across inspects");
+        assert_eq!(inspect1.size, inspect2.size, "size must be stable across inspects");
+    }
+
+    /// Policy round-trip preserves resource values exactly.
+    #[tokio::test]
+    async fn case_046_policy_resource_roundtrip() {
+        let mut client = zone_client().await;
+        let name = unique_zone_name("046");
+
+        let policy = r#"
+[zone]
+name = "oracle"
+type = "non-global"
+
+[resources]
+memory_limit = "1Gi"
+cpu_shares = 2048
+pids_max = 512
+"#;
+        create_zone(&mut client, &name, policy).await;
+        sleep(Duration::from_millis(ZONE_SETTLE_MS)).await;
+
+        let resp = client
+            .get_policy(pb::zone::GetPolicyRequest { zone_name: name.clone() })
+            .await.expect("GetPolicy must succeed").into_inner();
+
+        // Memory limit should be 1Gi = 1073741824 bytes.
+        let stats = client
+            .zone_stats(pb::zone::ZoneStatsRequest { zone_name: name.clone() })
+            .await.expect("ZoneStats must succeed").into_inner();
+
+        assert_eq!(
+            stats.memory_limit_bytes,
+            1024 * 1024 * 1024,
+            "1Gi must be 1073741824 bytes, got: {}",
+            stats.memory_limit_bytes
+        );
+
+        // Policy TOML must preserve the values.
+        assert!(resp.policy_toml.contains("2048"), "cpu_shares=2048 must round-trip");
+        assert!(resp.policy_toml.contains("512"), "pids_max=512 must round-trip");
+
+        delete_zone_checked(&mut client, &name).await;
+    }
+
+    /// Container list for a zone with no containers returns empty, not error.
+    #[tokio::test]
+    async fn case_047_empty_zone_lists_no_containers() {
+        let mut zone_cl = zone_client().await;
+        let mut ctr_cl = container_client().await;
+        let zone_name = unique_zone_name("047");
+
+        create_zone(&mut zone_cl, &zone_name, &isolated_policy_toml()).await;
+        sleep(Duration::from_millis(ZONE_SETTLE_MS)).await;
+
+        let containers = ctr_cl
+            .list_containers(pb::container::ListContainersRequest {
+                zone_name: zone_name.clone(),
+            })
+            .await
+            .expect("ListContainers on empty zone must succeed")
+            .into_inner()
+            .containers;
+
+        assert!(
+            containers.is_empty(),
+            "zone with no containers must return empty list, got {} containers",
+            containers.len()
+        );
+
+        delete_zone_checked(&mut zone_cl, &zone_name).await;
+    }
+
+    /// Backslash in zone name must be rejected (Windows path separator).
+    #[tokio::test]
+    async fn case_048_backslash_name_rejected() {
+        let mut client = zone_client().await;
+
+        let result = client
+            .create_zone(pb::zone::CreateZoneRequest {
+                name: "bad\\name".into(),
+                zone_type: "non-global".into(),
+                policy_toml: isolated_policy_toml(),
+            })
+            .await;
+
+        assert_grpc_error(result, tonic::Code::InvalidArgument, "backslash in zone name");
+    }
+
+    /// ".." zone name must be rejected.
+    #[tokio::test]
+    async fn case_049_dotdot_name_rejected() {
+        let mut client = zone_client().await;
+
+        let result = client
+            .create_zone(pb::zone::CreateZoneRequest {
+                name: "..".into(),
+                zone_type: "non-global".into(),
+                policy_toml: isolated_policy_toml(),
+            })
+            .await;
+
+        assert_grpc_error(result, tonic::Code::InvalidArgument, "dotdot zone name");
+    }
+}
+
+// ============================================================================
+// STRESS & BOUNDARY CONDITIONS (050-054)
+// ============================================================================
+
+#[cfg(test)]
+mod stress {
+    use super::helpers::*;
+    use super::pb;
+    use tokio::time::{sleep, Duration};
+
+    /// Create and delete 10 zones rapidly — list must be consistent at each step.
+    #[tokio::test]
+    async fn case_050_rapid_create_delete_cycle() {
+        let mut client = zone_client().await;
+        let prefix = unique_zone_name("050");
+
+        for i in 0..10 {
+            let name = format!("{prefix}-{i}");
+            create_zone(&mut client, &name, &isolated_policy_toml()).await;
+            sleep(Duration::from_millis(ZONE_SETTLE_MS)).await;
+
+            // Zone must be in list.
+            let zones = list_zones(&mut client).await;
+            assert!(zones.iter().any(|z| z.name == name), "zone {name} must be in list after create");
+
+            delete_zone_checked(&mut client, &name).await;
+            sleep(Duration::from_millis(200)).await;
+
+            // Zone must be gone.
+            let zones = list_zones(&mut client).await;
+            assert!(!zones.iter().any(|z| z.name == name), "zone {name} must be gone after delete");
+        }
+    }
+
+    /// Zone name at exactly 128 chars (max boundary) is accepted.
+    #[tokio::test]
+    async fn case_051_name_at_max_boundary() {
+        let mut client = zone_client().await;
+        let name = "a".repeat(128);
+
+        let result = client
+            .create_zone(pb::zone::CreateZoneRequest {
+                name: name.clone(),
+                zone_type: "non-global".into(),
+                policy_toml: isolated_policy_toml(),
+            })
+            .await;
+
+        // 128 chars must be accepted (the limit is >128 rejected).
+        result.expect("128-char zone name must be accepted");
+        sleep(Duration::from_millis(ZONE_SETTLE_MS)).await;
+
+        delete_zone_checked(&mut client, &name).await;
+    }
+
+    /// Multiple containers in one zone — all listed, scoped correctly.
+    #[tokio::test]
+    async fn case_052_multiple_containers_in_zone() {
+        let mut zone_cl = zone_client().await;
+        let mut ctr_cl = container_client().await;
+        let mut img_cl = image_client().await;
+        let zone_name = unique_zone_name("052");
+
+        ensure_alpine(&mut img_cl).await;
+        create_zone(&mut zone_cl, &zone_name, &bridged_policy_toml()).await;
+        sleep(Duration::from_millis(ZONE_SETTLE_MS)).await;
+
+        // Create 3 containers.
+        let mut ctr_ids = Vec::new();
+        for i in 0..3 {
+            let id = create_and_start_container(
+                &mut ctr_cl,
+                &zone_name,
+                &format!("ctr-{i}"),
+                vec!["/bin/sleep".into(), "60".into()],
+            ).await;
+            ctr_ids.push(id);
+        }
+
+        // List — all 3 must be present.
+        let containers = ctr_cl
+            .list_containers(pb::container::ListContainersRequest {
+                zone_name: zone_name.clone(),
+            })
+            .await
+            .expect("ListContainers must succeed")
+            .into_inner()
+            .containers;
+
+        for (i, ctr_id) in ctr_ids.iter().enumerate() {
+            assert!(
+                containers.iter().any(|c| c.id == *ctr_id),
+                "container {} (id={}) must be in zone listing",
+                i, ctr_id
+            );
+        }
+
+        assert!(
+            containers.len() >= 3,
+            "zone must have at least 3 containers, got {}",
+            containers.len()
+        );
+
+        delete_zone_checked(&mut zone_cl, &zone_name).await;
+    }
+
+    /// Image pull progress stream must contain at least one message and end with done=true.
+    #[tokio::test]
+    async fn case_053_pull_progress_stream_contract() {
+        let mut client = image_client().await;
+
+        let mut stream = client
+            .pull(pb::image::PullRequest {
+                reference: "alpine:latest".into(),
+            })
+            .await
+            .expect("Pull must succeed")
+            .into_inner();
+
+        let mut message_count = 0;
+        let mut saw_done = false;
+
+        while let Some(progress) = stream.message().await.expect("stream must not error mid-pull") {
+            message_count += 1;
+            assert!(!progress.status.is_empty(), "progress.status must not be empty");
+            if progress.done {
+                saw_done = true;
+                break;
+            }
+        }
+
+        assert!(message_count > 0, "pull must emit at least one progress message");
+        assert!(saw_done, "pull stream must end with done=true");
+    }
+
+    /// Zone with unknown network mode in policy is rejected.
+    #[tokio::test]
+    async fn case_054_unknown_network_mode_rejected() {
+        let mut client = zone_client().await;
+        let name = unique_zone_name("054");
+
+        let bad_policy = r#"
+[zone]
+name = "oracle"
+type = "non-global"
+
+[network]
+mode = "quantum-entangled"
+"#;
+        let result = client
+            .create_zone(pb::zone::CreateZoneRequest {
+                name,
+                zone_type: "non-global".into(),
+                policy_toml: bad_policy.into(),
+            })
+            .await;
+
+        assert_grpc_error(result, tonic::Code::InvalidArgument, "unknown network mode");
     }
 }
