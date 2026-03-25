@@ -426,22 +426,55 @@ impl ZoneRegistry {
     }
 
     /// Get a container by ID.
+    /// Lazily updates state: if a Running container's process has exited,
+    /// the state is updated to Stopped before returning.
     pub fn get_container(&self, container_id: &Uuid) -> Result<Container> {
-        self.metadata
+        let container = self.metadata
             .get_container(container_id)?
-            .ok_or_else(|| RauhaError::ContainerNotFound(*container_id))
+            .ok_or_else(|| RauhaError::ContainerNotFound(*container_id))?;
+
+        self.maybe_reap_container(container)
     }
 
     pub fn list_containers(&self, zone_name: Option<&str>) -> Result<Vec<Container>> {
-        if let Some(name) = zone_name {
+        let containers = if let Some(name) = zone_name {
             let zone = self
                 .metadata
                 .get_zone(name)?
                 .ok_or_else(|| RauhaError::ZoneNotFound(name.into()))?;
-            self.metadata.list_containers(Some(&zone.id))
+            self.metadata.list_containers(Some(&zone.id))?
         } else {
-            self.metadata.list_containers(None)
+            self.metadata.list_containers(None)?
+        };
+
+        // Lazily reap exited containers.
+        containers.into_iter().map(|c| self.maybe_reap_container(c)).collect()
+    }
+
+    /// If a container is Running but its process has exited, update state to Stopped.
+    /// Uses kill(pid, 0) to check liveness — ESRCH means dead, EPERM means alive
+    /// but unprivileged, 0 means alive.
+    fn maybe_reap_container(&self, mut container: Container) -> Result<Container> {
+        if container.state == ContainerState::Running {
+            if let Some(pid) = container.pid.filter(|&p| p > 0) {
+                let ret = unsafe { libc::kill(pid as i32, 0) };
+                let dead = ret == -1
+                    && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
+                if dead {
+                    container.state = ContainerState::Stopped;
+                    container.finished_at = Some(Utc::now());
+                    // Best-effort update — don't fail the get/list if metadata write fails.
+                    if let Err(e) = self.metadata.put_container(&container) {
+                        tracing::warn!(
+                            container = %container.id,
+                            error = %e,
+                            "failed to persist reaped container state"
+                        );
+                    }
+                }
+            }
         }
+        Ok(container)
     }
 
     pub async fn zone_stats(&self, zone_name: &str) -> Result<ZoneStats> {
@@ -610,7 +643,8 @@ mod tests {
         }
 
         fn start_container(&self, _container: &ContainerHandle) -> Result<u32> {
-            Ok(42) // Mock PID
+            // Return current process PID so liveness check (kill(pid,0)) passes.
+            Ok(std::process::id())
         }
 
         fn stop_container(&self, _container: &ContainerHandle) -> Result<()> {
@@ -838,7 +872,7 @@ mod tests {
         let running = reg.get_container(&ctr.id).unwrap();
         assert_eq!(running.state, rauha_common::container::ContainerState::Running);
         assert!(running.started_at.is_some());
-        assert_eq!(running.pid, Some(42)); // PID from MockBackend::start_container
+        assert!(running.pid.is_some(), "started container must have a PID");
 
         // Stop.
         reg.stop_container(&ctr.id, 10).await.unwrap();

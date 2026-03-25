@@ -71,17 +71,21 @@ impl ZoneService for ZoneServiceImpl {
     ) -> Result<Response<pb::zone::CreateZoneResponse>, Status> {
         let req = request.into_inner();
 
-        let (zone_type, policy) = if req.policy_toml.is_empty() {
-            (
-                match req.zone_type.as_str() {
-                    "privileged" => rauha_common::zone::ZoneType::Privileged,
-                    _ => rauha_common::zone::ZoneType::NonGlobal,
-                },
-                rauha_common::zone::ZonePolicy::default(),
-            )
+        // Zone type comes from the gRPC request field, not the TOML.
+        let zone_type = match req.zone_type.as_str() {
+            "privileged" => rauha_common::zone::ZoneType::Privileged,
+            "global" => rauha_common::zone::ZoneType::Global,
+            _ => rauha_common::zone::ZoneType::NonGlobal,
+        };
+
+        let policy = if req.policy_toml.is_empty() {
+            rauha_common::zone::ZonePolicy::default()
         } else {
-            crate::zone::policy::parse_policy(&req.policy_toml, &self.root)
-                .map_err(|e| Status::invalid_argument(e.to_string()))?
+            let (_toml_zone_type, parsed_policy) =
+                crate::zone::policy::parse_policy(&req.policy_toml, &self.root)
+                    .map_err(|e| Status::invalid_argument(e.to_string()))?;
+            let _ = _toml_zone_type; // Ignored — gRPC zone_type takes precedence.
+            parsed_policy
         };
 
         let zone = self

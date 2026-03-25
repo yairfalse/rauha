@@ -9,7 +9,7 @@ mod cgroup;
 mod ebpf;
 mod maps;
 mod namespace;
-mod network;
+pub mod network;
 pub mod nftables;
 
 use std::collections::HashMap;

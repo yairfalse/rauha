@@ -168,18 +168,16 @@ fn generate_rules(zone_name: &str, policy: &ZonePolicy) -> String {
                     ));
                 }
             }
-            // TODO(networking): allowed_zones support for macOS VMs.
-            // Cross-VM pf rules need the peer VM's IP, which the guest agent
-            // can report over vsock. Requires:
-            // 1. Guest agent reporting its assigned IP on boot
-            // 2. PfManager tracking VM IPs
-            // 3. Generating pass rules for allowed VM-to-VM traffic
-            // Lower priority since VMs already have NAT networking from
-            // Virtualization.framework.
-            if !policy.network.allowed_zones.is_empty() {
+            // Cross-VM allowed_zones: generate pass rules using peer zone's
+            // pf table. VMs get IPs from Virtualization.framework's NAT —
+            // we reference the peer zone's IP table so pf resolves the address.
+            for peer_zone in &policy.network.allowed_zones {
+                let peer_table = format!("zone-{peer_zone}-ips");
                 rules.push_str(&format!(
-                    "# allowed_zones: {:?} (not yet enforced — follow-up)\n",
-                    policy.network.allowed_zones
+                    "pass out quick from <{table_name}> to <{peer_table}>\n"
+                ));
+                rules.push_str(&format!(
+                    "pass in quick from <{peer_table}> to <{table_name}>\n"
                 ));
             }
             // Always allow DNS to host resolver.
@@ -233,6 +231,26 @@ mod tests {
         let rules = generate_rules("myzone", &policy);
         assert!(rules.contains("block out quick"));
         assert!(rules.contains("pass out quick from <zone-myzone-ips> to 10.0.0.0/8"));
+        assert!(rules.contains("port 53")); // DNS always allowed
+    }
+
+    #[test]
+    fn generate_bridged_rules_with_allowed_zones() {
+        let policy = ZonePolicy {
+            network: NetworkPolicy {
+                mode: NetworkMode::Bridged,
+                allowed_zones: vec!["database".into(), "cache".into()],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let rules = generate_rules("web", &policy);
+        // Must have pass rules for each allowed peer zone.
+        assert!(rules.contains("pass out quick from <zone-web-ips> to <zone-database-ips>"));
+        assert!(rules.contains("pass in quick from <zone-database-ips> to <zone-web-ips>"));
+        assert!(rules.contains("pass out quick from <zone-web-ips> to <zone-cache-ips>"));
+        assert!(rules.contains("pass in quick from <zone-cache-ips> to <zone-web-ips>"));
         assert!(rules.contains("port 53")); // DNS always allowed
     }
 
