@@ -452,14 +452,14 @@ impl ZoneRegistry {
     }
 
     /// If a container is Running but its process has exited, update state to Stopped.
-    /// Uses kill(pid, 0) to check liveness — ESRCH means dead, EPERM means alive
-    /// but unprivileged, 0 means alive.
+    ///
+    /// On Linux, uses kill(pid, 0) to check host-side PID liveness.
+    /// On macOS, the PID is from inside the VM — host-side kill() cannot check it,
+    /// so we skip the liveness check (macOS containers are reaped via guest agent).
     fn maybe_reap_container(&self, mut container: Container) -> Result<Container> {
         if container.state == ContainerState::Running {
             if let Some(pid) = container.pid.filter(|&p| p > 0) {
-                let ret = unsafe { libc::kill(pid as i32, 0) };
-                let dead = ret == -1
-                    && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
+                let dead = Self::is_process_dead(pid);
                 if dead {
                     container.state = ContainerState::Stopped;
                     container.finished_at = Some(Utc::now());
@@ -475,6 +475,20 @@ impl ZoneRegistry {
             }
         }
         Ok(container)
+    }
+
+    /// Check if a process is dead. Linux only — uses kill(pid, 0).
+    /// On macOS, PIDs are from inside VMs so host kill() can't check them.
+    #[cfg(target_os = "linux")]
+    fn is_process_dead(pid: u32) -> bool {
+        let ret = unsafe { libc::kill(pid as i32, 0) };
+        ret == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn is_process_dead(_pid: u32) -> bool {
+        // On macOS, container PIDs are inside VMs — can't check from host.
+        false
     }
 
     pub async fn zone_stats(&self, zone_name: &str) -> Result<ZoneStats> {
@@ -883,6 +897,39 @@ mod tests {
         // Delete.
         reg.delete_container(&ctr.id, false).await.unwrap();
         assert!(reg.get_container(&ctr.id).is_err());
+    }
+
+    #[tokio::test]
+    #[cfg(target_os = "linux")]
+    async fn reap_dead_container_on_get() {
+        use rauha_common::container::ContainerState;
+
+        let tmp = TempDir::new().unwrap();
+        let reg = test_registry(&tmp);
+
+        reg.create_zone("reap", ZoneType::NonGlobal, ZonePolicy::default())
+            .await
+            .unwrap();
+        let ctr = reg.create_container("reap", make_spec("ephemeral")).await.unwrap();
+
+        // Start (MockBackend returns our PID, which is alive).
+        reg.start_container(&ctr.id).await.unwrap();
+        let running = reg.get_container(&ctr.id).unwrap();
+        assert_eq!(running.state, ContainerState::Running);
+
+        // Manually set a dead PID (PID 1 is always alive, but PID 999999999 is not).
+        let mut hacked = running;
+        hacked.pid = Some(999_999_999);
+        reg.metadata.put_container(&hacked).unwrap();
+
+        // get_container should lazily reap it.
+        let reaped = reg.get_container(&ctr.id).unwrap();
+        assert_eq!(reaped.state, ContainerState::Stopped, "dead PID must be reaped to Stopped");
+        assert!(reaped.finished_at.is_some(), "reaped container must have finished_at");
+
+        // list_containers should also show Stopped.
+        let listed = reg.list_containers(Some("reap")).unwrap();
+        assert_eq!(listed[0].state, ContainerState::Stopped);
     }
 
     #[tokio::test]

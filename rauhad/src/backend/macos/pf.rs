@@ -172,6 +172,10 @@ fn generate_rules(zone_name: &str, policy: &ZonePolicy) -> String {
             // pf table. VMs get IPs from Virtualization.framework's NAT —
             // we reference the peer zone's IP table so pf resolves the address.
             for peer_zone in &policy.network.allowed_zones {
+                // Skip names with characters unsafe for pf table identifiers.
+                if !peer_zone.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+                    continue;
+                }
                 let peer_table = format!("zone-{peer_zone}-ips");
                 rules.push_str(&format!(
                     "pass out quick from <{table_name}> to <{peer_table}>\n"

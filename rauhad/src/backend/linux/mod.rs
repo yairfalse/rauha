@@ -9,8 +9,19 @@ mod cgroup;
 mod ebpf;
 mod maps;
 mod namespace;
-pub mod network;
-pub mod nftables;
+mod network;
+pub(crate) mod nftables;
+
+/// Clean up Linux network state (nftables table + bridge).
+/// Called during daemon shutdown.
+pub fn cleanup_network() {
+    if let Err(e) = nftables::cleanup_nat() {
+        tracing::warn!(%e, "failed to clean up nftables table");
+    }
+    if let Err(e) = network::destroy_bridge() {
+        tracing::warn!(%e, "failed to destroy network bridge");
+    }
+}
 
 use std::collections::HashMap;
 use std::io::{Read, Write};

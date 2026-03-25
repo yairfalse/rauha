@@ -78,11 +78,11 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!(%addr, "listening on gRPC");
 
     // Graceful shutdown: clean up network state on SIGTERM/SIGINT.
-    let shutdown = async {
-        let mut sigterm = tokio::signal::unix::signal(
-            tokio::signal::unix::SignalKind::terminate(),
-        ).expect("failed to register SIGTERM handler");
+    let mut sigterm = tokio::signal::unix::signal(
+        tokio::signal::unix::SignalKind::terminate(),
+    ).map_err(|e| anyhow::anyhow!("failed to register SIGTERM handler: {e}"))?;
 
+    let shutdown = async move {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {
                 tracing::info!("received SIGINT, shutting down");
@@ -93,25 +93,23 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    Server::builder()
+    let serve_result = Server::builder()
         .add_service(ZoneServiceServer::new(zone_svc))
         .add_service(ContainerServiceServer::new(container_svc))
         .add_service(ImageServiceServer::new(image_svc))
         .serve_with_shutdown(addr, shutdown)
-        .await?;
+        .await;
 
-    // Cleanup: remove nftables table and network bridge.
-    tracing::info!("cleaning up network state");
-    #[cfg(target_os = "linux")]
-    {
-        if let Err(e) = backend::linux::nftables::cleanup_nat() {
-            tracing::warn!(%e, "failed to clean up nftables table");
-        }
-        if let Err(e) = backend::linux::network::destroy_bridge() {
-            tracing::warn!(%e, "failed to destroy network bridge");
-        }
-    }
+    // Cleanup runs unconditionally — even if serve errored.
+    cleanup_network();
 
     tracing::info!("rauhad stopped");
+    serve_result?;
     Ok(())
+}
+
+fn cleanup_network() {
+    tracing::info!("cleaning up network state");
+    #[cfg(target_os = "linux")]
+    backend::linux::cleanup_network();
 }
