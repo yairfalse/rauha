@@ -413,6 +413,22 @@ impl IsolationBackend for MacosBackend {
     fn name(&self) -> &str {
         "macos-virtualization"
     }
+
+    fn shim_request(
+        &self,
+        zone_name: &str,
+        request: &ShimRequest,
+    ) -> Result<ShimResponse> {
+        self.send_to_guest(zone_name, request)
+    }
+
+    fn connect_vsock_port(
+        &self,
+        zone_name: &str,
+        port: u32,
+    ) -> Result<std::os::fd::OwnedFd> {
+        self.vm_manager.connect_vsock(zone_name, port)
+    }
 }
 
 impl MacosBackend {

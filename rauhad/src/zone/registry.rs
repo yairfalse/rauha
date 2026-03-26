@@ -490,66 +490,107 @@ impl ZoneRegistry {
             .map(|(name, _)| name.clone())
     }
 
-    /// Send a shim request for a zone. Delegates to the backend.
+    /// Send a shim request for a zone.
+    ///
+    /// On Linux, connects via Unix socket to the zone's shim process.
+    /// On macOS (or when no Unix socket exists), delegates to the backend,
+    /// which routes through vsock to the guest agent inside the VM.
     pub async fn shim_request(
         &self,
         zone_name: &str,
         request: &rauha_common::shim::ShimRequest,
     ) -> Result<rauha_common::shim::ShimResponse> {
-        // The shim communication is handled by the Linux backend.
-        // We need to use a generic approach — send via Unix socket directly.
         let socket_path = format!("/run/rauha/shim-{zone_name}.sock");
         let path = std::path::PathBuf::from(&socket_path);
 
-        if !path.exists() {
-            return Err(RauhaError::ShimError {
-                zone: zone_name.into(),
-                message: "shim socket not found".into(),
-            });
-        }
-
-        // Use spawn_blocking since Unix socket I/O is sync.
-        let request_clone = rauha_common::shim::encode(request).map_err(|e| {
-            RauhaError::ShimError {
-                zone: zone_name.into(),
-                message: format!("failed to encode request: {e}"),
-            }
-        })?;
-
-        let zone_name_owned = zone_name.to_string();
-        tokio::task::spawn_blocking(move || {
-            use std::io::Write;
-            let mut stream = std::os::unix::net::UnixStream::connect(&path).map_err(|e| {
+        if path.exists() {
+            // Linux: connect via Unix socket to the shim process.
+            let request_clone = rauha_common::shim::encode(request).map_err(|e| {
                 RauhaError::ShimError {
-                    zone: zone_name_owned.clone(),
-                    message: format!("failed to connect to shim: {e}"),
+                    zone: zone_name.into(),
+                    message: format!("failed to encode request: {e}"),
                 }
             })?;
 
-            stream
-                .set_read_timeout(Some(std::time::Duration::from_secs(30)))
-                .ok();
-            stream
-                .set_write_timeout(Some(std::time::Duration::from_secs(10)))
-                .ok();
+            let zone_name_owned = zone_name.to_string();
+            tokio::task::spawn_blocking(move || {
+                use std::io::Write;
+                let mut stream =
+                    std::os::unix::net::UnixStream::connect(&path).map_err(|e| {
+                        RauhaError::ShimError {
+                            zone: zone_name_owned.clone(),
+                            message: format!("failed to connect to shim: {e}"),
+                        }
+                    })?;
 
-            stream.write_all(&request_clone).map_err(|e| RauhaError::ShimError {
-                zone: zone_name_owned.clone(),
-                message: format!("failed to send request: {e}"),
-            })?;
-            stream.flush().map_err(|e| RauhaError::ShimError {
-                zone: zone_name_owned.clone(),
-                message: format!("failed to flush: {e}"),
-            })?;
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(30)))
+                    .ok();
+                stream
+                    .set_write_timeout(Some(std::time::Duration::from_secs(10)))
+                    .ok();
 
-            rauha_common::shim::decode_from::<rauha_common::shim::ShimResponse>(&mut stream)
-                .map_err(|e| RauhaError::ShimError {
-                    zone: zone_name_owned,
-                    message: format!("failed to read response: {e}"),
-                })
-        })
-        .await
-        .map_err(|e| RauhaError::BackendError(format!("shim task panicked: {e}")))?
+                stream
+                    .write_all(&request_clone)
+                    .map_err(|e| RauhaError::ShimError {
+                        zone: zone_name_owned.clone(),
+                        message: format!("failed to send request: {e}"),
+                    })?;
+                stream.flush().map_err(|e| RauhaError::ShimError {
+                    zone: zone_name_owned.clone(),
+                    message: format!("failed to flush: {e}"),
+                })?;
+
+                rauha_common::shim::decode_from::<rauha_common::shim::ShimResponse>(&mut stream)
+                    .map_err(|e| RauhaError::ShimError {
+                        zone: zone_name_owned,
+                        message: format!("failed to read response: {e}"),
+                    })
+            })
+            .await
+            .map_err(|e| RauhaError::BackendError(format!("shim task panicked: {e}")))?
+        } else {
+            // macOS: no Unix socket — route through backend (vsock to guest agent).
+            let backend = self.backend.clone();
+            let zone = zone_name.to_string();
+            let request = request.clone();
+            tokio::task::spawn_blocking(move || backend.shim_request(&zone, &request))
+                .await
+                .map_err(|e| RauhaError::BackendError(format!("shim task panicked: {e}")))?
+        }
+    }
+
+    /// Connect to a vsock port on a zone's VM for exec I/O relay.
+    ///
+    /// Returns a tokio-compatible async stream wrapping the vsock fd.
+    /// Only works on macOS (where exec sessions use vsock); on Linux,
+    /// exec sessions use Unix sockets and this method is never called.
+    pub async fn connect_exec_vsock(
+        &self,
+        zone_name: &str,
+        port: u32,
+    ) -> Result<tokio::net::UnixStream> {
+        let backend = self.backend.clone();
+        let zone = zone_name.to_string();
+        let fd = tokio::task::spawn_blocking(move || backend.connect_vsock_port(&zone, port))
+            .await
+            .map_err(|e| {
+                RauhaError::BackendError(format!("vsock connect task panicked: {e}"))
+            })??;
+
+        // Wrap the vsock fd as a tokio UnixStream. The fd is a SOCK_STREAM
+        // socket — read/write/poll all work the same regardless of address
+        // family (AF_VSOCK vs AF_UNIX). tokio's kqueue registration doesn't
+        // care about the socket type.
+        use std::os::fd::{FromRawFd, IntoRawFd};
+        use std::os::unix::net::UnixStream as StdUnixStream;
+        let raw_fd = fd.into_raw_fd();
+        let std_stream = unsafe { StdUnixStream::from_raw_fd(raw_fd) };
+        std_stream
+            .set_nonblocking(true)
+            .map_err(|e| RauhaError::BackendError(format!("set_nonblocking failed: {e}")))?;
+        tokio::net::UnixStream::from_std(std_stream)
+            .map_err(|e| RauhaError::BackendError(format!("tokio wrap failed: {e}")))
     }
 }
 

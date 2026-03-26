@@ -1804,4 +1804,87 @@ mode = "quantum-entangled"
 
         assert_grpc_error(result, tonic::Code::InvalidArgument, "unknown network mode");
     }
+
+    /// Exec into a running container and verify output.
+    ///
+    /// This validates the full exec pipeline: ExecStream RPC → shim/guest agent
+    /// forks a process with PTY → output relayed back through gRPC stream.
+    #[tokio::test]
+    async fn case_055_exec_in_running_container() {
+        use tokio_stream::StreamExt;
+
+        let mut zone_cl = zone_client().await;
+        let mut ctr_cl = container_client().await;
+        let mut img_cl = image_client().await;
+        let zone_name = unique_zone_name("055");
+
+        ensure_alpine(&mut img_cl).await;
+        create_zone(&mut zone_cl, &zone_name, &bridged_policy_toml()).await;
+        sleep(Duration::from_millis(ZONE_SETTLE_MS)).await;
+
+        // Start a long-running container to exec into.
+        let ctr_id = create_and_start_container(
+            &mut ctr_cl,
+            &zone_name,
+            "exec-target",
+            vec!["/bin/sleep".into(), "60".into()],
+        )
+        .await;
+
+        // Build the exec stream: first message is Start, then we close input.
+        let start_msg = pb::container::ExecStreamRequest {
+            message: Some(pb::container::exec_stream_request::Message::Start(
+                pb::container::ExecStreamStart {
+                    container_id: ctr_id.clone(),
+                    command: vec!["/bin/echo".into(), "hello-from-exec".into()],
+                    env: Default::default(),
+                    tty: true,
+                },
+            )),
+        };
+
+        let in_stream = tokio_stream::once(start_msg);
+        let response = ctr_cl
+            .exec_stream(in_stream)
+            .await
+            .expect("ExecStream must succeed");
+
+        let mut out_stream = response.into_inner();
+
+        // Collect stdout output with timeout.
+        let mut output = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+
+        loop {
+            match tokio::time::timeout_at(deadline, out_stream.next()).await {
+                Ok(Some(Ok(msg))) => {
+                    if let Some(pb::container::exec_stream_response::Message::StdoutData(data)) =
+                        msg.message
+                    {
+                        output.extend_from_slice(&data);
+                    }
+                }
+                Ok(Some(Err(e))) => {
+                    panic!("exec stream error: {e}");
+                }
+                Ok(None) => break, // stream ended
+                Err(_) => break,   // timeout
+            }
+        }
+
+        let output_str = String::from_utf8_lossy(&output);
+        assert!(
+            output_str.contains("hello-from-exec"),
+            "exec output must contain the echoed string, got: {output_str:?}"
+        );
+
+        // Cleanup.
+        let _ = ctr_cl
+            .stop_container(pb::container::StopContainerRequest {
+                container_id: ctr_id,
+                timeout_seconds: 5,
+            })
+            .await;
+        delete_zone_checked(&mut zone_cl, &zone_name).await;
+    }
 }

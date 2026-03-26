@@ -542,18 +542,39 @@ impl ContainerService for ContainerServiceImpl {
             .await
             .map_err(|e| Status::internal(format!("shim exec failed: {e}")))?;
 
-        let socket_path = match response {
-            rauha_common::shim::ShimResponse::AttachReady { socket_path } => socket_path,
+        // Connect to the exec session via the appropriate transport:
+        // - Linux shim: Unix socket (socket_path)
+        // - macOS guest agent: vsock (vsock_port)
+        let stream = match response {
+            rauha_common::shim::ShimResponse::ExecReady {
+                socket_path: Some(path),
+                ..
+            } => tokio::net::UnixStream::connect(&path).await.map_err(|e| {
+                Status::internal(format!("failed to connect to exec socket: {e}"))
+            })?,
+            rauha_common::shim::ShimResponse::ExecReady {
+                vsock_port: Some(port),
+                ..
+            } => self
+                .registry
+                .connect_exec_vsock(&zone_name, port)
+                .await
+                .map_err(|e| {
+                    Status::internal(format!("failed to connect exec vsock: {e}"))
+                })?,
+            // Legacy: accept AttachReady for backward compat with older shims.
+            rauha_common::shim::ShimResponse::AttachReady { socket_path } => {
+                tokio::net::UnixStream::connect(&socket_path)
+                    .await
+                    .map_err(|e| {
+                        Status::internal(format!("failed to connect to attach socket: {e}"))
+                    })?
+            }
             rauha_common::shim::ShimResponse::Error { message } => {
                 return Err(Status::internal(format!("exec failed: {message}")));
             }
             _ => return Err(Status::internal("unexpected shim response")),
         };
-
-        // Connect to the attach socket.
-        let stream = tokio::net::UnixStream::connect(&socket_path)
-            .await
-            .map_err(|e| Status::internal(format!("failed to connect to attach socket: {e}")))?;
 
         let (read_half, write_half) = stream.into_split();
 
