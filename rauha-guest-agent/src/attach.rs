@@ -185,19 +185,84 @@ pub fn serve_vsock_session(pty_master_fd: i32, vsock_port: u32) -> anyhow::Resul
         );
     }
 
+    // Set listener to nonblocking so we can poll with a timeout before accept.
+    let flags = unsafe { libc::fcntl(listen_fd, libc::F_GETFL) };
+    if flags >= 0 {
+        unsafe { libc::fcntl(listen_fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
+    }
+
     tracing::info!(port = vsock_port, "exec session vsock listening");
 
     // Spawn relay thread.
     std::thread::spawn(move || {
-        // Accept one connection.
-        let conn_fd =
-            unsafe { libc::accept(listen_fd, std::ptr::null_mut(), std::ptr::null_mut()) };
+        // Accept with a 30s timeout to avoid leaking the PTY if the host
+        // never connects (client crash, vsock failure, etc.).
+        const ACCEPT_TIMEOUT_MS: i32 = 30_000;
+
+        let conn_fd = loop {
+            let mut poll_fds = [PollFd::new(
+                unsafe { BorrowedFd::borrow_raw(listen_fd) },
+                PollFlags::POLLIN,
+            )];
+
+            match poll(&mut poll_fds, PollTimeout::from(ACCEPT_TIMEOUT_MS as u16)) {
+                Ok(0) => {
+                    tracing::warn!(
+                        port = vsock_port,
+                        "exec session vsock accept timed out; closing PTY"
+                    );
+                    unsafe {
+                        libc::close(pty_master_fd);
+                        libc::close(listen_fd);
+                    }
+                    return;
+                }
+                Ok(_) => {}
+                Err(nix::errno::Errno::EINTR) => continue,
+                Err(e) => {
+                    tracing::error!(%e, "exec session vsock poll failed");
+                    unsafe {
+                        libc::close(pty_master_fd);
+                        libc::close(listen_fd);
+                    }
+                    return;
+                }
+            }
+
+            let fd = unsafe {
+                libc::accept(listen_fd, std::ptr::null_mut(), std::ptr::null_mut())
+            };
+            if fd >= 0 {
+                break fd;
+            }
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::WouldBlock {
+                continue;
+            }
+            tracing::error!(%err, "exec session vsock accept failed");
+            unsafe {
+                libc::close(pty_master_fd);
+                libc::close(listen_fd);
+            }
+            return;
+        };
+
         unsafe { libc::close(listen_fd); }
 
-        if conn_fd < 0 {
-            tracing::error!("exec session vsock accept failed: {}", std::io::Error::last_os_error());
-            unsafe { libc::close(pty_master_fd); }
-            return;
+        // Set send/receive timeouts on the vsock connection to prevent
+        // indefinite blocking if the peer stops reading or writing.
+        let timeout = libc::timeval { tv_sec: 30, tv_usec: 0 };
+        unsafe {
+            libc::setsockopt(
+                conn_fd, libc::SOL_SOCKET, libc::SO_SNDTIMEO,
+                &timeout as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::timeval>() as u32,
+            );
+            libc::setsockopt(
+                conn_fd, libc::SOL_SOCKET, libc::SO_RCVTIMEO,
+                &timeout as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::timeval>() as u32,
+            );
         }
 
         // Relay loop using poll(2): PTY master <-> vsock connection.

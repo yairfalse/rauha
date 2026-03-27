@@ -549,7 +549,7 @@ impl ZoneRegistry {
             })
             .await
             .map_err(|e| RauhaError::BackendError(format!("shim task panicked: {e}")))?
-        } else {
+        } else if cfg!(target_os = "macos") {
             // macOS: no Unix socket — route through backend (vsock to guest agent).
             let backend = self.backend.clone();
             let zone = zone_name.to_string();
@@ -557,19 +557,24 @@ impl ZoneRegistry {
             tokio::task::spawn_blocking(move || backend.shim_request(&zone, &request))
                 .await
                 .map_err(|e| RauhaError::BackendError(format!("shim task panicked: {e}")))?
+        } else {
+            return Err(RauhaError::ShimError {
+                zone: zone_name.into(),
+                message: format!("shim socket not found at {socket_path}"),
+            });
         }
     }
 
     /// Connect to a vsock port on a zone's VM for exec I/O relay.
     ///
-    /// Returns a tokio-compatible async stream wrapping the vsock fd.
-    /// Only works on macOS (where exec sessions use vsock); on Linux,
-    /// exec sessions use Unix sockets and this method is never called.
+    /// Returns an async stream wrapping the vsock fd. Only works on macOS
+    /// (where exec sessions use vsock); on Linux, exec sessions use Unix
+    /// sockets and this method is never called.
     pub async fn connect_exec_vsock(
         &self,
         zone_name: &str,
         port: u32,
-    ) -> Result<tokio::net::UnixStream> {
+    ) -> Result<VsockAsyncStream> {
         let backend = self.backend.clone();
         let zone = zone_name.to_string();
         let fd = tokio::task::spawn_blocking(move || backend.connect_vsock_port(&zone, port))
@@ -578,19 +583,99 @@ impl ZoneRegistry {
                 RauhaError::BackendError(format!("vsock connect task panicked: {e}"))
             })??;
 
-        // Wrap the vsock fd as a tokio UnixStream. The fd is a SOCK_STREAM
-        // socket — read/write/poll all work the same regardless of address
-        // family (AF_VSOCK vs AF_UNIX). tokio's kqueue registration doesn't
-        // care about the socket type.
-        use std::os::fd::{FromRawFd, IntoRawFd};
-        use std::os::unix::net::UnixStream as StdUnixStream;
-        let raw_fd = fd.into_raw_fd();
-        let std_stream = unsafe { StdUnixStream::from_raw_fd(raw_fd) };
-        std_stream
-            .set_nonblocking(true)
-            .map_err(|e| RauhaError::BackendError(format!("set_nonblocking failed: {e}")))?;
-        tokio::net::UnixStream::from_std(std_stream)
-            .map_err(|e| RauhaError::BackendError(format!("tokio wrap failed: {e}")))
+        VsockAsyncStream::new(fd)
+            .map_err(|e| RauhaError::BackendError(format!("async vsock wrap failed: {e}")))
+    }
+}
+
+/// Async I/O wrapper for a vsock file descriptor.
+///
+/// Uses `AsyncFd` to provide `AsyncRead + AsyncWrite` on a raw vsock fd
+/// from Virtualization.framework. This avoids type-punning the fd as a
+/// Unix stream — the wrapper is honest about what it wraps.
+pub(crate) struct VsockAsyncStream {
+    inner: tokio::io::unix::AsyncFd<std::fs::File>,
+}
+
+impl VsockAsyncStream {
+    fn new(fd: std::os::fd::OwnedFd) -> std::io::Result<Self> {
+        use std::os::fd::AsRawFd;
+        let file = std::fs::File::from(fd);
+        // AsyncFd requires the fd to be in nonblocking mode.
+        let raw = file.as_raw_fd();
+        let flags = unsafe { libc::fcntl(raw, libc::F_GETFL) };
+        if flags >= 0 {
+            unsafe { libc::fcntl(raw, libc::F_SETFL, flags | libc::O_NONBLOCK) };
+        }
+        Ok(Self {
+            inner: tokio::io::unix::AsyncFd::new(file)?,
+        })
+    }
+}
+
+impl tokio::io::AsyncRead for VsockAsyncStream {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        loop {
+            let mut guard = match self.inner.poll_read_ready(cx) {
+                std::task::Poll::Ready(Ok(g)) => g,
+                std::task::Poll::Ready(Err(e)) => return std::task::Poll::Ready(Err(e)),
+                std::task::Poll::Pending => return std::task::Poll::Pending,
+            };
+
+            match guard.try_io(|inner| {
+                use std::io::Read;
+                (&*inner.get_ref()).read(buf.initialize_unfilled())
+            }) {
+                Ok(Ok(n)) => {
+                    buf.advance(n);
+                    return std::task::Poll::Ready(Ok(()));
+                }
+                Ok(Err(e)) => return std::task::Poll::Ready(Err(e)),
+                Err(_would_block) => continue,
+            }
+        }
+    }
+}
+
+impl tokio::io::AsyncWrite for VsockAsyncStream {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        loop {
+            let mut guard = match self.inner.poll_write_ready(cx) {
+                std::task::Poll::Ready(Ok(g)) => g,
+                std::task::Poll::Ready(Err(e)) => return std::task::Poll::Ready(Err(e)),
+                std::task::Poll::Pending => return std::task::Poll::Pending,
+            };
+
+            match guard.try_io(|inner| {
+                use std::io::Write;
+                (&*inner.get_ref()).write(buf)
+            }) {
+                Ok(result) => return std::task::Poll::Ready(result),
+                Err(_would_block) => continue,
+            }
+        }
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
     }
 }
 
