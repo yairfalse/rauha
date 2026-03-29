@@ -7,7 +7,7 @@
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ShimRequest {
     CreateContainer {
         id: String,
@@ -49,7 +49,7 @@ pub enum ShimRequest {
     },
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ShimResponse {
     Ok,
     Created { pid: u32 },
@@ -64,6 +64,16 @@ pub enum ShimResponse {
     /// An attach/exec session is ready. Connect to the socket at `socket_path`
     /// for bidirectional I/O with the container process.
     AttachReady { socket_path: String },
+    /// An exec session is ready. Connect via the appropriate transport for
+    /// bidirectional I/O with the exec process.
+    ///
+    /// Linux shim sets `socket_path`; macOS guest agent sets `vsock_port`.
+    ExecReady {
+        /// Unix socket path (Linux shim).
+        socket_path: Option<String>,
+        /// Vsock port number (macOS guest agent).
+        vsock_port: Option<u32>,
+    },
 }
 
 /// Encode a message to the wire format: [u32 LE length][postcard bytes].
@@ -213,6 +223,14 @@ mod tests {
             },
             ShimResponse::AttachReady {
                 socket_path: "/run/rauha/containers/abc/attach-123.sock".into(),
+            },
+            ShimResponse::ExecReady {
+                socket_path: Some("/run/rauha/containers/abc/exec-456.sock".into()),
+                vsock_port: None,
+            },
+            ShimResponse::ExecReady {
+                socket_path: None,
+                vsock_port: Some(6001),
             },
         ];
 

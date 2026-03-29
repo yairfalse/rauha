@@ -3,6 +3,7 @@
 //! Listens on virtio-vsock port 5123 for ShimRequest messages from the
 //! host rauhad daemon. This is the macOS equivalent of rauha-shim.
 
+mod attach;
 mod container;
 
 use std::collections::HashMap;
@@ -156,9 +157,54 @@ fn handle_request(state: &mut AgentState, request: ShimRequest) -> ShimResponse 
         ShimRequest::Attach { .. } => ShimResponse::Error {
             message: "attach not yet supported in guest agent".into(),
         },
-        ShimRequest::Exec { .. } => ShimResponse::Error {
-            message: "exec not yet supported in guest agent".into(),
-        },
+        ShimRequest::Exec {
+            id,
+            command,
+            env,
+            pty,
+        } => {
+            tracing::info!(container = %id, ?command, pty, "exec in container");
+
+            if !pty {
+                return ShimResponse::Error {
+                    message: "non-PTY exec not yet supported".into(),
+                };
+            }
+
+            // Verify container exists and is running.
+            match state.get_state(&id) {
+                Some((_pid, status)) if status == "running" => {}
+                Some((_, status)) => {
+                    return ShimResponse::Error {
+                        message: format!("container {id} is in {status} state, not running"),
+                    };
+                }
+                None => {
+                    return ShimResponse::Error {
+                        message: format!("container {id} not found"),
+                    };
+                }
+            }
+
+            let vsock_port = attach::allocate_session_port();
+
+            match attach::fork_and_exec_pty(&state.rootfs_root, &id, &command, &env) {
+                Ok((master_fd, _pid)) => {
+                    match attach::serve_vsock_session(master_fd, vsock_port) {
+                        Ok(()) => ShimResponse::ExecReady {
+                            socket_path: None,
+                            vsock_port: Some(vsock_port),
+                        },
+                        Err(e) => ShimResponse::Error {
+                            message: format!("failed to create vsock session: {e}"),
+                        },
+                    }
+                }
+                Err(e) => ShimResponse::Error {
+                    message: format!("exec failed: {e}"),
+                },
+            }
+        }
     }
 }
 

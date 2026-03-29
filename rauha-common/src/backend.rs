@@ -1,5 +1,6 @@
 use crate::container::{ContainerHandle, ContainerSpec};
 use crate::error::Result;
+use crate::shim::{ShimRequest, ShimResponse};
 use crate::zone::{IsolationModel, IsolationReport, ZoneConfig, ZoneHandle, ZonePolicy, ZoneStats, ZoneType};
 
 /// The core abstraction for platform-specific isolation.
@@ -59,4 +60,29 @@ pub trait IsolationBackend: Send + Sync {
 
     /// The name of this backend (e.g., "linux-ebpf", "macos-virt").
     fn name(&self) -> &str;
+
+    /// Send a shim request via the backend's native transport.
+    ///
+    /// On macOS, this routes through vsock to the guest agent inside the VM.
+    /// On Linux, the registry handles shim communication directly via Unix
+    /// socket, so this default (error) is fine.
+    fn shim_request(&self, _zone_name: &str, _request: &ShimRequest) -> Result<ShimResponse> {
+        Err(crate::error::RauhaError::BackendError(
+            "shim_request not supported by this backend".into(),
+        ))
+    }
+
+    /// Connect to a vsock port on a zone's VM for exec I/O relay.
+    ///
+    /// Returns a raw fd for bidirectional streaming. Only implemented by the
+    /// macOS backend — Linux exec uses Unix sockets instead.
+    fn connect_vsock_port(
+        &self,
+        _zone_name: &str,
+        _port: u32,
+    ) -> Result<std::os::fd::OwnedFd> {
+        Err(crate::error::RauhaError::BackendError(
+            "vsock not available on this backend".into(),
+        ))
+    }
 }

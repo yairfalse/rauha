@@ -555,66 +555,50 @@ impl ContainerService for ContainerServiceImpl {
             .await
             .map_err(|e| Status::internal(format!("shim exec failed: {e}")))?;
 
-        let socket_path = match response {
-            rauha_common::shim::ShimResponse::AttachReady { socket_path } => socket_path,
+        let (tx, rx) = mpsc::channel(256);
+
+        // Connect to the exec session and spawn relay tasks.
+        // The transport differs by platform but the relay logic is identical.
+        match response {
+            rauha_common::shim::ShimResponse::ExecReady {
+                socket_path: Some(path),
+                ..
+            } => {
+                let stream = tokio::net::UnixStream::connect(&path).await.map_err(|e| {
+                    Status::internal(format!("failed to connect to exec socket: {e}"))
+                })?;
+                let (r, w) = stream.into_split();
+                spawn_exec_relay(r, w, tx, in_stream);
+            }
+            rauha_common::shim::ShimResponse::ExecReady {
+                vsock_port: Some(port),
+                ..
+            } => {
+                let stream = self
+                    .registry
+                    .connect_exec_vsock(&zone_name, port)
+                    .await
+                    .map_err(|e| {
+                        Status::internal(format!("failed to connect exec vsock: {e}"))
+                    })?;
+                let (r, w) = tokio::io::split(stream);
+                spawn_exec_relay(r, w, tx, in_stream);
+            }
+            // Legacy: accept AttachReady for backward compat with older shims.
+            rauha_common::shim::ShimResponse::AttachReady { socket_path } => {
+                let stream = tokio::net::UnixStream::connect(&socket_path)
+                    .await
+                    .map_err(|e| {
+                        Status::internal(format!("failed to connect to attach socket: {e}"))
+                    })?;
+                let (r, w) = stream.into_split();
+                spawn_exec_relay(r, w, tx, in_stream);
+            }
             rauha_common::shim::ShimResponse::Error { message } => {
                 return Err(Status::internal(format!("exec failed: {message}")));
             }
             _ => return Err(Status::internal("unexpected shim response")),
         };
-
-        // Connect to the attach socket.
-        let stream = tokio::net::UnixStream::connect(&socket_path)
-            .await
-            .map_err(|e| Status::internal(format!("failed to connect to attach socket: {e}")))?;
-
-        let (read_half, write_half) = stream.into_split();
-
-        let (tx, rx) = mpsc::channel(256);
-
-        // Read from attach socket → send to gRPC client.
-        tokio::spawn(async move {
-            use tokio::io::AsyncReadExt;
-            let mut reader = read_half;
-            let mut buf = [0u8; 4096];
-            loop {
-                match reader.read(&mut buf).await {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        let resp = pb::container::ExecStreamResponse {
-                            message: Some(
-                                pb::container::exec_stream_response::Message::StdoutData(
-                                    buf[..n].to_vec(),
-                                ),
-                            ),
-                        };
-                        if tx.send(Ok(resp)).await.is_err() {
-                            break;
-                        }
-                    }
-                    Err(_) => break,
-                }
-            }
-        });
-
-        // Read from gRPC client → write to attach socket.
-        tokio::spawn(async move {
-            use tokio::io::AsyncWriteExt;
-            let mut writer = write_half;
-            while let Some(Ok(msg)) = in_stream.next().await {
-                match msg.message {
-                    Some(pb::container::exec_stream_request::Message::StdinData(data)) => {
-                        if writer.write_all(&data).await.is_err() {
-                            break;
-                        }
-                    }
-                    Some(pb::container::exec_stream_request::Message::Resize(_resize)) => {
-                        // TODO: send TIOCSWINSZ to PTY via shim
-                    }
-                    _ => {}
-                }
-            }
-        });
 
         Ok(Response::new(ReceiverStream::new(rx)))
     }
@@ -726,6 +710,67 @@ impl ContainerService for ContainerServiceImpl {
             _ => Err(Status::internal("unexpected shim response")),
         }
     }
+}
+
+/// Spawn read and write relay tasks between an exec I/O stream and gRPC.
+///
+/// Generic over the stream type so it works with both Unix sockets (Linux)
+/// and vsock streams (macOS).
+fn spawn_exec_relay<R, W>(
+    reader: R,
+    writer: W,
+    tx: mpsc::Sender<Result<pb::container::ExecStreamResponse, Status>>,
+    in_stream: Streaming<pb::container::ExecStreamRequest>,
+) where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+    W: tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    use tokio_stream::StreamExt;
+
+    // Read from exec stream → send to gRPC client.
+    tokio::spawn(async move {
+        use tokio::io::AsyncReadExt;
+        let mut reader = reader;
+        let mut buf = [0u8; 4096];
+        loop {
+            match reader.read(&mut buf).await {
+                Ok(0) => break,
+                Ok(n) => {
+                    let resp = pb::container::ExecStreamResponse {
+                        message: Some(
+                            pb::container::exec_stream_response::Message::StdoutData(
+                                buf[..n].to_vec(),
+                            ),
+                        ),
+                    };
+                    if tx.send(Ok(resp)).await.is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    // Read from gRPC client → write to exec stream.
+    tokio::spawn(async move {
+        use tokio::io::AsyncWriteExt;
+        let mut writer = writer;
+        let mut in_stream = in_stream;
+        while let Some(Ok(msg)) = in_stream.next().await {
+            match msg.message {
+                Some(pb::container::exec_stream_request::Message::StdinData(data)) => {
+                    if writer.write_all(&data).await.is_err() {
+                        break;
+                    }
+                }
+                Some(pb::container::exec_stream_request::Message::Resize(_resize)) => {
+                    // TODO: send TIOCSWINSZ to PTY via shim
+                }
+                _ => {}
+            }
+        }
+    });
 }
 
 // --- Image Service ---

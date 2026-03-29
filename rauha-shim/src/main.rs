@@ -172,7 +172,10 @@ fn handle_request(state: &mut ShimState, request: ShimRequest) -> ShimResponse {
             ) {
                 Ok((master_fd, _pid)) => {
                     match attach::serve_attach_session(&id, &session_id, master_fd) {
-                        Ok(socket_path) => ShimResponse::AttachReady { socket_path },
+                        Ok(socket_path) => ShimResponse::ExecReady {
+                            socket_path: Some(socket_path),
+                            vsock_port: None,
+                        },
                         Err(e) => ShimResponse::Error {
                             message: format!("failed to create attach session: {e}"),
                         },

@@ -373,6 +373,7 @@ impl VmManager {
     pub fn connect_vsock(
         &self,
         zone_name: &str,
+        port: u32,
     ) -> Result<std::os::fd::OwnedFd> {
         use std::os::fd::{FromRawFd, OwnedFd};
         use std::sync::{Arc, Condvar};
@@ -381,8 +382,6 @@ impl VmManager {
         let entry = vms.get(zone_name).ok_or_else(|| {
             RauhaError::BackendError(format!("VM not running for zone {zone_name}"))
         })?;
-
-        let port = entry.vsock_port;
 
         // We need to dispatch the vsock connect onto the VM's serial queue.
         // Use raw pointers to pass the VM reference into the queue closure.
@@ -476,6 +475,7 @@ impl VmManager {
     pub fn connect_vsock(
         &self,
         zone_name: &str,
+        _port: u32,
     ) -> Result<std::os::fd::OwnedFd> {
         Err(RauhaError::BackendError(format!(
             "vsock not available on this platform (zone: {zone_name})"

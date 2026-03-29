@@ -30,7 +30,7 @@ impl VsockConnection {
     /// Calls VmManager::connect_vsock() which does the ObjC connectToPort:
     /// call and returns a plain fd. We dup it into reader + writer halves.
     pub fn connect(vm_manager: &VmManager, zone_name: &str) -> Result<Self> {
-        let fd: OwnedFd = vm_manager.connect_vsock(zone_name)?;
+        let fd: OwnedFd = vm_manager.connect_vsock(zone_name, super::vm::GUEST_AGENT_VSOCK_PORT)?;
 
         // The vsock fd is full-duplex. Clone it so we have independent
         // File handles for reading and writing (avoids seek conflicts).
