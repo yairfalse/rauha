@@ -16,8 +16,7 @@ use server::pb::container::container_service_server::ContainerServiceServer;
 use server::pb::image::image_service_server::ImageServiceServer;
 
 const DEFAULT_ROOT: &str = if cfg!(target_os = "macos") {
-    // ~/Library/Application Support/Rauha
-    "/tmp/rauha" // Simplified for dev; production uses proper macOS path
+    "/tmp/rauha"
 } else {
     "/var/lib/rauha"
 };
@@ -68,8 +67,6 @@ async fn main() -> anyhow::Result<()> {
     ));
 
     // Reconcile persisted metadata with kernel state.
-    // Handles crash recovery: re-pushes zone policies to BPF maps,
-    // re-creates missing cgroups/netns, cleans up orphaned kernel state.
     registry.reconcile().await?;
 
     // Set up gRPC services.
@@ -77,24 +74,42 @@ async fn main() -> anyhow::Result<()> {
     let container_svc = server::ContainerServiceImpl::new(registry.clone());
     let image_svc = server::ImageServiceImpl::new(image_service);
 
-    // Determine socket path.
-    let socket_path = if cfg!(target_os = "macos") {
-        root_path.join("rauhad.sock")
-    } else {
-        PathBuf::from("/run/rauha/rauhad.sock")
+    let addr = "[::1]:9876".parse()?;
+    tracing::info!(%addr, "listening on gRPC");
+
+    // Graceful shutdown: clean up network state on SIGTERM/SIGINT.
+    let mut sigterm = tokio::signal::unix::signal(
+        tokio::signal::unix::SignalKind::terminate(),
+    ).map_err(|e| anyhow::anyhow!("failed to register SIGTERM handler: {e}"))?;
+
+    let shutdown = async move {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                tracing::info!("received SIGINT, shutting down");
+            }
+            _ = sigterm.recv() => {
+                tracing::info!("received SIGTERM, shutting down");
+            }
+        }
     };
 
-    // For development, also listen on a TCP port.
-    let addr = "[::1]:9876".parse()?;
-    tracing::info!(%addr, "listening on gRPC (TCP)");
-    tracing::info!(socket = %socket_path.display(), "socket path (Unix domain socket — not yet wired)");
-
-    Server::builder()
+    let serve_result = Server::builder()
         .add_service(ZoneServiceServer::new(zone_svc))
         .add_service(ContainerServiceServer::new(container_svc))
         .add_service(ImageServiceServer::new(image_svc))
-        .serve(addr)
-        .await?;
+        .serve_with_shutdown(addr, shutdown)
+        .await;
 
+    // Cleanup runs unconditionally — even if serve errored.
+    cleanup_network();
+
+    tracing::info!("rauhad stopped");
+    serve_result?;
     Ok(())
+}
+
+fn cleanup_network() {
+    tracing::info!("cleaning up network state");
+    #[cfg(target_os = "linux")]
+    backend::linux::cleanup_network();
 }
