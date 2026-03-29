@@ -2,11 +2,14 @@
 //!
 //! When a process opens a file, check if the file's inode belongs to a
 //! different zone. If so, deny unless the zones are allowed to communicate.
+//!
+//! Also triggers the one-shot offset self-test on first invocation.
 
 use aya_ebpf::programs::LsmContext;
 
-use crate::{lookup_caller_zone, is_cross_zone_allowed, read_file_ino, INODE_ZONE_MAP};
-use rauha_ebpf_common::ZONE_FLAG_GLOBAL;
+use crate::{lookup_caller_zone, is_cross_zone_allowed, read_file_ino, maybe_run_self_test,
+            count_decision, INODE_ZONE_MAP};
+use rauha_ebpf_common::{ZONE_FLAG_GLOBAL, PROG_FILE_OPEN};
 
 /// Called from the file_open LSM hook.
 ///
@@ -14,10 +17,15 @@ use rauha_ebpf_common::ZONE_FLAG_GLOBAL;
 ///
 /// Returns 0 to allow, -1 (EPERM) to deny.
 pub fn file_open(ctx: &LsmContext) -> i32 {
-    match try_file_open(ctx) {
-        Ok(ret) => ret,
-        Err(_) => 0, // On error, allow — fail open to avoid breaking the system.
-    }
+    // One-shot self-test: validates offset chain on first file_open after load.
+    unsafe { maybe_run_self_test() };
+
+    let (ret, is_error) = match try_file_open(ctx) {
+        Ok(ret) => (ret, false),
+        Err(_) => (0, true), // Fail open to avoid breaking the system.
+    };
+    count_decision(PROG_FILE_OPEN, ret == 0, is_error);
+    ret
 }
 
 #[inline(always)]

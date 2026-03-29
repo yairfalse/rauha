@@ -29,6 +29,8 @@ const MAP_NAMES: &[&str] = &[
     "ZONE_POLICY",
     "INODE_ZONE_MAP",
     "ZONE_ALLOWED_COMMS",
+    "SELF_TEST",
+    "ENFORCEMENT_COUNTERS",
 ];
 
 /// Expected kernel struct offsets hardcoded in the eBPF programs.
@@ -43,6 +45,10 @@ const EXPECTED_OFFSETS: &[(&str, &str, usize)] = &[
 ];
 
 pub struct EbpfManager {
+    // IMPORTANT: field order matters for drop safety. `program_fds` contains
+    // raw fd integers borrowed from `bpf`. Rust drops fields in declaration
+    // order, so `program_fds` (just integers, no Drop) drops before `bpf`
+    // (which owns the actual fds). Do not reorder these fields.
     bpf: Bpf,
     pin_path: PathBuf,
     /// Program fds recorded after attach, keyed by program name.
@@ -139,7 +145,13 @@ impl EbpfManager {
             "eBPF programs loaded and attached"
         );
 
-        Ok(Self { bpf, pin_path, program_fds })
+        let mut mgr = Self { bpf, pin_path, program_fds };
+
+        // Run the offset self-test: trigger file_open to populate SELF_TEST map,
+        // then verify the two cgroup_id derivation paths match.
+        mgr.verify_offset_self_test()?;
+
+        Ok(mgr)
     }
 
     /// Get a mutable reference to the inner Bpf object for map access.
@@ -194,6 +206,106 @@ impl EbpfManager {
         }
 
         Ok(statuses)
+    }
+
+    /// Verify that the hardcoded kernel struct offsets produce correct results.
+    ///
+    /// Triggers a file_open event (by opening /proc/self/status) which causes
+    /// the eBPF program to write both `bpf_get_current_cgroup_id()` and the
+    /// offset-chain-derived cgroup_id to the SELF_TEST map. If they differ,
+    /// the offsets are wrong for this kernel.
+    fn verify_offset_self_test(&mut self) -> Result<()> {
+        use aya::maps::Array;
+        use rauha_ebpf_common::SelfTestResult;
+
+        // Trigger file_open by opening a file. The eBPF hook will populate SELF_TEST.
+        let _trigger = fs::File::open("/proc/self/status");
+
+        // Brief sleep to let the BPF program execute.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        let map = Array::<_, SelfTestResult>::try_from(
+            self.bpf.map("SELF_TEST").ok_or_else(|| RauhaError::EbpfError {
+                message: "SELF_TEST map not found".into(),
+                hint: "rebuild eBPF programs with `cargo xtask build-ebpf`".into(),
+            })?,
+        )
+        .map_err(|e| RauhaError::EbpfError {
+            message: format!("failed to open SELF_TEST map: {e}"),
+            hint: "check eBPF object was built correctly".into(),
+        })?;
+
+        let result = map.get(&0, 0).map_err(|e| RauhaError::EbpfError {
+            message: format!("failed to read SELF_TEST map: {e}"),
+            hint: "eBPF program may not have executed yet".into(),
+        })?;
+
+        if result.helper_cgroup_id == 0 && result.offset_cgroup_id == 0 {
+            tracing::warn!(
+                "offset self-test inconclusive — file_open hook may not have fired. \
+                 Continuing with pahole validation only."
+            );
+            return Ok(());
+        }
+
+        if result.helper_cgroup_id != result.offset_cgroup_id {
+            return Err(RauhaError::EbpfError {
+                message: format!(
+                    "offset self-test FAILED: bpf_get_current_cgroup_id()={} but \
+                     offset chain produced {}. Hardcoded struct offsets are wrong \
+                     for this kernel.",
+                    result.helper_cgroup_id, result.offset_cgroup_id
+                ),
+                hint: "update offsets in rauha-ebpf/src/main.rs using \
+                       `pahole -C task_struct /sys/kernel/btf/vmlinux` and rebuild"
+                    .into(),
+            });
+        }
+
+        tracing::info!(
+            cgroup_id = result.helper_cgroup_id,
+            "offset self-test passed — kernel struct offsets verified"
+        );
+        Ok(())
+    }
+
+    /// Read per-hook enforcement counters, summed across all CPUs.
+    ///
+    /// Returns a vec of (program_name, counters) tuples.
+    pub fn read_enforcement_counters(&self) -> Result<Vec<(String, rauha_ebpf_common::EnforcementCounters)>> {
+        use aya::maps::PerCpuArray;
+        use rauha_ebpf_common::EnforcementCounters;
+
+        let map = PerCpuArray::<_, EnforcementCounters>::try_from(
+            self.bpf.map("ENFORCEMENT_COUNTERS").ok_or_else(|| RauhaError::EbpfError {
+                message: "ENFORCEMENT_COUNTERS map not found".into(),
+                hint: "rebuild eBPF programs with `cargo xtask build-ebpf`".into(),
+            })?,
+        )
+        .map_err(|e| RauhaError::EbpfError {
+            message: format!("failed to open ENFORCEMENT_COUNTERS map: {e}"),
+            hint: "check eBPF object was built correctly".into(),
+        })?;
+
+        let mut results = Vec::new();
+        for (idx, &name) in LSM_PROGRAMS.iter().enumerate() {
+            let per_cpu = map.get(&(idx as u32), 0).map_err(|e| RauhaError::EbpfError {
+                message: format!("failed to read counters for {name}: {e}"),
+                hint: "".into(),
+            })?;
+
+            // Sum across all CPUs.
+            let mut total = EnforcementCounters { allow: 0, deny: 0, error: 0 };
+            for cpu_val in per_cpu.iter() {
+                total.allow += cpu_val.allow;
+                total.deny += cpu_val.deny;
+                total.error += cpu_val.error;
+            }
+
+            results.push((name.to_string(), total));
+        }
+
+        Ok(results)
     }
 
     /// Unpin all maps (called on clean shutdown).

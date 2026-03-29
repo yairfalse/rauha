@@ -173,106 +173,35 @@ impl MapManager {
         }
     }
 
-    /// Register all inodes in a directory tree as belonging to a zone.
+    /// Insert a batch of pre-collected inodes into the INODE_ZONE_MAP.
     ///
-    /// Walks `rootfs_path` recursively and registers each file's inode in
-    /// INODE_ZONE_MAP. Stops at `max_inodes` to avoid filling the map.
-    /// Returns the number of inodes registered.
-    pub fn register_rootfs_inodes(
-        bpf: &mut Bpf,
-        rootfs_path: &std::path::Path,
-        zone_id: u32,
-        max_inodes: u32,
-    ) -> Result<u32> {
-        use std::os::unix::fs::MetadataExt;
-
+    /// This is the BPF-touching half of inode registration. Call
+    /// `collect_rootfs_inodes` first (outside any lock) to get the inode list,
+    /// then call this with the lock held briefly.
+    pub fn insert_inodes(bpf: &mut Bpf, inodes: &[u64], zone_id: u32) -> Result<u32> {
         let mut count = 0u32;
-        let mut stack = vec![rootfs_path.to_path_buf()];
-
-        while let Some(dir) = stack.pop() {
-            let entries = match std::fs::read_dir(&dir) {
-                Ok(e) => e,
-                Err(e) => {
-                    tracing::debug!(dir = %dir.display(), %e, "skipping unreadable directory during inode registration");
-                    continue;
-                }
-            };
-
-            for entry in entries {
-                if count >= max_inodes {
-                    tracing::warn!(
-                        zone_id,
-                        count,
-                        max_inodes,
-                        "inode registration hit MAX_INODES cap — some files won't be tracked"
-                    );
-                    return Ok(count);
-                }
-
-                let entry = match entry {
-                    Ok(e) => e,
-                    Err(_) => continue,
-                };
-
-                let meta = match std::fs::symlink_metadata(entry.path()) {
-                    Ok(m) => m,
-                    Err(_) => continue,
-                };
-
-                let ino = meta.ino();
-                if let Err(e) = Self::set_inode_zone(bpf, ino, zone_id) {
-                    tracing::debug!(ino, zone_id, %e, "failed to register inode");
-                    continue;
-                }
-                count += 1;
-
-                if meta.is_dir() {
-                    stack.push(entry.path());
-                }
+        for &ino in inodes {
+            if let Err(e) = Self::set_inode_zone(bpf, ino, zone_id) {
+                tracing::debug!(ino, zone_id, %e, "failed to register inode");
+                continue;
             }
+            count += 1;
         }
-
-        tracing::debug!(zone_id, count, path = %rootfs_path.display(), "registered rootfs inodes");
+        tracing::debug!(zone_id, count, total = inodes.len(), "inserted inodes into BPF map");
         Ok(count)
     }
 
-    /// Unregister all inodes in a directory tree from the INODE_ZONE_MAP.
-    pub fn unregister_rootfs_inodes(
-        bpf: &mut Bpf,
-        rootfs_path: &std::path::Path,
-    ) -> Result<u32> {
-        use std::os::unix::fs::MetadataExt;
-
+    /// Remove a batch of inodes from the INODE_ZONE_MAP.
+    pub fn remove_inodes(bpf: &mut Bpf, inodes: &[u64]) -> Result<u32> {
         let mut count = 0u32;
-        let mut stack = vec![rootfs_path.to_path_buf()];
-
-        while let Some(dir) = stack.pop() {
-            let entries = match std::fs::read_dir(&dir) {
-                Ok(e) => e,
-                Err(_) => continue,
-            };
-
-            for entry in entries {
-                let entry = match entry {
-                    Ok(e) => e,
-                    Err(_) => continue,
-                };
-
-                let meta = match std::fs::symlink_metadata(entry.path()) {
-                    Ok(m) => m,
-                    Err(_) => continue,
-                };
-
-                let _ = Self::remove_inode_zone(bpf, meta.ino());
-                count += 1;
-
-                if meta.is_dir() {
-                    stack.push(entry.path());
-                }
+        for &ino in inodes {
+            if let Err(e) = Self::remove_inode_zone(bpf, ino) {
+                tracing::debug!(ino, %e, "failed to unregister inode");
+                continue;
             }
+            count += 1;
         }
-
-        tracing::debug!(count, path = %rootfs_path.display(), "unregistered rootfs inodes");
+        tracing::debug!(count, total = inodes.len(), "removed inodes from BPF map");
         Ok(count)
     }
 
@@ -337,7 +266,79 @@ impl MapManager {
     }
 }
 
+/// Collect all inode numbers from a directory tree.
+///
+/// This is the filesystem-walking half of inode registration. It does no BPF
+/// operations and needs no locks — call it outside the ebpf mutex, then pass
+/// the result to `MapManager::insert_inodes` with the lock held briefly.
+///
+/// ## Overlayfs behavior
+///
+/// When `rootfs_path` is an overlayfs merged mount (the normal case for
+/// containers with `overlay_layers`), `stat()` returns the overlayfs inode
+/// number. This matches what the kernel sees in `file->f_inode->i_ino` when
+/// the container process opens files through the same mount — so the inode
+/// numbers are consistent between collection and enforcement.
+///
+/// **Known limitation — copy-up:** When a container modifies a file from a
+/// lower (read-only) layer, overlayfs copies it to the upper (writable) layer.
+/// The copied-up file gets a new inode number not present in INODE_ZONE_MAP.
+/// The eBPF `file_open` hook treats untracked inodes as allowed (fail-open),
+/// so copy-up creates a narrow enforcement gap for modified files. This is
+/// acceptable because mount namespaces are the primary isolation barrier and
+/// eBPF is defense-in-depth.
+///
+/// Returns the collected inodes (capped at `max_inodes`).
+pub fn collect_rootfs_inodes(rootfs_path: &std::path::Path, max_inodes: u32) -> Vec<u64> {
+    use std::os::unix::fs::MetadataExt;
+
+    let mut inodes = Vec::new();
+    let mut stack = vec![rootfs_path.to_path_buf()];
+
+    while let Some(dir) = stack.pop() {
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(e) => e,
+            Err(e) => {
+                tracing::debug!(dir = %dir.display(), %e, "skipping unreadable directory during inode collection");
+                continue;
+            }
+        };
+
+        for entry in entries {
+            if inodes.len() as u32 >= max_inodes {
+                tracing::warn!(
+                    count = inodes.len(),
+                    max_inodes,
+                    "inode collection hit cap — some files won't be tracked"
+                );
+                return inodes;
+            }
+
+            let entry = match entry {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+
+            let meta = match std::fs::symlink_metadata(entry.path()) {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+
+            inodes.push(meta.ino());
+
+            if meta.is_dir() {
+                stack.push(entry.path());
+            }
+        }
+    }
+
+    tracing::debug!(count = inodes.len(), path = %rootfs_path.display(), "collected rootfs inodes");
+    inodes
+}
+
 /// Convert userspace ZonePolicy to kernel-side ZonePolicyKernel.
+///
+/// Maps capability names to a bitmask and policy settings to flag bits.
 fn policy_to_kernel(policy: &ZonePolicy) -> ZonePolicyKernel {
     let caps_mask = caps_to_mask(&policy.capabilities.allowed);
 
@@ -358,5 +359,71 @@ fn policy_to_kernel(policy: &ZonePolicy) -> ZonePolicyKernel {
         caps_mask,
         flags,
         _pad: 0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rauha_common::zone::{NetworkMode, ZonePolicy};
+
+    fn default_policy_with_caps(caps: Vec<&str>) -> ZonePolicy {
+        let mut p = ZonePolicy::default();
+        p.capabilities.allowed = caps.into_iter().map(String::from).collect();
+        p
+    }
+
+    #[test]
+    fn policy_to_kernel_default_has_no_flags() {
+        let k = policy_to_kernel(&ZonePolicy::default());
+        assert_eq!(k.caps_mask, 0);
+        assert_eq!(k.flags, 0);
+        assert_eq!(k._pad, 0);
+    }
+
+    #[test]
+    fn policy_to_kernel_sets_ptrace_flag_from_cap() {
+        let k = policy_to_kernel(&default_policy_with_caps(vec!["CAP_SYS_PTRACE"]));
+        assert_ne!(k.flags & POLICY_FLAG_ALLOW_PTRACE, 0);
+    }
+
+    #[test]
+    fn policy_to_kernel_sets_ptrace_flag_from_short_form() {
+        let k = policy_to_kernel(&default_policy_with_caps(vec!["SYS_PTRACE"]));
+        assert_ne!(k.flags & POLICY_FLAG_ALLOW_PTRACE, 0);
+    }
+
+    #[test]
+    fn policy_to_kernel_ptrace_flag_case_insensitive() {
+        let k = policy_to_kernel(&default_policy_with_caps(vec!["cap_sys_ptrace"]));
+        assert_ne!(k.flags & POLICY_FLAG_ALLOW_PTRACE, 0);
+    }
+
+    #[test]
+    fn policy_to_kernel_host_network_sets_flag() {
+        let mut p = ZonePolicy::default();
+        p.network.mode = NetworkMode::Host;
+        let k = policy_to_kernel(&p);
+        assert_ne!(k.flags & POLICY_FLAG_ALLOW_HOST_NET, 0);
+    }
+
+    #[test]
+    fn policy_to_kernel_isolated_network_no_flag() {
+        let p = ZonePolicy::default(); // default is Isolated
+        let k = policy_to_kernel(&p);
+        assert_eq!(k.flags & POLICY_FLAG_ALLOW_HOST_NET, 0);
+    }
+
+    #[test]
+    fn policy_to_kernel_caps_mask_correct() {
+        let k = policy_to_kernel(&default_policy_with_caps(vec!["CAP_NET_ADMIN", "CAP_SYS_ADMIN"]));
+        // CAP_NET_ADMIN = bit 12, CAP_SYS_ADMIN = bit 21
+        assert_eq!(k.caps_mask, (1 << 12) | (1 << 21));
+    }
+
+    #[test]
+    fn policy_to_kernel_unknown_cap_ignored() {
+        let k = policy_to_kernel(&default_policy_with_caps(vec!["CAP_NONEXISTENT"]));
+        assert_eq!(k.caps_mask, 0);
     }
 }

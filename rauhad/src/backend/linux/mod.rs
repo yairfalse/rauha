@@ -97,6 +97,9 @@ pub struct LinuxBackend {
     zone_name_map: Mutex<HashMap<String, Uuid>>,
     /// Shim connections per zone.
     shim_connections: Mutex<HashMap<String, ShimConnection>>,
+    /// Registered inodes per zone, for correct cleanup without re-walking.
+    /// Key is zone name, value is the inode list registered in INODE_ZONE_MAP.
+    registered_inodes: Mutex<HashMap<String, Vec<u64>>>,
     /// IP address allocator for zone networking.
     ip_allocator: Mutex<IpAllocator>,
 }
@@ -141,6 +144,7 @@ impl LinuxBackend {
             zone_id_map: Mutex::new(HashMap::new()),
             zone_name_map: Mutex::new(HashMap::new()),
             shim_connections: Mutex::new(HashMap::new()),
+            registered_inodes: Mutex::new(HashMap::new()),
             ip_allocator: Mutex::new(ip_allocator),
         })
     }
@@ -176,18 +180,18 @@ impl LinuxBackend {
     /// Allocate a new compact zone_id for BPF maps.
     fn allocate_zone_id(&self, uuid: Uuid) -> u32 {
         let id = self.next_zone_id.fetch_add(1, Ordering::Relaxed);
-        self.zone_id_map.lock().unwrap().insert(uuid, id);
+        self.zone_id_map.lock().unwrap_or_else(|e| e.into_inner()).insert(uuid, id);
         id
     }
 
     /// Look up the compact zone_id for a Uuid.
     fn get_zone_id(&self, uuid: &Uuid) -> Option<u32> {
-        self.zone_id_map.lock().unwrap().get(uuid).copied()
+        self.zone_id_map.lock().unwrap_or_else(|e| e.into_inner()).get(uuid).copied()
     }
 
     /// Remove zone_id mapping.
     fn remove_zone_id(&self, uuid: &Uuid) -> Option<u32> {
-        self.zone_id_map.lock().unwrap().remove(uuid)
+        self.zone_id_map.lock().unwrap_or_else(|e| e.into_inner()).remove(uuid)
     }
 
     /// Get the socket path for a zone's shim.
@@ -201,7 +205,7 @@ impl LinuxBackend {
 
         // Check if shim is already connected and responsive.
         {
-            let conns = self.shim_connections.lock().unwrap();
+            let conns = self.shim_connections.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(conn) = conns.get(zone_name) {
                 // Try a quick health check.
                 if conn
@@ -264,7 +268,7 @@ impl LinuxBackend {
         let conn = ShimConnection::new(socket_path);
         self.shim_connections
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .insert(zone_name.to_string(), conn);
 
         tracing::info!(zone = zone_name, "shim spawned");
@@ -273,7 +277,7 @@ impl LinuxBackend {
 
     /// Send a request to a zone's shim.
     fn shim_request(&self, zone_name: &str, request: &ShimRequest) -> Result<ShimResponse> {
-        let conns = self.shim_connections.lock().unwrap();
+        let conns = self.shim_connections.lock().unwrap_or_else(|e| e.into_inner());
         let conn = conns.get(zone_name).ok_or_else(|| RauhaError::ShimError {
             zone: zone_name.into(),
             message: "no shim connection".into(),
@@ -298,8 +302,8 @@ impl LinuxBackend {
         zone_id: u32,
         net_policy: &NetworkPolicy,
     ) -> Result<()> {
-        let zone_names = self.zone_name_map.lock().unwrap();
-        let zone_ids = self.zone_id_map.lock().unwrap();
+        let zone_names = self.zone_name_map.lock().unwrap_or_else(|e| e.into_inner());
+        let zone_ids = self.zone_id_map.lock().unwrap_or_else(|e| e.into_inner());
 
         for allowed_zone_name in &net_policy.allowed_zones {
             if let Some(peer_uuid) = zone_names.get(allowed_zone_name) {
@@ -347,7 +351,7 @@ impl IsolationBackend for LinuxBackend {
         let zone_id = self.allocate_zone_id(zone.id);
         self.zone_name_map
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .insert(zone.name.clone(), zone.id);
 
         // Re-create cgroup if missing (idempotent).
@@ -364,7 +368,7 @@ impl IsolationBackend for LinuxBackend {
 
         // Re-register IP in allocator if zone has network state.
         if let Some(ref net_state) = zone.network_state {
-            self.ip_allocator.lock().unwrap().mark_allocated(net_state.ip());
+            self.ip_allocator.lock().unwrap_or_else(|e| e.into_inner()).mark_allocated(net_state.ip());
         }
 
         // Re-create netns if missing (idempotent).
@@ -445,7 +449,7 @@ impl IsolationBackend for LinuxBackend {
         // Track zone name → uuid mapping.
         self.zone_name_map
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .insert(config.name.clone(), zone_uuid);
 
         // Step 1: Create cgroup.
@@ -461,7 +465,7 @@ impl IsolationBackend for LinuxBackend {
         let net_state = if config.policy.network.mode != NetworkMode::Host {
             // Allocate an IP for this zone.
             let ip_state = {
-                let mut alloc = self.ip_allocator.lock().unwrap();
+                let mut alloc = self.ip_allocator.lock().unwrap_or_else(|e| e.into_inner());
                 let ip = alloc.allocate()?;
                 ZoneNetworkState {
                     ip: ip.octets(),
@@ -526,7 +530,7 @@ impl IsolationBackend for LinuxBackend {
 
         // Shut down shim if running.
         {
-            let mut conns = self.shim_connections.lock().unwrap();
+            let mut conns = self.shim_connections.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(conn) = conns.remove(&zone.name) {
                 let _ = conn.send_request(&ShimRequest::Shutdown);
             }
@@ -534,14 +538,20 @@ impl IsolationBackend for LinuxBackend {
 
         // Remove from BPF maps first.
         let zone_id = self.remove_zone_id(&zone.id);
+        // Remove stored inodes from BPF map (uses stored list, no re-walk).
+        let stored_inodes = self
+            .registered_inodes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&zone.name)
+            .unwrap_or_default();
+
         if let (Some(zone_id), Ok(ref mut ebpf_guard)) = (zone_id, self.ebpf.lock()) {
             if let Some(ref mut ebpf) = **ebpf_guard {
                 let bpf = ebpf.bpf_mut();
 
-                // Unregister rootfs inodes before removing zone membership.
-                let rootfs_root = PathBuf::from(&self.root).join("zones").join(&zone.name);
-                if rootfs_root.exists() {
-                    if let Err(e) = MapManager::unregister_rootfs_inodes(bpf, &rootfs_root) {
+                if !stored_inodes.is_empty() {
+                    if let Err(e) = MapManager::remove_inodes(bpf, &stored_inodes) {
                         tracing::warn!(%e, zone = zone.name, "failed to unregister rootfs inodes");
                     }
                 }
@@ -553,7 +563,7 @@ impl IsolationBackend for LinuxBackend {
 
         // Release IP back to allocator.
         if let Some(ref net_state) = zone.network_state {
-            let mut alloc = self.ip_allocator.lock().unwrap();
+            let mut alloc = self.ip_allocator.lock().unwrap_or_else(|e| e.into_inner());
             alloc.release(net_state.ip());
         }
 
@@ -569,7 +579,7 @@ impl IsolationBackend for LinuxBackend {
         // Destroy cgroup last (must be empty).
         self.cgroup.destroy_zone_cgroup(&zone.name)?;
 
-        self.zone_name_map.lock().unwrap().remove(&zone.name);
+        self.zone_name_map.lock().unwrap_or_else(|e| e.into_inner()).remove(&zone.name);
 
         // Clean up shim socket.
         let socket_path = Self::shim_socket_path(&zone.name);
@@ -718,30 +728,51 @@ impl IsolationBackend for LinuxBackend {
         .map_err(|e| RauhaError::BackendError(format!("failed to serialize spec: {e}")))?;
 
         // Register rootfs inodes in BPF map for file isolation.
+        // Phase 1: Collect inodes from filesystem (no lock, may be slow for large rootfs).
+        // Phase 2: Insert into BPF map (short lock hold).
         if let Some(zone_id) = self.get_zone_id(&zone.id) {
-            if let Ok(ref mut ebpf_guard) = self.ebpf.lock() {
-                if let Some(ref mut ebpf) = **ebpf_guard {
-                    match MapManager::register_rootfs_inodes(
-                        ebpf.bpf_mut(),
-                        &rootfs_dir,
-                        zone_id,
-                        rauha_ebpf_common::MAX_INODES,
-                    ) {
-                        Ok(count) => {
-                            tracing::info!(
-                                zone = zone.name,
-                                container = %container_id,
-                                count,
-                                "registered container rootfs inodes in BPF map"
-                            );
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                %e,
-                                zone = zone.name,
-                                container = %container_id,
-                                "failed to register rootfs inodes — file isolation incomplete"
-                            );
+            let is_overlay = rootfs_dir.ends_with("merged");
+            tracing::debug!(
+                zone = zone.name,
+                path = %rootfs_dir.display(),
+                overlay = is_overlay,
+                "collecting rootfs inodes for BPF file isolation"
+            );
+
+            let inodes = maps::collect_rootfs_inodes(
+                &rootfs_dir,
+                rauha_ebpf_common::MAX_INODES,
+            );
+
+            if !inodes.is_empty() {
+                // Store inodes for correct cleanup on zone destroy.
+                self.registered_inodes
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .entry(zone.name.clone())
+                    .or_default()
+                    .extend_from_slice(&inodes);
+
+                if let Ok(ref mut ebpf_guard) = self.ebpf.lock() {
+                    if let Some(ref mut ebpf) = **ebpf_guard {
+                        match MapManager::insert_inodes(ebpf.bpf_mut(), &inodes, zone_id) {
+                            Ok(count) => {
+                                tracing::info!(
+                                    zone = zone.name,
+                                    container = %container_id,
+                                    count,
+                                    collected = inodes.len(),
+                                    "registered container rootfs inodes in BPF map"
+                                );
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    %e,
+                                    zone = zone.name,
+                                    container = %container_id,
+                                    "failed to register rootfs inodes — file isolation incomplete"
+                                );
+                            }
                         }
                     }
                 }
@@ -788,7 +819,7 @@ impl IsolationBackend for LinuxBackend {
         let zone_name = self
             .zone_name_map
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .iter()
             .find(|(_, uuid)| **uuid == container.zone_id)
             .map(|(name, _)| name.clone())
@@ -823,7 +854,7 @@ impl IsolationBackend for LinuxBackend {
         let zone_name = self
             .zone_name_map
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .iter()
             .find(|(_, uuid)| **uuid == container.zone_id)
             .map(|(name, _)| name.clone())
@@ -945,6 +976,35 @@ impl IsolationBackend for LinuxBackend {
                 "network namespace missing — network not isolated".into()
             },
         });
+
+        // Check 5: enforcement counters — detect silent enforcement failure.
+        if let Ok(ref ebpf_guard) = self.ebpf.lock() {
+            if let Some(ref ebpf) = **ebpf_guard {
+                if let Ok(counters) = ebpf.read_enforcement_counters() {
+                    for (name, c) in &counters {
+                        if c.error > 0 && c.deny == 0 {
+                            checks.push(IsolationCheck {
+                                name: format!("enforcement:{name}"),
+                                passed: false,
+                                detail: format!(
+                                    "hook has {} errors and 0 denials — enforcement may be silently failing",
+                                    c.error
+                                ),
+                            });
+                        } else if c.allow > 0 || c.deny > 0 {
+                            checks.push(IsolationCheck {
+                                name: format!("enforcement:{name}"),
+                                passed: true,
+                                detail: format!(
+                                    "allow={}, deny={}, error={}",
+                                    c.allow, c.deny, c.error
+                                ),
+                            });
+                        }
+                    }
+                }
+            }
+        }
 
         let is_isolated = cgroup_ok && ebpf_ok && membership_ok && netns_ok;
 

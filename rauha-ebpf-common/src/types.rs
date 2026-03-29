@@ -10,7 +10,9 @@ pub const MAX_ZONES: u32 = 4096;
 pub const MAX_CGROUPS: u32 = 65536;
 
 /// Maximum number of inodes tracked for file-zone ownership.
-pub const MAX_INODES: u32 = 1_048_576;
+/// 256K entries × ~76 bytes/entry ≈ 19MB pinned kernel memory.
+/// Covers most container rootfs scenarios (Alpine ~800, Ubuntu ~35K).
+pub const MAX_INODES: u32 = 262_144;
 
 /// Value in the ZONE_MEMBERSHIP map. Keyed by cgroup_id (u64).
 #[repr(C)]
@@ -52,6 +54,45 @@ pub const ZONE_FLAG_GLOBAL: u32 = 1 << 1;
 // Flag constants for ZonePolicyKernel.flags
 pub const POLICY_FLAG_ALLOW_PTRACE: u32 = 1 << 0;
 pub const POLICY_FLAG_ALLOW_HOST_NET: u32 = 1 << 1;
+
+/// Result of the startup self-test that validates kernel struct offsets.
+///
+/// Written by the `file_open` hook on its first invocation. Userspace reads
+/// this after triggering a file open and compares the two cgroup_id values.
+/// If they differ, the hardcoded offsets are wrong for this kernel.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct SelfTestResult {
+    /// cgroup_id from `bpf_get_current_cgroup_id()` (known-good BPF helper).
+    pub helper_cgroup_id: u64,
+    /// cgroup_id derived from the hardcoded offset chain:
+    /// `bpf_get_current_task() -> cgroups -> dfl_cgrp -> kn -> id`
+    pub offset_cgroup_id: u64,
+}
+
+/// Per-hook enforcement decision counters.
+///
+/// One entry per LSM program in the ENFORCEMENT_COUNTERS PerCpuArray.
+/// Each CPU has its own copy — no contention. Userspace sums across CPUs.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct EnforcementCounters {
+    /// Number of times this hook returned 0 (allow).
+    pub allow: u64,
+    /// Number of times this hook returned -1 (deny).
+    pub deny: u64,
+    /// Number of times the hook hit an error path and fell through to allow.
+    /// High error + zero deny = enforcement silently failing.
+    pub error: u64,
+}
+
+// Program indices in the ENFORCEMENT_COUNTERS array.
+pub const PROG_FILE_OPEN: u32 = 0;
+pub const PROG_BPRM_CHECK: u32 = 1;
+pub const PROG_PTRACE_CHECK: u32 = 2;
+pub const PROG_TASK_KILL: u32 = 3;
+pub const PROG_CGROUP_ATTACH: u32 = 4;
+pub const ENFORCEMENT_COUNTER_ENTRIES: u32 = 5;
 
 #[cfg(feature = "userspace")]
 mod cap_convert {
@@ -153,6 +194,10 @@ unsafe impl Sync for ZonePolicyKernel {}
 unsafe impl Send for ZonePolicyKernel {}
 unsafe impl Sync for ZoneCommKey {}
 unsafe impl Send for ZoneCommKey {}
+unsafe impl Sync for SelfTestResult {}
+unsafe impl Send for SelfTestResult {}
+unsafe impl Sync for EnforcementCounters {}
+unsafe impl Send for EnforcementCounters {}
 
 // aya::Pod is required for types used as BPF map keys/values on the userspace side.
 // All three types are #[repr(C)], Copy, and have no padding — safe to implement.
@@ -162,6 +207,10 @@ unsafe impl aya::Pod for ZoneInfoKernel {}
 unsafe impl aya::Pod for ZonePolicyKernel {}
 #[cfg(feature = "userspace")]
 unsafe impl aya::Pod for ZoneCommKey {}
+#[cfg(feature = "userspace")]
+unsafe impl aya::Pod for SelfTestResult {}
+#[cfg(feature = "userspace")]
+unsafe impl aya::Pod for EnforcementCounters {}
 
 #[cfg(test)]
 mod tests {
@@ -181,6 +230,16 @@ mod tests {
     #[test]
     fn zone_comm_key_size() {
         assert_eq!(size_of::<ZoneCommKey>(), 8);
+    }
+
+    #[test]
+    fn self_test_result_size() {
+        assert_eq!(size_of::<SelfTestResult>(), 16);
+    }
+
+    #[test]
+    fn enforcement_counters_size() {
+        assert_eq!(size_of::<EnforcementCounters>(), 24);
     }
 
     #[test]

@@ -11,8 +11,8 @@
 
 use aya_ebpf::programs::LsmContext;
 
-use crate::{lookup_caller_zone, read_kernel_u64, offsets, ZONE_MEMBERSHIP};
-use rauha_ebpf_common::ZONE_FLAG_GLOBAL;
+use crate::{lookup_caller_zone, read_kernel_u64, count_decision, offsets, ZONE_MEMBERSHIP};
+use rauha_ebpf_common::{ZONE_FLAG_GLOBAL, PROG_CGROUP_ATTACH};
 
 /// Called from the cgroup_attach_task LSM hook.
 ///
@@ -20,10 +20,12 @@ use rauha_ebpf_common::ZONE_FLAG_GLOBAL;
 ///
 /// Returns 0 to allow, -1 (EPERM) to deny.
 pub fn cgroup_attach_task(ctx: &LsmContext) -> i32 {
-    match try_cgroup_attach(ctx) {
-        Ok(ret) => ret,
-        Err(_) => 0, // Fail open — blocking cgroup moves breaks shim operation.
-    }
+    let (ret, is_error) = match try_cgroup_attach(ctx) {
+        Ok(ret) => (ret, false),
+        Err(_) => (0, true), // Fail open — blocking cgroup moves breaks shim operation.
+    };
+    count_decision(PROG_CGROUP_ATTACH, ret == 0, is_error);
+    ret
 }
 
 #[inline(always)]

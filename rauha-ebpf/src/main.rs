@@ -3,10 +3,13 @@
 
 use aya_ebpf::{
     macros::{lsm, map},
-    maps::HashMap,
+    maps::{Array, HashMap, PerCpuArray},
     programs::LsmContext,
 };
-use rauha_ebpf_common::{ZoneCommKey, ZoneInfoKernel, ZonePolicyKernel, MAX_CGROUPS, MAX_INODES, MAX_ZONES};
+use rauha_ebpf_common::{
+    EnforcementCounters, SelfTestResult, ZoneCommKey, ZoneInfoKernel, ZonePolicyKernel,
+    ENFORCEMENT_COUNTER_ENTRIES, MAX_CGROUPS, MAX_INODES, MAX_ZONES,
+};
 
 mod file_guard;
 mod exec_guard;
@@ -29,6 +32,17 @@ static INODE_ZONE_MAP: HashMap<u64, u32> = HashMap::with_max_entries(MAX_INODES,
 /// Maps (src_zone, dst_zone) → u8. If entry exists, cross-zone communication is allowed.
 #[map]
 static ZONE_ALLOWED_COMMS: HashMap<ZoneCommKey, u8> = HashMap::with_max_entries(MAX_ZONES, 0);
+
+/// Startup self-test: compares cgroup_id from BPF helper vs offset chain.
+/// Written once by file_open on first invocation. Userspace reads to verify offsets.
+#[map]
+static SELF_TEST: Array<SelfTestResult> = Array::with_max_entries(1, 0);
+
+/// Per-hook enforcement decision counters (one entry per LSM program, per CPU).
+/// Userspace sums across CPUs to get totals.
+#[map]
+static ENFORCEMENT_COUNTERS: PerCpuArray<EnforcementCounters> =
+    PerCpuArray::with_max_entries(ENFORCEMENT_COUNTER_ENTRIES, 0);
 
 /// Look up the caller's zone from their cgroup_id.
 /// Returns None if the process is not in any zone (global/unzoned).
@@ -152,6 +166,87 @@ fn is_cross_zone_allowed(src_zone: u32, dst_zone: u32) -> bool {
         dst_zone,
     };
     unsafe { ZONE_ALLOWED_COMMS.get(&key).is_some() }
+}
+
+/// Check if a cross-zone task operation (ptrace, signal) should be denied.
+///
+/// Shared logic for ptrace_guard and signal_guard — both hooks have the same
+/// signature pattern: ctx.arg(0) is the target task_struct pointer.
+///
+/// Returns 0 (allow) or -1 (deny).
+#[inline(always)]
+fn check_cross_zone_task_access(ctx: &LsmContext) -> Result<i32, i64> {
+    let caller = match lookup_caller_zone(ctx) {
+        Some(info) => info,
+        None => return Ok(0),
+    };
+
+    if caller.flags & rauha_ebpf_common::ZONE_FLAG_GLOBAL != 0 {
+        return Ok(0);
+    }
+
+    let target_ptr: u64 = unsafe { ctx.arg(0) };
+    if target_ptr == 0 {
+        return Ok(0);
+    }
+
+    let target = match unsafe { lookup_task_zone(target_ptr) } {
+        Some(info) => info,
+        None => return Ok(0),
+    };
+
+    if is_cross_zone_allowed(caller.zone_id, target.zone_id) {
+        return Ok(0);
+    }
+
+    Ok(-1)
+}
+
+/// Run the one-shot self-test: write both cgroup_id derivation paths to SELF_TEST map.
+///
+/// Called from file_open on first invocation. Skips if already populated (nonzero).
+/// The two values should be identical if the hardcoded offsets are correct.
+#[inline(always)]
+unsafe fn maybe_run_self_test() {
+    // One-shot guard: skip if already written.
+    if let Some(existing) = SELF_TEST.get(0) {
+        if existing.helper_cgroup_id != 0 {
+            return;
+        }
+    }
+
+    let helper_id = aya_ebpf::helpers::bpf_get_current_cgroup_id();
+    let task_ptr = aya_ebpf::helpers::bpf_get_current_task() as u64;
+    let offset_id = read_task_cgroup_id(task_ptr).unwrap_or(0);
+
+    let result = SelfTestResult {
+        helper_cgroup_id: helper_id,
+        offset_cgroup_id: offset_id,
+    };
+
+    // get_ptr_mut returns a mutable pointer to the array slot.
+    if let Some(slot) = SELF_TEST.get_ptr_mut(0) {
+        *slot = result;
+    }
+}
+
+/// Increment enforcement counters for a hook decision.
+///
+/// `prog_idx`: program index constant (PROG_FILE_OPEN, etc.)
+/// `allow`: true if the decision was to allow (return 0)
+/// `is_error`: true if the hook hit an error path and fell through
+#[inline(always)]
+fn count_decision(prog_idx: u32, allow: bool, is_error: bool) {
+    if let Some(counters) = unsafe { ENFORCEMENT_COUNTERS.get_ptr_mut(prog_idx) } {
+        let c = unsafe { &mut *counters };
+        if is_error {
+            c.error += 1;
+        } else if allow {
+            c.allow += 1;
+        } else {
+            c.deny += 1;
+        }
+    }
 }
 
 // --- LSM hook entry points ---
