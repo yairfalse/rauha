@@ -537,6 +537,15 @@ impl IsolationBackend for LinuxBackend {
         if let (Some(zone_id), Ok(ref mut ebpf_guard)) = (zone_id, self.ebpf.lock()) {
             if let Some(ref mut ebpf) = **ebpf_guard {
                 let bpf = ebpf.bpf_mut();
+
+                // Unregister rootfs inodes before removing zone membership.
+                let rootfs_root = PathBuf::from(&self.root).join("zones").join(&zone.name);
+                if rootfs_root.exists() {
+                    if let Err(e) = MapManager::unregister_rootfs_inodes(bpf, &rootfs_root) {
+                        tracing::warn!(%e, zone = zone.name, "failed to unregister rootfs inodes");
+                    }
+                }
+
                 let _ = MapManager::remove_zone_member(bpf, zone.platform_id);
                 let _ = MapManager::remove_zone_policy(bpf, zone_id);
             }
@@ -708,6 +717,37 @@ impl IsolationBackend for LinuxBackend {
         )
         .map_err(|e| RauhaError::BackendError(format!("failed to serialize spec: {e}")))?;
 
+        // Register rootfs inodes in BPF map for file isolation.
+        if let Some(zone_id) = self.get_zone_id(&zone.id) {
+            if let Ok(ref mut ebpf_guard) = self.ebpf.lock() {
+                if let Some(ref mut ebpf) = **ebpf_guard {
+                    match MapManager::register_rootfs_inodes(
+                        ebpf.bpf_mut(),
+                        &rootfs_dir,
+                        zone_id,
+                        rauha_ebpf_common::MAX_INODES,
+                    ) {
+                        Ok(count) => {
+                            tracing::info!(
+                                zone = zone.name,
+                                container = %container_id,
+                                count,
+                                "registered container rootfs inodes in BPF map"
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                %e,
+                                zone = zone.name,
+                                container = %container_id,
+                                "failed to register rootfs inodes — file isolation incomplete"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
         // Send CreateContainer to shim.
         let response = self.shim_request(
             &zone.name,
@@ -718,13 +758,16 @@ impl IsolationBackend for LinuxBackend {
         )?;
 
         match response {
-            ShimResponse::Created { pid } | ShimResponse::Ok => Ok(ContainerHandle {
+            ShimResponse::Created { pid } => Ok(ContainerHandle {
                 id: container_id,
                 zone_id: zone.id,
-                pid: match response {
-                    ShimResponse::Created { pid } => pid,
-                    _ => 0,
-                },
+                pid,
+                platform_id: 0,
+            }),
+            ShimResponse::Ok => Ok(ContainerHandle {
+                id: container_id,
+                zone_id: zone.id,
+                pid: 0,
                 platform_id: 0,
             }),
             ShimResponse::Error { message } => Err(RauhaError::ShimError {
@@ -840,19 +883,23 @@ impl IsolationBackend for LinuxBackend {
             if let Some(ref ebpf) = **ebpf_guard {
                 match ebpf.health_check() {
                     Ok(statuses) => {
-                        let all_loaded = statuses.iter().all(|s| s.loaded);
+                        let all_ok = statuses.iter().all(|s| s.loaded && s.attached);
                         for status in &statuses {
+                            let passed = status.loaded && status.attached;
+                            let detail = if status.loaded && status.attached {
+                                "program loaded and attached".into()
+                            } else if status.loaded {
+                                "program loaded but detached from hook — restart rauhad to re-attach".into()
+                            } else {
+                                "program not loaded — zone boundary not enforced".into()
+                            };
                             checks.push(IsolationCheck {
                                 name: format!("ebpf:{}", status.name),
-                                passed: status.loaded,
-                                detail: if status.loaded {
-                                    "program loaded".into()
-                                } else {
-                                    "program not loaded — zone boundary not enforced".into()
-                                },
+                                passed,
+                                detail,
                             });
                         }
-                        all_loaded
+                        all_ok
                     }
                     Err(e) => {
                         checks.push(IsolationCheck {

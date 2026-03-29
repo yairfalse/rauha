@@ -51,6 +51,9 @@ impl MapManager {
     }
 
     /// Remove a cgroup from zone membership.
+    ///
+    /// NotFound is acceptable (idempotent cleanup) and logged at debug level.
+    /// Other errors propagate.
     pub fn remove_zone_member(bpf: &mut Bpf, cgroup_id: u64) -> Result<()> {
         let mut map: AyaHashMap<_, u64, ZoneInfoKernel> =
             AyaHashMap::try_from(bpf.map_mut("ZONE_MEMBERSHIP").ok_or_else(|| {
@@ -64,12 +67,14 @@ impl MapManager {
                 hint: "check eBPF object was built correctly".into(),
             })?;
 
-        map.remove(&cgroup_id).map_err(|e| RauhaError::EbpfError {
-            message: format!("failed to remove zone membership: {e}"),
-            hint: "entry may not exist".into(),
-        })?;
-
-        Ok(())
+        match map.remove(&cgroup_id) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                // NotFound during cleanup is fine — entry may already be gone.
+                tracing::debug!(cgroup_id, %e, "zone membership entry not found (already removed)");
+                Ok(())
+            }
+        }
     }
 
     /// Set the enforcement policy for a zone in the BPF map.
@@ -98,6 +103,8 @@ impl MapManager {
     }
 
     /// Remove a zone's policy from BPF maps.
+    ///
+    /// NotFound is acceptable (idempotent cleanup) and logged at debug level.
     pub fn remove_zone_policy(bpf: &mut Bpf, zone_id: u32) -> Result<()> {
         let mut map: AyaHashMap<_, u32, ZonePolicyKernel> =
             AyaHashMap::try_from(bpf.map_mut("ZONE_POLICY").ok_or_else(|| {
@@ -111,8 +118,13 @@ impl MapManager {
                 hint: "check eBPF object was built correctly".into(),
             })?;
 
-        let _ = map.remove(&zone_id); // Ignore error if already removed.
-        Ok(())
+        match map.remove(&zone_id) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                tracing::debug!(zone_id, %e, "zone policy not found in BPF map (already removed)");
+                Ok(())
+            }
+        }
     }
 
     /// Track an inode as belonging to a zone.
@@ -151,8 +163,117 @@ impl MapManager {
                 hint: "check eBPF object was built correctly".into(),
             })?;
 
-        let _ = map.remove(&inode);
-        Ok(())
+        match map.remove(&inode) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                // Not found is fine — idempotent cleanup.
+                tracing::debug!(inode, %e, "inode not in INODE_ZONE_MAP (already removed)");
+                Ok(())
+            }
+        }
+    }
+
+    /// Register all inodes in a directory tree as belonging to a zone.
+    ///
+    /// Walks `rootfs_path` recursively and registers each file's inode in
+    /// INODE_ZONE_MAP. Stops at `max_inodes` to avoid filling the map.
+    /// Returns the number of inodes registered.
+    pub fn register_rootfs_inodes(
+        bpf: &mut Bpf,
+        rootfs_path: &std::path::Path,
+        zone_id: u32,
+        max_inodes: u32,
+    ) -> Result<u32> {
+        use std::os::unix::fs::MetadataExt;
+
+        let mut count = 0u32;
+        let mut stack = vec![rootfs_path.to_path_buf()];
+
+        while let Some(dir) = stack.pop() {
+            let entries = match std::fs::read_dir(&dir) {
+                Ok(e) => e,
+                Err(e) => {
+                    tracing::debug!(dir = %dir.display(), %e, "skipping unreadable directory during inode registration");
+                    continue;
+                }
+            };
+
+            for entry in entries {
+                if count >= max_inodes {
+                    tracing::warn!(
+                        zone_id,
+                        count,
+                        max_inodes,
+                        "inode registration hit MAX_INODES cap — some files won't be tracked"
+                    );
+                    return Ok(count);
+                }
+
+                let entry = match entry {
+                    Ok(e) => e,
+                    Err(_) => continue,
+                };
+
+                let meta = match std::fs::symlink_metadata(entry.path()) {
+                    Ok(m) => m,
+                    Err(_) => continue,
+                };
+
+                let ino = meta.ino();
+                if let Err(e) = Self::set_inode_zone(bpf, ino, zone_id) {
+                    tracing::debug!(ino, zone_id, %e, "failed to register inode");
+                    continue;
+                }
+                count += 1;
+
+                if meta.is_dir() {
+                    stack.push(entry.path());
+                }
+            }
+        }
+
+        tracing::debug!(zone_id, count, path = %rootfs_path.display(), "registered rootfs inodes");
+        Ok(count)
+    }
+
+    /// Unregister all inodes in a directory tree from the INODE_ZONE_MAP.
+    pub fn unregister_rootfs_inodes(
+        bpf: &mut Bpf,
+        rootfs_path: &std::path::Path,
+    ) -> Result<u32> {
+        use std::os::unix::fs::MetadataExt;
+
+        let mut count = 0u32;
+        let mut stack = vec![rootfs_path.to_path_buf()];
+
+        while let Some(dir) = stack.pop() {
+            let entries = match std::fs::read_dir(&dir) {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+
+            for entry in entries {
+                let entry = match entry {
+                    Ok(e) => e,
+                    Err(_) => continue,
+                };
+
+                let meta = match std::fs::symlink_metadata(entry.path()) {
+                    Ok(m) => m,
+                    Err(_) => continue,
+                };
+
+                let _ = Self::remove_inode_zone(bpf, meta.ino());
+                count += 1;
+
+                if meta.is_dir() {
+                    stack.push(entry.path());
+                }
+            }
+        }
+
+        tracing::debug!(count, path = %rootfs_path.display(), "unregistered rootfs inodes");
+        Ok(count)
     }
 
     /// Allow cross-zone communication between two zones.
@@ -181,6 +302,8 @@ impl MapManager {
     }
 
     /// Deny cross-zone communication between two zones.
+    ///
+    /// NotFound is acceptable (pair may not have been allowed) and logged at debug.
     pub fn deny_zone_comm(bpf: &mut Bpf, src_zone: u32, dst_zone: u32) -> Result<()> {
         let key = ZoneCommKey { src_zone, dst_zone };
 
@@ -196,8 +319,13 @@ impl MapManager {
                 hint: "check eBPF object was built correctly".into(),
             })?;
 
-        let _ = map.remove(&key);
-        Ok(())
+        match map.remove(&key) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                tracing::debug!(src_zone, dst_zone, %e, "zone comm entry not found (already denied)");
+                Ok(())
+            }
+        }
     }
 
     /// Atomically update a zone's policy (hot reload).

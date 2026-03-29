@@ -1,11 +1,17 @@
 //! cgroup_attach_task LSM hook — prevent zone escape.
 //!
-//! Once a task is placed in a zone's cgroup, prevent it from being moved
-//! to a different cgroup (which would effectively escape the zone).
+//! A task in a zone may be moved within its own zone's cgroup subtree,
+//! but must not be moved to a cgroup belonging to a different zone.
+//!
+//! The shim enrollment flow is safe: the shim process runs unzoned
+//! (inherits daemon's cgroup, not in ZONE_MEMBERSHIP), so its cgroup
+//! writes to zone-{name}/cgroup.procs are allowed by the "not in a zone"
+//! early return. The child blocks on the sync pipe until enrollment
+//! completes, so it cannot act before cgroup assignment.
 
 use aya_ebpf::programs::LsmContext;
 
-use crate::lookup_caller_zone;
+use crate::{lookup_caller_zone, read_kernel_u64, offsets, ZONE_MEMBERSHIP};
 use rauha_ebpf_common::ZONE_FLAG_GLOBAL;
 
 /// Called from the cgroup_attach_task LSM hook.
@@ -16,29 +22,60 @@ use rauha_ebpf_common::ZONE_FLAG_GLOBAL;
 pub fn cgroup_attach_task(ctx: &LsmContext) -> i32 {
     match try_cgroup_attach(ctx) {
         Ok(ret) => ret,
-        Err(_) => 0,
+        Err(_) => 0, // Fail open — blocking cgroup moves breaks shim operation.
     }
 }
 
 #[inline(always)]
 fn try_cgroup_attach(ctx: &LsmContext) -> Result<i32, i64> {
-    // If the current process is in a zone, deny moving to a different cgroup.
-    // This prevents zone escape by cgroup migration.
     let caller = match lookup_caller_zone(ctx) {
         Some(info) => info,
-        None => return Ok(0), // Not in a zone → allow cgroup operations.
+        None => return Ok(0), // Not in a zone → global → allow cgroup operations.
     };
 
-    // Global zones manage other zones — they can move tasks.
+    // Global zones manage other zones — they can move tasks freely.
     if caller.flags & ZONE_FLAG_GLOBAL != 0 {
         return Ok(0);
     }
 
-    // A non-global zoned process is trying to attach a task to a cgroup.
-    // This could be a zone escape attempt. Deny it.
-    //
-    // The daemon (running in global zone) will be the one that assigns
-    // processes to zone cgroups. Non-global zone processes should never
-    // need to do cgroup operations.
-    Ok(-1)
+    // Read the destination cgroup's ID.
+    // arg 0 is struct cgroup *dst_cgrp.
+    let dst_cgrp_ptr: u64 = unsafe { ctx.arg(0) };
+    if dst_cgrp_ptr == 0 {
+        return Ok(0);
+    }
+
+    // Read dst_cgrp->kn->id to get the destination cgroup_id.
+    let kn_ptr = unsafe { read_kernel_u64(dst_cgrp_ptr, offsets::CGROUP_KN)? };
+    if kn_ptr == 0 {
+        return Ok(0);
+    }
+    let dst_cgroup_id = unsafe { read_kernel_u64(kn_ptr, offsets::KERNFS_NODE_ID)? };
+
+    // Look up which zone the destination cgroup belongs to.
+    let dst_zone = unsafe { ZONE_MEMBERSHIP.get(&dst_cgroup_id) };
+
+    match dst_zone {
+        Some(dst_info) => {
+            // Destination is a known zone cgroup.
+            // Allow if it's the same zone (within-zone subtree move).
+            if caller.zone_id == dst_info.zone_id {
+                Ok(0)
+            } else {
+                // Moving to a different zone's cgroup → zone escape. Deny.
+                Ok(-1)
+            }
+        }
+        None => {
+            // Destination cgroup is not in ZONE_MEMBERSHIP.
+            // This could be:
+            // - A cgroup outside any zone (escape attempt) → deny
+            // - A child cgroup within the zone that hasn't been registered yet
+            //
+            // Since legitimate within-zone child cgroups are registered by the
+            // daemon before use, an unregistered destination is treated as a
+            // potential escape. Deny for non-global zoned processes.
+            Ok(-1)
+        }
+    }
 }

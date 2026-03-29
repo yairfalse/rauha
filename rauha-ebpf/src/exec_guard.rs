@@ -5,7 +5,7 @@
 
 use aya_ebpf::programs::LsmContext;
 
-use crate::{lookup_caller_zone, is_cross_zone_allowed, INODE_ZONE_MAP};
+use crate::{lookup_caller_zone, is_cross_zone_allowed, read_file_ino, read_kernel_u64, offsets, INODE_ZONE_MAP};
 use rauha_ebpf_common::ZONE_FLAG_GLOBAL;
 
 /// Called from the bprm_check_security LSM hook.
@@ -32,34 +32,16 @@ fn try_bprm_check(ctx: &LsmContext) -> Result<i32, i64> {
         return Ok(0);
     }
 
-    // struct linux_binprm { ... struct file *file; ... }
-    // file is at offset 168 in linux_binprm (kernel 6.1+).
+    // linux_binprm->file (CO-RE safe read).
     let bprm_ptr: u64 = unsafe { ctx.arg(0) };
     if bprm_ptr == 0 {
         return Ok(0);
     }
 
-    let file_ptr: u64 = unsafe {
-        let ptr = (bprm_ptr + 168) as *const u64;
-        core::ptr::read_volatile(ptr)
-    };
-    if file_ptr == 0 {
-        return Ok(0);
-    }
+    let file_ptr = unsafe { read_kernel_u64(bprm_ptr, offsets::BPRM_FILE)? };
 
-    // file->f_inode (offset 32) -> i_ino (offset 64)
-    let inode_ptr: u64 = unsafe {
-        let ptr = (file_ptr + 32) as *const u64;
-        core::ptr::read_volatile(ptr)
-    };
-    if inode_ptr == 0 {
-        return Ok(0);
-    }
-
-    let ino: u64 = unsafe {
-        let ptr = (inode_ptr + 64) as *const u64;
-        core::ptr::read_volatile(ptr)
-    };
+    // file->f_inode->i_ino
+    let ino = unsafe { read_file_ino(file_ptr)? };
 
     let file_zone_id = match unsafe { INODE_ZONE_MAP.get(&ino) } {
         Some(&zone_id) => zone_id,

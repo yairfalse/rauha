@@ -154,6 +154,15 @@ unsafe impl Send for ZonePolicyKernel {}
 unsafe impl Sync for ZoneCommKey {}
 unsafe impl Send for ZoneCommKey {}
 
+// aya::Pod is required for types used as BPF map keys/values on the userspace side.
+// All three types are #[repr(C)], Copy, and have no padding — safe to implement.
+#[cfg(feature = "userspace")]
+unsafe impl aya::Pod for ZoneInfoKernel {}
+#[cfg(feature = "userspace")]
+unsafe impl aya::Pod for ZonePolicyKernel {}
+#[cfg(feature = "userspace")]
+unsafe impl aya::Pod for ZoneCommKey {}
+
 #[cfg(test)]
 mod tests {
     use super::*;

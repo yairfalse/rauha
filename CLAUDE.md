@@ -42,7 +42,7 @@ bash tests/integration/test-zone-networking.sh
 
 # Oracle tests (require running rauhad, any platform)
 cd eval/oracle
-RAUHA_GRPC_ENDPOINT=http://[::1]:9876 cargo test           # all 13 cases
+RAUHA_GRPC_ENDPOINT=http://[::1]:9876 cargo test           # all cases
 RAUHA_GRPC_ENDPOINT=http://[::1]:9876 cargo test -- case_001  # one case
 ```
 
@@ -67,7 +67,7 @@ Both platform backends implement this trait. rauhad is platform-agnostic — it 
 
 - **rauhad** is async (tokio) — gRPC server, concurrent zone management
 - **rauha-shim** is deliberately sync — `fork()` in a multithreaded async runtime is UB. The shim is single-threaded so it can safely fork, setns, pivot_root, and run the container process
-- IPC between daemon and shim: length-prefixed postcard over Unix socket (`rauha-common/src/shim.rs`)
+- IPC between daemon and shim: length-prefixed postcard over Unix socket (`rauha-common/src/shim.rs`). The protocol includes attach/exec commands — Linux shim returns a Unix socket path, macOS guest agent returns a vsock port for bidirectional I/O.
 
 ### One Shim Per Zone (Not Per Container)
 
@@ -87,6 +87,8 @@ On macOS, each zone is a lightweight Linux VM via Apple's Virtualization.framewo
 - **pf.rs** — macOS packet filter (pf) firewall anchors, one per zone, generated from ZonePolicy.
 
 The `rauha-guest-agent` runs inside the VM and handles `ShimRequest`/`ShimResponse` messages (same postcard protocol as the Linux shim). It's simpler than `rauha-shim`: no cgroup enrollment (VM is the boundary), no `setns` (already in the right namespace).
+
+- **attach.rs** — PTY fork + vsock relay for exec sessions. Mirrors the Linux shim's attach but uses vsock ports (starting at 6000) instead of Unix sockets, and chroots into virtiofs-mounted rootfs at `/mnt/rauha/containers/{id}/...`.
 
 Resource limits (CPU/memory) are set at VM boot and require restart to change. Filesystem sharing uses virtio-fs, mounting the container rootfs from host into the VM at `/mnt/rauha`.
 
@@ -110,7 +112,7 @@ On macOS, VMs get NAT from Virtualization.framework. pf handles per-zone firewal
 
 ### gRPC Error Boundary (`rauhad/src/server.rs`)
 
-`to_status()` maps `RauhaError` variants to correct gRPC status codes. When adding new error variants, update this function — the oracle will catch incorrect mappings. Key mappings: `ZoneNotFound`→`NotFound`, `ZoneAlreadyExists`→`AlreadyExists`, `InvalidPolicy`/`BackendError("zone name...")`→`InvalidArgument`, `ImagePullError("not pulled")`→`NotFound`.
+`to_status()` maps `RauhaError` variants to correct gRPC status codes. When adding new error variants, update this function — the oracle will catch incorrect mappings. Key mappings: `ZoneNotFound`/`ContainerNotFound`/`ImageNotFound`→`NotFound`, `ZoneAlreadyExists`/`ContainerAlreadyExists`→`AlreadyExists`, `InvalidInput`/`InvalidPolicy`→`InvalidArgument`, `PermissionDenied`/`CrossZoneAccessDenied`→`PermissionDenied`, `ZoneNotEmpty`→`FailedPrecondition`.
 
 ### Data Stores
 
@@ -151,7 +153,7 @@ Built separately via `cargo xtask build-ebpf` targeting `bpfel-unknown-none`. No
 
 ## Oracle (`eval/oracle/`)
 
-Standalone ground-truth test binary (NOT in workspace). Validates rauhad through its gRPC API — never reads source code, never mocks. 13 numbered cases across zone lifecycle (001-003), container lifecycle (004-006), image management (007-009), isolation (010-012), policy (013-015), observability (019-021), and resilience (022-024). When a case fails, it means the system's public contract is broken.
+Standalone ground-truth test binary (NOT in workspace). Validates rauhad through its gRPC API — never reads source code, never mocks. 55 numbered cases (001-055) across zone lifecycle, container lifecycle, image management, isolation, policy, observability, resilience, invariants, stress, and boundaries. When a case fails, it means the system's public contract is broken.
 
 The oracle must not be modified as a side effect of modifying the system. It has its own `[workspace]` in Cargo.toml and its own copy of the proto files.
 

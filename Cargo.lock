@@ -1841,6 +1841,9 @@ dependencies = [
 [[package]]
 name = "rauha-ebpf-common"
 version = "0.1.0"
+dependencies = [
+ "aya",
+]
 
 [[package]]
 name = "rauha-guest-agent"
