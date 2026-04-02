@@ -20,7 +20,7 @@ pub fn fork_and_exec(
     use nix::unistd::{self, ForkResult};
     use oci_spec::runtime::Spec;
     use std::ffi::CString;
-    use std::os::fd::AsRawFd;
+    use std::os::fd::{AsRawFd, BorrowedFd};
     use std::path::PathBuf;
 
     let spec: Spec = serde_json::from_str(spec_json)?;
@@ -81,7 +81,7 @@ pub fn fork_and_exec(
     let cwd = process.cwd().to_string_lossy().to_string();
     let cwd_cstr = CString::new(cwd.as_str())?;
 
-    let hostname = spec.hostname().cloned();
+    let hostname = spec.hostname().clone();
 
     // Convert OwnedFd to raw fds for use across fork.
     // We manage lifetime manually after fork (child/parent each close their end).
@@ -152,7 +152,7 @@ pub fn fork_and_exec(
             }
 
             // Signal child to proceed (unblock from sync pipe).
-            let _ = nix::unistd::write(wr_raw, &[1u8]);
+            let _ = nix::unistd::write(unsafe { BorrowedFd::borrow_raw(wr_raw) }, &[1u8]);
             // Drop write end (closes it).
             drop(pipe_wr);
 

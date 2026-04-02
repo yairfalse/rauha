@@ -141,7 +141,7 @@ pub fn fork_and_exec_pty(
     use nix::pty::openpty;
     use nix::unistd::{self, ForkResult};
     use std::ffi::CString;
-    use std::os::fd::AsRawFd;
+    use std::os::fd::{AsRawFd, BorrowedFd};
 
     if command.is_empty() {
         anyhow::bail!("exec command is empty");
@@ -244,7 +244,7 @@ pub fn fork_and_exec_pty(
             }
 
             // Signal child to proceed.
-            let _ = nix::unistd::write(wr_raw, &[1u8]);
+            let _ = nix::unistd::write(unsafe { BorrowedFd::borrow_raw(wr_raw) }, &[1u8]);
             drop(pipe_wr);
 
             // Prevent Rust from closing master_fd when pty.master drops —
