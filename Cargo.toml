@@ -8,6 +8,7 @@ members = [
     "rauha-shim",
     "rauha-guest-agent",
     "rauha-oci",
+    "containerd-shim-rauha-v2",
     "xtask",
 ]
 
