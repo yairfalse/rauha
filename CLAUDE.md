@@ -39,6 +39,9 @@ bash tests/integration/test-image-pull.sh
 bash tests/integration/test-container-lifecycle.sh
 bash tests/integration/test-zone-isolation.sh
 bash tests/integration/test-zone-networking.sh
+bash tests/integration/test-exec.sh
+bash tests/integration/test-logs.sh
+bash tests/integration/test-cgroup-lock.sh          # eBPF enforcement required
 
 # Oracle tests (require running rauhad, any platform)
 cd eval/oracle
@@ -125,7 +128,11 @@ Root directory: `/var/lib/rauha` on Linux, `/tmp/rauha` on macOS (dev default, o
 
 ### eBPF Programs (`rauha-ebpf/src/`)
 
-Five LSM hooks enforce zone boundaries at the kernel level: `file_open`, `bprm_check_security`, `ptrace_access_check`, `task_kill`, `cgroup_attach_task`. Programs use hardcoded struct offsets (not CO-RE yet). Shared kernel/userspace types live in `rauha-ebpf-common`.
+Five LSM hooks enforce zone boundaries at the kernel level: `file_open`, `bprm_check_security`, `ptrace_access_check`, `task_kill`, `cgroup_attach_task`. All kernel memory reads use `bpf_probe_read_kernel` (not raw pointer dereference). Kernel struct offsets are hardcoded in `rauha-ebpf/src/main.rs::offsets` module and validated at startup via pahole + a runtime self-test. Shared kernel/userspace types live in `rauha-ebpf-common`.
+
+Six BPF maps: `ZONE_MEMBERSHIP` (cgroup→zone), `ZONE_POLICY` (zone→policy flags), `INODE_ZONE_MAP` (inode→zone for file isolation), `ZONE_ALLOWED_COMMS` (cross-zone permission pairs), `SELF_TEST` (startup offset validation), `ENFORCEMENT_COUNTERS` (per-hook allow/deny/error counts, PerCpuArray).
+
+The offset self-test (`SELF_TEST` map) compares `bpf_get_current_cgroup_id()` against the offset-chain-derived cgroup_id on first `file_open`. If they differ, `EbpfManager::load()` returns an error and the daemon runs in degraded mode (no eBPF enforcement). This prevents silent enforcement failure from wrong offsets.
 
 Built separately via `cargo xtask build-ebpf` targeting `bpfel-unknown-none`. Not part of the normal workspace build.
 

@@ -78,6 +78,18 @@ impl EbpfManager {
         }
 
         let pin_path = PathBuf::from(BPF_PIN_PATH);
+
+        // Remove any stale pinned maps from a previous run (crash recovery).
+        // BpfLoader::map_pin_path() reuses existing pins, which would leave
+        // stale zone_id entries from the old run. Since recover_zone()
+        // repopulates all maps from redb, starting fresh is correct.
+        if pin_path.exists() {
+            for entry in fs::read_dir(&pin_path).into_iter().flatten().flatten() {
+                let _ = fs::remove_file(entry.path());
+            }
+            tracing::debug!("cleared stale BPF pin files from previous run");
+        }
+
         fs::create_dir_all(&pin_path).map_err(|e| RauhaError::EbpfError {
             message: format!("failed to create BPF pin directory: {e}"),
             hint: "run rauhad as root with BPF filesystem mounted".into(),

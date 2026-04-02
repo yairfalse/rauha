@@ -296,6 +296,11 @@ impl LinuxBackend {
     }
 
     /// Sync the ZONE_ALLOWED_COMMS BPF map for defense-in-depth.
+    ///
+    /// Revokes any previously allowed comms for this zone that are no longer
+    /// in the policy, then adds the current allowed set. This ensures
+    /// hot-reload actually revokes permissions when zones are removed from
+    /// `allowed_zones`.
     fn sync_bpf_allowed_comms(
         &self,
         bpf: &mut aya::Bpf,
@@ -305,13 +310,39 @@ impl LinuxBackend {
         let zone_names = self.zone_name_map.lock().unwrap_or_else(|e| e.into_inner());
         let zone_ids = self.zone_id_map.lock().unwrap_or_else(|e| e.into_inner());
 
+        // Collect the set of peer zone_ids that should be allowed.
+        let mut allowed_peer_ids: std::collections::HashSet<u32> = std::collections::HashSet::new();
         for allowed_zone_name in &net_policy.allowed_zones {
             if let Some(peer_uuid) = zone_names.get(allowed_zone_name) {
                 if let Some(&peer_zone_id) = zone_ids.get(peer_uuid) {
-                    // Allow bidirectional communication.
-                    let _ = MapManager::allow_zone_comm(bpf, zone_id, peer_zone_id);
-                    let _ = MapManager::allow_zone_comm(bpf, peer_zone_id, zone_id);
+                    allowed_peer_ids.insert(peer_zone_id);
                 }
+            }
+        }
+
+        // Revoke comms for all known zones that are NOT in the allowed set.
+        // This handles the hot-reload case where a zone is removed from allowed_zones.
+        for &peer_zone_id in zone_ids.values() {
+            if peer_zone_id == zone_id {
+                continue;
+            }
+            if !allowed_peer_ids.contains(&peer_zone_id) {
+                if let Err(e) = MapManager::deny_zone_comm(bpf, zone_id, peer_zone_id) {
+                    tracing::warn!(%e, zone_id, peer_zone_id, "failed to revoke zone comm");
+                }
+                if let Err(e) = MapManager::deny_zone_comm(bpf, peer_zone_id, zone_id) {
+                    tracing::warn!(%e, zone_id, peer_zone_id, "failed to revoke reverse zone comm");
+                }
+            }
+        }
+
+        // Add the currently allowed comms.
+        for &peer_zone_id in &allowed_peer_ids {
+            if let Err(e) = MapManager::allow_zone_comm(bpf, zone_id, peer_zone_id) {
+                tracing::warn!(%e, zone_id, peer_zone_id, "failed to allow zone comm in BPF map");
+            }
+            if let Err(e) = MapManager::allow_zone_comm(bpf, peer_zone_id, zone_id) {
+                tracing::warn!(%e, zone_id, peer_zone_id, "failed to allow reverse zone comm in BPF map");
             }
         }
 
