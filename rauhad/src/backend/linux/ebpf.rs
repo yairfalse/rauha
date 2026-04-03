@@ -14,13 +14,14 @@ use rauha_common::error::{RauhaError, Result};
 
 const BPF_PIN_PATH: &str = "/sys/fs/bpf/rauha";
 
-/// Names of LSM programs in the eBPF object.
-const LSM_PROGRAMS: &[&str] = &[
-    "rauha_file_open",
-    "rauha_bprm_check",
-    "rauha_ptrace_check",
-    "rauha_task_kill",
-    "rauha_cgroup_attach",
+/// LSM programs: (program_name_in_object, lsm_hook_name).
+/// The hook name is what Aya passes to the kernel BTF lookup.
+const LSM_PROGRAMS: &[(&str, &str)] = &[
+    ("rauha_file_open", "file_open"),
+    ("rauha_bprm_check", "bprm_check_security"),
+    ("rauha_ptrace_check", "ptrace_access_check"),
+    ("rauha_task_kill", "task_kill"),
+    ("rauha_cgroup_attach", "cgroup_attach_task"),
 ];
 
 /// Names of maps to pin for persistence.
@@ -142,35 +143,33 @@ impl EbpfManager {
         let mut program_fds = HashMap::new();
 
         // Attach all LSM programs.
-        for &name in LSM_PROGRAMS {
-            let prog: &mut Lsm = bpf.program_mut(name)
+        for &(prog_name, hook_name) in LSM_PROGRAMS {
+            let prog: &mut Lsm = bpf.program_mut(prog_name)
                 .ok_or_else(|| RauhaError::EbpfError {
-                    message: format!("LSM program '{name}' not found in object"),
+                    message: format!("LSM program '{prog_name}' not found in object"),
                     hint: "rebuild eBPF programs with `cargo xtask build-ebpf`".into(),
                 })?
                 .try_into()
                 .map_err(|e| RauhaError::EbpfError {
-                    message: format!("program '{name}' is not an LSM program: {e}"),
+                    message: format!("program '{prog_name}' is not an LSM program: {e}"),
                     hint: "check the eBPF source uses #[lsm] macro".into(),
                 })?;
 
-            prog.load(name, &btf).map_err(|e| RauhaError::EbpfError {
-                message: format!("failed to load LSM program '{name}': {e}"),
+            prog.load(hook_name, &btf).map_err(|e| RauhaError::EbpfError {
+                message: format!("failed to load LSM program '{prog_name}' (hook={hook_name}): {e}"),
                 hint: "check BPF verifier output, program may be too complex".into(),
             })?;
 
             prog.attach().map_err(|e| RauhaError::EbpfError {
-                message: format!("failed to attach LSM program '{name}': {e}"),
+                message: format!("failed to attach LSM program '{prog_name}': {e}"),
                 hint: "ensure kernel has `lsm=bpf` in boot cmdline".into(),
             })?;
 
-            // Record the program fd for health checking. The fd stays valid
-            // as long as the Bpf object (which owns the program) is alive.
             if let Ok(prog_fd) = prog.fd() {
-                program_fds.insert(name.to_string(), prog_fd.as_fd().as_raw_fd());
+                program_fds.insert(prog_name.to_string(), prog_fd.as_fd().as_raw_fd());
             }
 
-            tracing::info!(program = name, "attached LSM program");
+            tracing::info!(program = prog_name, hook = hook_name, "attached LSM program");
         }
 
         tracing::info!(
@@ -229,28 +228,27 @@ impl EbpfManager {
     pub fn health_check(&self) -> Result<Vec<ProgramStatus>> {
         let mut statuses = Vec::new();
 
-        for &name in LSM_PROGRAMS {
-            let loaded = self.bpf.program(name).is_some();
+        for &(prog_name, _) in LSM_PROGRAMS {
+            let loaded = self.bpf.program(prog_name).is_some();
 
-            // Verify the program fd is still open in /proc/self/fd.
-            let attached = if let Some(&fd) = self.program_fds.get(name) {
+            let attached = if let Some(&fd) = self.program_fds.get(prog_name) {
                 fd >= 0 && Path::new(&format!("/proc/self/fd/{fd}")).exists()
             } else {
                 false
             };
 
             if !loaded {
-                tracing::warn!(program = name, "LSM program not found in BPF object");
+                tracing::warn!(program = prog_name, "LSM program not found in BPF object");
             } else if !attached {
                 tracing::warn!(
-                    program = name,
+                    program = prog_name,
                     "LSM program fd invalid — enforcement may be inactive. \
                      Restart rauhad to re-attach."
                 );
             }
 
             statuses.push(ProgramStatus {
-                name: name.to_string(),
+                name: prog_name.to_string(),
                 loaded,
                 attached,
             });
@@ -339,9 +337,9 @@ impl EbpfManager {
         })?;
 
         let mut results = Vec::new();
-        for (idx, &name) in LSM_PROGRAMS.iter().enumerate() {
+        for (idx, &(prog_name, _)) in LSM_PROGRAMS.iter().enumerate() {
             let per_cpu = map.get(&(idx as u32), 0).map_err(|e| RauhaError::EbpfError {
-                message: format!("failed to read counters for {name}: {e}"),
+                message: format!("failed to read counters for {prog_name}: {e}"),
                 hint: "".into(),
             })?;
 
@@ -353,7 +351,7 @@ impl EbpfManager {
                 total.error += cpu_val.error;
             }
 
-            results.push((name.to_string(), total));
+            results.push((prog_name.to_string(), total));
         }
 
         Ok(results)
