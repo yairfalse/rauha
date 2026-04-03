@@ -11,8 +11,8 @@
 
 use aya_ebpf::programs::LsmContext;
 
-use crate::{lookup_caller_zone, read_kernel_u64, count_decision, offsets, ZONE_MEMBERSHIP};
-use rauha_ebpf_common::{ZONE_FLAG_GLOBAL, PROG_CGROUP_ATTACH};
+use crate::{lookup_caller_zone, read_kernel_u64, count_decision, emit_deny_event, offsets, ZONE_MEMBERSHIP};
+use rauha_ebpf_common::{ZONE_FLAG_GLOBAL, PROG_CGROUP_ATTACH, HOOK_CGROUP_ATTACH};
 
 /// Called from the cgroup_attach_task LSM hook.
 ///
@@ -65,6 +65,7 @@ fn try_cgroup_attach(ctx: &LsmContext) -> Result<i32, i64> {
                 Ok(0)
             } else {
                 // Moving to a different zone's cgroup → zone escape. Deny.
+                emit_deny_event(HOOK_CGROUP_ATTACH, caller.zone_id, dst_info.zone_id, dst_cgroup_id);
                 Ok(-1)
             }
         }
@@ -77,6 +78,7 @@ fn try_cgroup_attach(ctx: &LsmContext) -> Result<i32, i64> {
             // Since legitimate within-zone child cgroups are registered by the
             // daemon before use, an unregistered destination is treated as a
             // potential escape. Deny for non-global zoned processes.
+            emit_deny_event(HOOK_CGROUP_ATTACH, caller.zone_id, 0, dst_cgroup_id);
             Ok(-1)
         }
     }

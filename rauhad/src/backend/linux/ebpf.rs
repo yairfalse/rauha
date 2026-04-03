@@ -31,6 +31,7 @@ const MAP_NAMES: &[&str] = &[
     "ZONE_ALLOWED_COMMS",
     "SELF_TEST",
     "ENFORCEMENT_COUNTERS",
+    "ENFORCEMENT_EVENTS",
 ];
 
 /// Expected kernel struct offsets hardcoded in the eBPF programs.
@@ -164,6 +165,23 @@ impl EbpfManager {
         mgr.verify_offset_self_test()?;
 
         Ok(mgr)
+    }
+
+    /// Take ownership of the ENFORCEMENT_EVENTS ring buffer map.
+    ///
+    /// Transfers the map out of the Bpf object so it can be moved into a
+    /// background task without lifetime issues. Can only be called once.
+    pub fn take_event_ring_buf(&mut self) -> Result<aya::maps::RingBuf<aya::maps::MapData>> {
+        let map = self.bpf.take_map("ENFORCEMENT_EVENTS").ok_or_else(|| {
+            RauhaError::EbpfError {
+                message: "ENFORCEMENT_EVENTS map not found or already taken".into(),
+                hint: "rebuild eBPF programs with `cargo xtask build-ebpf`".into(),
+            }
+        })?;
+        aya::maps::RingBuf::try_from(map).map_err(|e| RauhaError::EbpfError {
+            message: format!("failed to create RingBuf from ENFORCEMENT_EVENTS: {e}"),
+            hint: "check eBPF object was built correctly".into(),
+        })
     }
 
     /// Get a mutable reference to the inner Bpf object for map access.

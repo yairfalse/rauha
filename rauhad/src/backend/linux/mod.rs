@@ -7,6 +7,7 @@
 
 mod cgroup;
 mod ebpf;
+mod events;
 mod maps;
 mod namespace;
 mod network;
@@ -100,6 +101,8 @@ pub struct LinuxBackend {
     /// Registered inodes per zone, for correct cleanup without re-walking.
     /// Key is zone name, value is the inode list registered in INODE_ZONE_MAP.
     registered_inodes: Mutex<HashMap<String, Vec<u64>>>,
+    /// Cancellation token for the enforcement event reader task.
+    event_reader_cancel: Option<tokio_util::sync::CancellationToken>,
     /// IP address allocator for zone networking.
     ip_allocator: Mutex<IpAllocator>,
 }
@@ -111,14 +114,28 @@ impl LinuxBackend {
 
         // Try to load eBPF programs. If it fails, log a warning and continue
         // in degraded mode (no kernel enforcement).
-        let ebpf = match Self::try_load_ebpf(root) {
-            Ok(mgr) => {
+        let (ebpf, event_reader_cancel) = match Self::try_load_ebpf(root) {
+            Ok(mut mgr) => {
                 tracing::info!("eBPF programs loaded — kernel enforcement active");
-                Some(mgr)
+
+                // Start the enforcement event reader (ring buffer → tracing logs).
+                let cancel = match mgr.take_event_ring_buf() {
+                    Ok(ring_buf) => {
+                        let token = tokio_util::sync::CancellationToken::new();
+                        events::spawn_event_reader(ring_buf, token.clone());
+                        Some(token)
+                    }
+                    Err(e) => {
+                        tracing::warn!(%e, "enforcement event ring buffer not available");
+                        None
+                    }
+                };
+
+                (Some(mgr), cancel)
             }
             Err(e) => {
                 tracing::warn!(%e, "eBPF programs not loaded — running without kernel enforcement");
-                None
+                (None, None)
             }
         };
 
@@ -145,6 +162,7 @@ impl LinuxBackend {
             zone_name_map: Mutex::new(HashMap::new()),
             shim_connections: Mutex::new(HashMap::new()),
             registered_inodes: Mutex::new(HashMap::new()),
+            event_reader_cancel,
             ip_allocator: Mutex::new(ip_allocator),
         })
     }

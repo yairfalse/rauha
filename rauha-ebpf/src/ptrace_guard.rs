@@ -10,7 +10,7 @@
 use aya_ebpf::programs::LsmContext;
 
 use crate::{lookup_caller_zone, check_cross_zone_task_access, count_decision, ZONE_POLICY};
-use rauha_ebpf_common::{ZONE_FLAG_GLOBAL, POLICY_FLAG_ALLOW_PTRACE, PROG_PTRACE_CHECK};
+use rauha_ebpf_common::{ZONE_FLAG_GLOBAL, POLICY_FLAG_ALLOW_PTRACE, PROG_PTRACE_CHECK, HOOK_PTRACE_CHECK};
 
 /// Called from the ptrace_access_check LSM hook.
 ///
@@ -45,5 +45,5 @@ fn try_ptrace_check(ctx: &LsmContext) -> Result<i32, i64> {
     }
 
     // Fall through to the shared cross-zone task access check.
-    check_cross_zone_task_access(ctx)
+    check_cross_zone_task_access(ctx, HOOK_PTRACE_CHECK)
 }

@@ -94,6 +94,46 @@ pub const PROG_TASK_KILL: u32 = 3;
 pub const PROG_CGROUP_ATTACH: u32 = 4;
 pub const ENFORCEMENT_COUNTER_ENTRIES: u32 = 5;
 
+// Hook type constants for EnforcementEvent.
+pub const HOOK_FILE_OPEN: u8 = 0;
+pub const HOOK_BPRM_CHECK: u8 = 1;
+pub const HOOK_PTRACE_CHECK: u8 = 2;
+pub const HOOK_TASK_KILL: u8 = 3;
+pub const HOOK_CGROUP_ATTACH: u8 = 4;
+
+// Decision constants for EnforcementEvent.
+pub const DECISION_ALLOW: u8 = 0;
+pub const DECISION_DENY: u8 = 1;
+
+/// Enforcement event emitted from BPF hooks via ring buffer.
+///
+/// Fixed 48-byte struct. All hooks populate the common fields;
+/// hook-specific context goes in the `context` field:
+///   - file_open / bprm_check: the denied inode number
+///   - cgroup_attach: the destination cgroup_id
+///   - ptrace / task_kill: 0 (target PID to be added later)
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct EnforcementEvent {
+    /// Monotonic timestamp from bpf_ktime_get_ns().
+    pub timestamp_ns: u64,
+    /// Caller's tgid (process ID).
+    pub pid: u32,
+    /// Which LSM hook (HOOK_FILE_OPEN, etc.).
+    pub hook: u8,
+    /// Decision (DECISION_DENY, etc.).
+    pub decision: u8,
+    pub _pad0: [u8; 2],
+    /// Caller's zone_id (0 = unzoned).
+    pub caller_zone: u32,
+    /// Target zone_id (for cross-zone denies).
+    pub target_zone: u32,
+    /// Hook-specific context data.
+    pub context: u64,
+    /// Reserved for future use (comm name, etc.).
+    pub _reserved: [u64; 2],
+}
+
 #[cfg(feature = "userspace")]
 mod cap_convert {
     use super::ZonePolicyKernel;
@@ -198,6 +238,8 @@ unsafe impl Sync for SelfTestResult {}
 unsafe impl Send for SelfTestResult {}
 unsafe impl Sync for EnforcementCounters {}
 unsafe impl Send for EnforcementCounters {}
+unsafe impl Sync for EnforcementEvent {}
+unsafe impl Send for EnforcementEvent {}
 
 // aya::Pod is required for types used as BPF map keys/values on the userspace side.
 // All three types are #[repr(C)], Copy, and have no padding — safe to implement.
@@ -211,6 +253,8 @@ unsafe impl aya::Pod for ZoneCommKey {}
 unsafe impl aya::Pod for SelfTestResult {}
 #[cfg(feature = "userspace")]
 unsafe impl aya::Pod for EnforcementCounters {}
+#[cfg(feature = "userspace")]
+unsafe impl aya::Pod for EnforcementEvent {}
 
 #[cfg(test)]
 mod tests {
@@ -240,6 +284,11 @@ mod tests {
     #[test]
     fn enforcement_counters_size() {
         assert_eq!(size_of::<EnforcementCounters>(), 24);
+    }
+
+    #[test]
+    fn enforcement_event_size() {
+        assert_eq!(size_of::<EnforcementEvent>(), 48);
     }
 
     #[test]

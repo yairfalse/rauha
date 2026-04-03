@@ -1,14 +1,17 @@
 #![no_std]
 #![no_main]
 
+use core::mem::MaybeUninit;
+
 use aya_ebpf::{
     macros::{lsm, map},
-    maps::{Array, HashMap, PerCpuArray},
+    maps::{Array, HashMap, PerCpuArray, ring_buf::RingBuf},
     programs::LsmContext,
 };
 use rauha_ebpf_common::{
-    EnforcementCounters, SelfTestResult, ZoneCommKey, ZoneInfoKernel, ZonePolicyKernel,
-    ENFORCEMENT_COUNTER_ENTRIES, MAX_CGROUPS, MAX_INODES, MAX_ZONES,
+    EnforcementCounters, EnforcementEvent, SelfTestResult, ZoneCommKey, ZoneInfoKernel,
+    ZonePolicyKernel, DECISION_DENY, ENFORCEMENT_COUNTER_ENTRIES, MAX_CGROUPS, MAX_INODES,
+    MAX_ZONES,
 };
 
 mod file_guard;
@@ -43,6 +46,12 @@ static SELF_TEST: Array<SelfTestResult> = Array::with_max_entries(1, 0);
 #[map]
 static ENFORCEMENT_COUNTERS: PerCpuArray<EnforcementCounters> =
     PerCpuArray::with_max_entries(ENFORCEMENT_COUNTER_ENTRIES, 0);
+
+/// Ring buffer for streaming enforcement deny events to userspace.
+/// 256 pages = 1MB. At 48 bytes/event, holds ~21K events before wrapping.
+/// Only deny events are emitted — allows are tracked by counters only.
+#[map]
+static ENFORCEMENT_EVENTS: RingBuf = RingBuf::with_byte_size(256 * 4096, 0);
 
 /// Look up the caller's zone from their cgroup_id.
 /// Returns None if the process is not in any zone (global/unzoned).
@@ -168,14 +177,43 @@ fn is_cross_zone_allowed(src_zone: u32, dst_zone: u32) -> bool {
     unsafe { ZONE_ALLOWED_COMMS.get(&key).is_some() }
 }
 
+/// Emit a deny enforcement event to the ring buffer.
+///
+/// Best-effort: if the ring buffer is full, the event is silently dropped.
+/// Counters (count_decision) remain the source of truth for totals.
+#[inline(always)]
+fn emit_deny_event(hook: u8, caller_zone: u32, target_zone: u32, context: u64) {
+    let pid = (unsafe { aya_ebpf::helpers::bpf_get_current_pid_tgid() } >> 32) as u32;
+    let ts = unsafe { aya_ebpf::helpers::bpf_ktime_get_ns() };
+
+    let event = EnforcementEvent {
+        timestamp_ns: ts,
+        pid,
+        hook,
+        decision: DECISION_DENY,
+        _pad0: [0; 2],
+        caller_zone,
+        target_zone,
+        context,
+        _reserved: [0; 2],
+    };
+
+    if let Some(mut entry) = unsafe { ENFORCEMENT_EVENTS.reserve::<EnforcementEvent>(0) } {
+        entry.write(MaybeUninit::new(event));
+        entry.submit(0);
+    }
+}
+
 /// Check if a cross-zone task operation (ptrace, signal) should be denied.
 ///
 /// Shared logic for ptrace_guard and signal_guard — both hooks have the same
 /// signature pattern: ctx.arg(0) is the target task_struct pointer.
 ///
+/// `hook` identifies the caller for ring buffer event emission.
+///
 /// Returns 0 (allow) or -1 (deny).
 #[inline(always)]
-fn check_cross_zone_task_access(ctx: &LsmContext) -> Result<i32, i64> {
+fn check_cross_zone_task_access(ctx: &LsmContext, hook: u8) -> Result<i32, i64> {
     let caller = match lookup_caller_zone(ctx) {
         Some(info) => info,
         None => return Ok(0),
@@ -199,6 +237,7 @@ fn check_cross_zone_task_access(ctx: &LsmContext) -> Result<i32, i64> {
         return Ok(0);
     }
 
+    emit_deny_event(hook, caller.zone_id, target.zone_id, 0);
     Ok(-1)
 }
 

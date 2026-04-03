@@ -6,7 +6,7 @@
 use aya_ebpf::programs::LsmContext;
 
 use crate::{check_cross_zone_task_access, count_decision};
-use rauha_ebpf_common::PROG_TASK_KILL;
+use rauha_ebpf_common::{PROG_TASK_KILL, HOOK_TASK_KILL};
 
 /// Called from the task_kill LSM hook.
 ///
@@ -15,7 +15,7 @@ use rauha_ebpf_common::PROG_TASK_KILL;
 ///
 /// Returns 0 to allow, -1 (EPERM) to deny.
 pub fn task_kill(ctx: &LsmContext) -> i32 {
-    let (ret, is_error) = match check_cross_zone_task_access(ctx) {
+    let (ret, is_error) = match check_cross_zone_task_access(ctx, HOOK_TASK_KILL) {
         Ok(ret) => (ret, false),
         Err(_) => (0, true),
     };

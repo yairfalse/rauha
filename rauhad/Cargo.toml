@@ -31,6 +31,7 @@ aya-log = { workspace = true }
 rauha-ebpf-common = { workspace = true }
 nix = { workspace = true }
 oci-spec = { workspace = true }
+tokio-util = { version = "0.7", features = ["rt"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = { workspace = true }

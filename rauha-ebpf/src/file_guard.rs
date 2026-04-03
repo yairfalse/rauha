@@ -8,8 +8,8 @@
 use aya_ebpf::programs::LsmContext;
 
 use crate::{lookup_caller_zone, is_cross_zone_allowed, read_file_ino, maybe_run_self_test,
-            count_decision, INODE_ZONE_MAP};
-use rauha_ebpf_common::{ZONE_FLAG_GLOBAL, PROG_FILE_OPEN};
+            count_decision, emit_deny_event, INODE_ZONE_MAP};
+use rauha_ebpf_common::{ZONE_FLAG_GLOBAL, PROG_FILE_OPEN, HOOK_FILE_OPEN};
 
 /// Called from the file_open LSM hook.
 ///
@@ -57,6 +57,6 @@ fn try_file_open(ctx: &LsmContext) -> Result<i32, i64> {
         return Ok(0);
     }
 
-    // Deny cross-zone file access.
+    emit_deny_event(HOOK_FILE_OPEN, caller.zone_id, file_zone_id, ino);
     Ok(-1)
 }
