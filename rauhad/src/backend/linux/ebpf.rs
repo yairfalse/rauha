@@ -34,15 +34,20 @@ const MAP_NAMES: &[&str] = &[
     "ENFORCEMENT_EVENTS",
 ];
 
-/// Expected kernel struct offsets hardcoded in the eBPF programs.
-/// Used for runtime validation via `pahole` if available.
-const EXPECTED_OFFSETS: &[(&str, &str, usize)] = &[
-    ("task_struct", "cgroups", 2336),
-    ("css_set", "dfl_cgrp", 48),
-    ("cgroup", "kn", 64),
-    ("file", "f_inode", 32),
-    ("inode", "i_ino", 64),
-    ("linux_binprm", "file", 168),
+/// Struct field offsets and their corresponding eBPF global variable names.
+/// (struct_name, field_name, ebpf_global_name, default_offset)
+///
+/// At load time, userspace reads real offsets from BTF via pahole and injects
+/// them into the eBPF programs via `BpfLoader::set_global()`. If pahole is
+/// not available, the default offsets (correct for Linux 6.1+) are used.
+const OFFSET_DEFS: &[(&str, &str, &str, u64)] = &[
+    ("task_struct", "cgroups", "TASK_CGROUPS_OFFSET", 2336),
+    ("css_set", "dfl_cgrp", "CSS_SET_DFL_CGRP_OFFSET", 48),
+    ("cgroup", "kn", "CGROUP_KN_OFFSET", 64),
+    ("kernfs_node", "id", "KERNFS_NODE_ID_OFFSET", 0),
+    ("file", "f_inode", "FILE_F_INODE_OFFSET", 32),
+    ("inode", "i_ino", "INODE_I_INO_OFFSET", 64),
+    ("linux_binprm", "file", "BPRM_FILE_OFFSET", 168),
 ];
 
 pub struct EbpfManager {
@@ -101,17 +106,33 @@ impl EbpfManager {
             hint: "kernel must have CONFIG_DEBUG_INFO_BTF=y".into(),
         })?;
 
-        // Validate hardcoded struct offsets against running kernel.
-        validate_struct_offsets();
+        // Resolve struct offsets from the running kernel's BTF via pahole.
+        // These are injected into the eBPF programs as globals before loading.
+        let resolved_offsets = resolve_kernel_offsets();
 
         let obj_data = fs::read(ebpf_obj_path).map_err(|e| RauhaError::EbpfError {
             message: format!("failed to read eBPF object: {e}"),
             hint: format!("check permissions on {}", ebpf_obj_path.display()),
         })?;
 
-        let mut bpf = BpfLoader::new()
-            .btf(Some(&btf))
-            .map_pin_path(&pin_path)
+        // Collect offsets into a Vec so they live long enough for set_global.
+        let offset_values: Vec<(&str, u64)> = OFFSET_DEFS
+            .iter()
+            .map(|&(_, _, global_name, default)| {
+                let val = resolved_offsets.get(global_name).copied().unwrap_or(default);
+                (global_name, val)
+            })
+            .collect();
+
+        let mut loader = BpfLoader::new();
+        loader.btf(Some(&btf)).map_pin_path(&pin_path);
+
+        // Inject resolved offsets into eBPF globals before loading.
+        for (name, val) in &offset_values {
+            loader.set_global(name, val, true);
+        }
+
+        let mut bpf = loader
             .load(&obj_data)
             .map_err(|e| RauhaError::EbpfError {
                 message: format!("failed to load eBPF programs: {e}"),
@@ -359,56 +380,64 @@ pub struct ProgramStatus {
     pub attached: bool,
 }
 
-/// Validate hardcoded struct offsets against the running kernel using `pahole`.
+/// Resolve kernel struct offsets from BTF via pahole.
 ///
-/// `pahole` reads kernel DWARF/BTF debug info and prints struct layouts.
-/// If pahole is not installed, validation is skipped with a warning.
-/// Mismatches are logged as errors but don't block loading — the eBPF
-/// programs will load but may read wrong fields.
-fn validate_struct_offsets() {
+/// Returns a map of global_name → offset. If pahole is not available, returns
+/// defaults from OFFSET_DEFS. If pahole finds a different offset than the
+/// default, the resolved (real) offset is used and a log message is emitted.
+fn resolve_kernel_offsets() -> HashMap<String, u64> {
+    let mut offsets: HashMap<String, u64> = HashMap::new();
+
+    // Start with defaults.
+    for &(_, _, global_name, default) in OFFSET_DEFS {
+        offsets.insert(global_name.to_string(), default);
+    }
+
     let pahole = match which_pahole() {
         Some(path) => path,
         None => {
             tracing::warn!(
-                "pahole not found — cannot validate eBPF struct offsets against running kernel. \
-                 Install dwarves package for runtime offset validation."
+                "pahole not found — using default struct offsets. \
+                 Install dwarves package for automatic kernel offset resolution."
             );
-            return;
+            return offsets;
         }
     };
 
-    for &(type_name, field_name, expected) in EXPECTED_OFFSETS {
+    for &(type_name, field_name, global_name, default) in OFFSET_DEFS {
         match pahole_field_offset(&pahole, type_name, field_name) {
             Ok(actual) => {
-                if actual != expected {
-                    tracing::error!(
+                let actual_u64 = actual as u64;
+                if actual_u64 != default {
+                    tracing::info!(
                         r#type = type_name,
                         field = field_name,
-                        expected,
-                        actual,
-                        "struct offset mismatch — eBPF programs may read wrong field. \
-                         Update offsets in rauha-ebpf/src/main.rs and rebuild with \
-                         `cargo xtask build-ebpf`"
+                        default,
+                        resolved = actual_u64,
+                        "kernel offset differs from default — using resolved value"
                     );
                 } else {
                     tracing::debug!(
                         r#type = type_name,
                         field = field_name,
-                        offset = actual,
-                        "struct offset validated"
+                        offset = actual_u64,
+                        "kernel offset matches default"
                     );
                 }
+                offsets.insert(global_name.to_string(), actual_u64);
             }
             Err(e) => {
                 tracing::debug!(
                     r#type = type_name,
                     field = field_name,
                     %e,
-                    "could not validate offset"
+                    "could not resolve offset — using default"
                 );
             }
         }
     }
+
+    offsets
 }
 
 /// Find the `pahole` binary.

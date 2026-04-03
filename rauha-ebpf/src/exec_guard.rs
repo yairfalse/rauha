@@ -41,7 +41,7 @@ fn try_bprm_check(ctx: &LsmContext) -> Result<i32, i64> {
         return Ok(0);
     }
 
-    let file_ptr = unsafe { read_kernel_u64(bprm_ptr, offsets::BPRM_FILE)? };
+    let file_ptr = unsafe { read_kernel_u64(bprm_ptr, offsets::bprm_file())? };
 
     // file->f_inode->i_ino
     let ino = unsafe { read_file_ino(file_ptr)? };

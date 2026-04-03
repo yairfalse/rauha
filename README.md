@@ -324,7 +324,7 @@ cargo xtask build-ebpf
 
 **LSM is additive-only.** eBPF LSM programs can deny access but cannot override SELinux/AppArmor denials. Zone policy must be a subset of existing MAC policy.
 
-**Struct offsets are hardcoded.** eBPF programs use fixed offsets for kernel structs (e.g., `file->f_inode` at +32). Validated at startup via `pahole` and a runtime self-test that compares the offset-derived cgroup_id against `bpf_get_current_cgroup_id()`. If offsets are wrong, enforcement is disabled rather than silently incorrect. CO-RE migration is in progress.
+**Struct offsets are resolved at load time.** eBPF programs read kernel struct fields (e.g., `file->f_inode`, `task_struct->cgroups`) via configurable offsets injected as globals by userspace. When `pahole` is available, real offsets are read from the running kernel's BTF and patched into the programs before loading — no rebuild needed for different kernels. A runtime self-test validates the offset chain on first execution. If pahole is not installed, sensible defaults for Linux 6.1+ are used.
 
 **Covert channels** via shared kernel resources (CPU cache timing, memory pressure) are not addressable by eBPF. Same limitation as all OS-level isolation.
 

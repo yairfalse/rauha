@@ -48,11 +48,11 @@ fn try_cgroup_attach(ctx: &LsmContext) -> Result<i32, i64> {
     }
 
     // Read dst_cgrp->kn->id to get the destination cgroup_id.
-    let kn_ptr = unsafe { read_kernel_u64(dst_cgrp_ptr, offsets::CGROUP_KN)? };
+    let kn_ptr = unsafe { read_kernel_u64(dst_cgrp_ptr, offsets::cgroup_kn())? };
     if kn_ptr == 0 {
         return Ok(0);
     }
-    let dst_cgroup_id = unsafe { read_kernel_u64(kn_ptr, offsets::KERNFS_NODE_ID)? };
+    let dst_cgroup_id = unsafe { read_kernel_u64(kn_ptr, offsets::kernfs_node_id())? };
 
     // Look up which zone the destination cgroup belongs to.
     let dst_zone = unsafe { ZONE_MEMBERSHIP.get(&dst_cgroup_id) };
