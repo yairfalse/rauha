@@ -1,10 +1,22 @@
 # Rauha
 
-**Isolation-first container runtime for Linux and macOS.**
+**Kernel-level enforcement and observability for container isolation.**
 
-Containers bolt isolation onto a kernel that wasn't designed for it — namespaces, cgroups, and seccomp are independent mechanisms duct-taped together. Solaris got this right in 2005 with Zones: isolation was a first-class kernel concept, not an afterthought.
+Docker gives you namespaces and cgroups. That's structural isolation — it sets up walls, but nothing watches the doors. A process can't see across a namespace boundary, but the kernel doesn't know that two containers *shouldn't* talk to each other. There's no enforcement at the syscall level, no audit trail of what was allowed or denied, no way to prove a workload stayed inside its boundary.
 
-Rauha brings that philosophy to modern systems. **Zones** are the core primitive — a unified isolation boundary that ties together cgroups, namespaces, and eBPF enforcement under one API. Two native backends: eBPF LSM hooks on Linux, Virtualization.framework VMs on macOS.
+Rauha adds what's missing. Five eBPF LSM hooks run inside the kernel on every `open()`, `exec()`, `kill()`, `ptrace()`, and `cgroup_attach()`. Every call is checked against zone membership. Every deny is recorded with the process, the zone, and the target. This works on any cgroup-based workload — Rauha's own containers, or containers managed by containerd, Docker, or Kubernetes.
+
+**Two ways to use Rauha:**
+
+- **Rauha runtime** — a standalone container runtime where zones are first-class. Zones unify cgroups, namespaces, and eBPF enforcement under one API. Integrates with Kubernetes via a containerd shim v2. Linux uses eBPF LSM; macOS uses Virtualization.framework VMs.
+
+- **Rauha enforce** *(coming soon)* — a lightweight agent that drops eBPF enforcement onto existing clusters. No runtime replacement needed. It watches containerd events, maps workloads to zones by label, and populates the same BPF maps. Your containers get kernel-level isolation enforcement without changing how you deploy them.
+
+**Why this matters for AI infrastructure:**
+
+AI agents execute arbitrary code. Training jobs touch sensitive data. Model weights are high-value IP. GPU workloads share nodes. The isolation story for all of this is "a Docker container" — which means a shared kernel and hope.
+
+Rauha's eBPF hooks give you enforceable, auditable isolation: an agent sandbox where you can prove the agent never read files outside its zone. A training job where you have kernel-level evidence of which datasets were accessed. Millisecond zone startup with no VM boot overhead. Every enforcement decision streamed in real time for compliance and anomaly detection.
 
 > *Rauha* (Finnish) — peace, calm. What your production systems should be.
 
