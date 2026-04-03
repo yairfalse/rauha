@@ -73,6 +73,8 @@ This isn't a userspace check — it's enforced in the kernel on every access wit
 | `rauha_task_kill` | `task_kill` | Cross-zone signals |
 | `rauha_cgroup_attach` | `cgroup_attach_task` | Zone escape via cgroup manipulation |
 
+Every deny is emitted to a ring buffer with the caller PID, zone IDs, and context (inode, cgroup ID) for audit and debugging.
+
 Requires Linux 6.1+ with `CONFIG_BPF_LSM=y`.
 
 ### macOS: native VMs via Virtualization.framework
@@ -179,7 +181,29 @@ trait IsolationBackend: Send + Sync {
 | `rauha-oci` | OCI image pull, content store, rootfs preparation |
 | `rauha-ebpf` | eBPF LSM programs (kernel-side, separate build) |
 | `rauha-ebpf-common` | Shared `#[repr(C)]` types between eBPF and userspace |
+| `containerd-shim-rauha-v2` | containerd shim v2 — bridges containerd to rauhad for Kubernetes |
 | `xtask` | Build helper for eBPF compilation |
+
+### Kubernetes Integration
+
+Rauha integrates with Kubernetes via a containerd shim v2. The `containerd-shim-rauha-v2` binary bridges containerd's Task ttrpc API to rauhad's gRPC API:
+
+```
+kubelet → containerd → containerd-shim-rauha-v2 (ttrpc) → rauhad (gRPC)
+```
+
+Sandbox creation maps to Rauha zone creation. Container operations map to Rauha container operations within that zone. Use `runtimeClassName: rauha` in pod specs.
+
+### Enforcement Observability
+
+Every deny decision from the 5 LSM hooks is emitted to a BPF ring buffer and streamed to userspace. Each event carries the timestamp, PID, caller zone, target zone, and hook-specific context (inode for file access, cgroup ID for cgroup escape attempts).
+
+This provides:
+- **Audit trails** — provable evidence that a workload never escaped its zone
+- **Real-time visibility** — see enforcement decisions as they happen
+- **Debugging** — understand exactly why access was denied
+
+Enforcement counters (allow/deny/error per hook, per CPU) are always available for aggregate monitoring.
 
 ## Usage
 
@@ -237,7 +261,7 @@ deny = ["mount", "umount2", "pivot_root"]
 
 ## Oracle Test Suite
 
-Rauha includes a ground-truth oracle (`eval/oracle/`) — a standalone Rust binary that validates rauhad through its gRPC API. 54 numbered test cases across 11 categories. The oracle never reads source code, never mocks. When a case fails, it means the system's public contract is broken.
+Rauha includes a ground-truth oracle (`eval/oracle/`) — a standalone Rust binary that validates rauhad through its gRPC API. 55 numbered test cases across 11 categories. The oracle never reads source code, never mocks. When a case fails, it means the system's public contract is broken.
 
 ```bash
 cd eval/oracle
@@ -288,7 +312,7 @@ cargo xtask build-ebpf
 
 **LSM is additive-only.** eBPF LSM programs can deny access but cannot override SELinux/AppArmor denials. Zone policy must be a subset of existing MAC policy.
 
-**Struct offsets are hardcoded.** eBPF programs use fixed offsets for kernel structs (e.g., `file->f_inode` at +32). Correct for Linux 6.1+; CO-RE BTF support is planned.
+**Struct offsets are hardcoded.** eBPF programs use fixed offsets for kernel structs (e.g., `file->f_inode` at +32). Validated at startup via `pahole` and a runtime self-test that compares the offset-derived cgroup_id against `bpf_get_current_cgroup_id()`. If offsets are wrong, enforcement is disabled rather than silently incorrect. CO-RE migration is in progress.
 
 **Covert channels** via shared kernel resources (CPU cache timing, memory pressure) are not addressable by eBPF. Same limitation as all OS-level isolation.
 
