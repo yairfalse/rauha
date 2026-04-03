@@ -15,7 +15,10 @@ mod mapper;
 mod policy;
 mod watcher;
 
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
@@ -33,6 +36,10 @@ struct Cli {
     /// Path to the eBPF object file.
     #[arg(long)]
     ebpf_obj: Option<PathBuf>,
+
+    /// Path to the containerd socket for live event watching.
+    #[arg(long, default_value = "/run/containerd/containerd.sock")]
+    containerd_sock: String,
 }
 
 #[derive(Subcommand)]
@@ -60,12 +67,16 @@ async fn main() -> anyhow::Result<()> {
     match cli.command {
         Some(Commands::Status) => cmd_status().await,
         Some(Commands::Events { follow }) => cmd_events(follow).await,
-        None => cmd_run(cli.policy_dir, cli.ebpf_obj).await,
+        None => cmd_run(cli.policy_dir, cli.ebpf_obj, cli.containerd_sock).await,
     }
 }
 
 /// Main enforcement loop.
-async fn cmd_run(policy_dir: PathBuf, ebpf_obj: Option<PathBuf>) -> anyhow::Result<()> {
+async fn cmd_run(
+    policy_dir: PathBuf,
+    ebpf_obj: Option<PathBuf>,
+    containerd_sock: String,
+) -> anyhow::Result<()> {
     tracing::info!("rauha-enforce starting");
 
     // Load eBPF programs.
@@ -84,17 +95,19 @@ async fn cmd_run(policy_dir: PathBuf, ebpf_obj: Option<PathBuf>) -> anyhow::Resu
 
     // Enumerate existing containers and assign zones.
     let assignments = watcher::enumerate_cgroups(&policies)?;
-    let mut zone_counter = 1u32;
+    let zone_counter = AtomicU32::new(1);
+    let mut cgroup_id_map: HashMap<String, u64> = HashMap::new();
 
     for assignment in &assignments {
-        let zone_id = zone_counter;
-        zone_counter += 1;
+        let zone_id = zone_counter.fetch_add(1, Ordering::SeqCst);
 
         mgr.add_zone_member(assignment.cgroup_id, zone_id, rauha_common::zone::ZoneType::NonGlobal)?;
 
         if let Some(policy) = policies.get(&assignment.zone_name) {
             mgr.set_zone_policy(zone_id, policy)?;
         }
+
+        cgroup_id_map.insert(assignment.container_id.clone(), assignment.cgroup_id);
 
         tracing::info!(
             zone = assignment.zone_name,
@@ -106,9 +119,68 @@ async fn cmd_run(policy_dir: PathBuf, ebpf_obj: Option<PathBuf>) -> anyhow::Resu
 
     print_status_summary(&policies, &assignments, &mgr);
 
-    // Wait for shutdown.
-    tracing::info!("rauha-enforce running — press Ctrl+C to stop");
-    tokio::signal::ctrl_c().await?;
+    // Start live containerd event watcher.
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<watcher::WatcherEvent>(100);
+    let policies_arc = Arc::new(policies.clone());
+
+    tokio::spawn(watcher::watch_containerd_events(
+        containerd_sock,
+        policies_arc.clone(),
+        tx,
+    ));
+
+    tracing::info!("rauha-enforce running — watching for container events");
+
+    // Process live events until shutdown.
+    loop {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                tracing::info!("shutting down");
+                break;
+            }
+            event = rx.recv() => {
+                match event {
+                    Some(watcher::WatcherEvent::Add(assignment)) => {
+                        let zone_id = zone_counter.fetch_add(1, Ordering::SeqCst);
+                        if let Err(e) = mgr.add_zone_member(
+                            assignment.cgroup_id,
+                            zone_id,
+                            rauha_common::zone::ZoneType::NonGlobal,
+                        ) {
+                            tracing::error!(%e, "failed to add zone member");
+                            continue;
+                        }
+                        if let Some(policy) = policies_arc.get(&assignment.zone_name) {
+                            let _ = mgr.set_zone_policy(zone_id, policy);
+                        }
+                        cgroup_id_map.insert(assignment.container_id.clone(), assignment.cgroup_id);
+                        tracing::info!(
+                            container = assignment.container_id,
+                            zone = assignment.zone_name,
+                            zone_id,
+                            "live: container enforced"
+                        );
+                    }
+                    Some(watcher::WatcherEvent::Remove { container_id, cgroup_id }) => {
+                        // Use tracked cgroup_id if the event didn't provide one.
+                        let resolved_cgroup_id = if cgroup_id != 0 {
+                            cgroup_id
+                        } else {
+                            cgroup_id_map.remove(&container_id).unwrap_or(0)
+                        };
+                        if resolved_cgroup_id != 0 {
+                            let _ = mgr.remove_zone_member(resolved_cgroup_id);
+                        }
+                        tracing::info!(container = container_id, "live: container removed");
+                    }
+                    None => {
+                        tracing::warn!("event channel closed");
+                        break;
+                    }
+                }
+            }
+        }
+    }
 
     cancel.cancel();
     mgr.cleanup();
