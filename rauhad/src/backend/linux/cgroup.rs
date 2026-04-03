@@ -40,6 +40,18 @@ impl CgroupManager {
             })?;
         }
 
+        // Enable controllers for child cgroups (zones).
+        // Without this, zone cgroups can't use cpu.weight, memory.max, etc.
+        let subtree_control = slice_path.join("cgroup.subtree_control");
+        if let Err(e) = fs::write(&subtree_control, "+cpu +memory +pids +io") {
+            tracing::warn!(
+                %e,
+                "failed to enable cgroup controllers in rauha.slice — \
+                 resource limits may not work. Check that parent cgroup has \
+                 controllers delegated."
+            );
+        }
+
         Ok(Self { slice_path })
     }
 
