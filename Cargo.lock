@@ -2312,6 +2312,7 @@ dependencies = [
  "rauha-common",
  "rauha-ebpf-common",
  "serde",
+ "serde_json",
  "tokio",
  "tokio-util",
  "toml",

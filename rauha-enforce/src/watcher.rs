@@ -1,15 +1,17 @@
-//! Container watcher — enumerates existing container cgroups.
+//! Container watcher — enumerates existing container cgroups and assigns zones.
 //!
-//! V1: scans /sys/fs/cgroup for containerd scope cgroups and reads labels
-//! from containerd's state directory.
-//!
-//! Future: subscribe to containerd ttrpc events for live updates.
+//! Zone assignment is label-driven: containers with a `rauha.dev/zone`
+//! annotation in their OCI spec are assigned to the named zone. Containers
+//! without the label are treated as global (no enforcement).
 
 use std::collections::HashMap;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 
 use rauha_common::zone::ZonePolicy;
+
+/// Label key for zone assignment.
+const ANNOTATION_ZONE: &str = "rauha.dev/zone";
 
 /// A container's zone assignment.
 pub struct ZoneAssignment {
@@ -18,20 +20,16 @@ pub struct ZoneAssignment {
     pub cgroup_id: u64,
 }
 
-/// Enumerate existing container cgroups and assign zones.
+/// Enumerate existing container cgroups and assign zones by label.
 ///
 /// Walks /sys/fs/cgroup looking for containerd-managed cgroups. For each one,
-/// attempts to read zone labels. Containers without a zone label are skipped
-/// (treated as global).
-///
-/// This is a best-effort scan — if the cgroup structure doesn't match
-/// expectations, containers are silently skipped.
+/// reads the OCI config.json to find the `rauha.dev/zone` annotation.
+/// Containers without the annotation are skipped (global zone, no enforcement).
 pub fn enumerate_cgroups(
     policies: &HashMap<String, ZonePolicy>,
 ) -> anyhow::Result<Vec<ZoneAssignment>> {
     let mut assignments = Vec::new();
 
-    // Common cgroup paths for containerd-managed containers.
     let cgroup_roots = [
         "/sys/fs/cgroup/system.slice",
         "/sys/fs/cgroup/kubepods.slice",
@@ -83,35 +81,68 @@ fn scan_cgroup_dir(
                 .unwrap_or(&name)
                 .to_string();
 
-            // Get cgroup_id from the directory's inode.
             let cgroup_id = resolve_cgroup_id(&path);
             if cgroup_id == 0 {
                 continue;
             }
 
-            // Try to find a zone assignment for this container.
-            // In a full implementation, we'd read labels from containerd's
-            // metadata store. For V1, we assign based on policy file existence:
-            // if a policy named after the cgroup path segment exists, use it.
-            for zone_name in policies.keys() {
-                // Simple heuristic: if there's a policy, and the container
-                // exists, assign it. In production, this would be label-driven.
-                assignments.push(ZoneAssignment {
-                    container_id: container_id.clone(),
-                    zone_name: zone_name.clone(),
-                    cgroup_id,
-                });
-                break; // One zone per container.
+            // Read zone label from the container's OCI config.json.
+            if let Some(zone_name) = read_container_zone_label(&container_id) {
+                if policies.contains_key(&zone_name) {
+                    assignments.push(ZoneAssignment {
+                        container_id,
+                        zone_name,
+                        cgroup_id,
+                    });
+                } else {
+                    tracing::warn!(
+                        container = container_id,
+                        zone = zone_name,
+                        "container has rauha.dev/zone label but no matching policy — skipping"
+                    );
+                }
             }
+            // No label → silently skip (global zone, no enforcement).
         }
 
         // Recurse into subdirectories (for nested cgroup hierarchies).
-        if path.is_dir() {
-            scan_cgroup_dir(&path, policies, assignments)?;
-        }
+        scan_cgroup_dir(&path, policies, assignments)?;
     }
 
     Ok(())
+}
+
+/// Read the `rauha.dev/zone` annotation from a container's OCI config.json.
+///
+/// Containerd writes the OCI runtime spec at a well-known path for each
+/// container task. The annotations map contains container labels.
+fn read_container_zone_label(container_id: &str) -> Option<String> {
+    let state_paths = [
+        format!(
+            "/run/containerd/io.containerd.runtime.v2.task/default/{container_id}/config.json"
+        ),
+        format!(
+            "/run/containerd/io.containerd.runtime.v2.task/k8s.io/{container_id}/config.json"
+        ),
+        format!(
+            "/run/containerd/io.containerd.runtime.v2.task/moby/{container_id}/config.json"
+        ),
+    ];
+
+    for path in &state_paths {
+        if let Ok(data) = std::fs::read_to_string(path) {
+            if let Ok(spec) = serde_json::from_str::<serde_json::Value>(&data) {
+                if let Some(zone) = spec
+                    .get("annotations")
+                    .and_then(|a| a.get(ANNOTATION_ZONE))
+                    .and_then(|v| v.as_str())
+                {
+                    return Some(zone.to_string());
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Resolve a cgroup directory path to its cgroup_id.
