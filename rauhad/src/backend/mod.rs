@@ -7,22 +7,32 @@ pub mod linux;
 #[cfg(target_os = "macos")]
 pub mod macos;
 
+/// Enforcement event broadcast sender type (Linux only).
+#[cfg(target_os = "linux")]
+pub type EventSender = tokio::sync::broadcast::Sender<linux::events::DecodedEvent>;
+
 /// Create the platform-appropriate isolation backend.
-pub fn create_backend(root: &str) -> rauha_common::error::Result<Box<dyn IsolationBackend>> {
-    #[cfg(target_os = "linux")]
-    {
-        Ok(Box::new(linux::LinuxBackend::new(root)?))
-    }
+#[cfg(target_os = "linux")]
+pub fn create_backend(
+    root: &str,
+) -> rauha_common::error::Result<(Box<dyn IsolationBackend>, Option<EventSender>)> {
+    let backend = linux::LinuxBackend::new(root)?;
+    let event_tx = backend.event_sender();
+    Ok((Box::new(backend), event_tx))
+}
 
-    #[cfg(target_os = "macos")]
-    {
-        Ok(Box::new(macos::MacosBackend::new(root)?))
-    }
+#[cfg(target_os = "macos")]
+pub fn create_backend(
+    root: &str,
+) -> rauha_common::error::Result<Box<dyn IsolationBackend>> {
+    Ok(Box::new(macos::MacosBackend::new(root)?))
+}
 
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    {
-        Err(rauha_common::error::RauhaError::UnsupportedPlatform(
-            std::env::consts::OS.into(),
-        ))
-    }
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub fn create_backend(
+    root: &str,
+) -> rauha_common::error::Result<Box<dyn IsolationBackend>> {
+    Err(rauha_common::error::RauhaError::UnsupportedPlatform(
+        std::env::consts::OS.into(),
+    ))
 }

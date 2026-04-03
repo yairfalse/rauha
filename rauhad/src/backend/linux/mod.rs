@@ -7,7 +7,7 @@
 
 mod cgroup;
 mod ebpf;
-mod events;
+pub mod events;
 mod maps;
 mod namespace;
 mod network;
@@ -103,6 +103,8 @@ pub struct LinuxBackend {
     registered_inodes: Mutex<HashMap<String, Vec<u64>>>,
     /// Cancellation token for the enforcement event reader task.
     event_reader_cancel: Option<tokio_util::sync::CancellationToken>,
+    /// Broadcast sender for enforcement events (gRPC WatchEvents subscribes here).
+    event_tx: Option<tokio::sync::broadcast::Sender<events::DecodedEvent>>,
     /// IP address allocator for zone networking.
     ip_allocator: Mutex<IpAllocator>,
 }
@@ -114,28 +116,28 @@ impl LinuxBackend {
 
         // Try to load eBPF programs. If it fails, log a warning and continue
         // in degraded mode (no kernel enforcement).
-        let (ebpf, event_reader_cancel) = match Self::try_load_ebpf(root) {
+        let (ebpf, event_reader_cancel, event_tx) = match Self::try_load_ebpf(root) {
             Ok(mut mgr) => {
                 tracing::info!("eBPF programs loaded — kernel enforcement active");
 
                 // Start the enforcement event reader (ring buffer → tracing logs).
-                let cancel = match mgr.take_event_ring_buf() {
+                let (cancel, event_tx) = match mgr.take_event_ring_buf() {
                     Ok(ring_buf) => {
                         let token = tokio_util::sync::CancellationToken::new();
-                        events::spawn_event_reader(ring_buf, token.clone());
-                        Some(token)
+                        let tx = events::spawn_event_reader(ring_buf, token.clone());
+                        (Some(token), Some(tx))
                     }
                     Err(e) => {
                         tracing::warn!(%e, "enforcement event ring buffer not available");
-                        None
+                        (None, None)
                     }
                 };
 
-                (Some(mgr), cancel)
+                (Some(mgr), cancel, event_tx)
             }
             Err(e) => {
                 tracing::warn!(%e, "eBPF programs not loaded — running without kernel enforcement");
-                (None, None)
+                (None, None, None)
             }
         };
 
@@ -163,6 +165,7 @@ impl LinuxBackend {
             shim_connections: Mutex::new(HashMap::new()),
             registered_inodes: Mutex::new(HashMap::new()),
             event_reader_cancel,
+            event_tx,
             ip_allocator: Mutex::new(ip_allocator),
         })
     }
@@ -193,6 +196,11 @@ impl LinuxBackend {
             message: "eBPF object not found in any known location".into(),
             hint: "run `cargo xtask build-ebpf` to compile eBPF programs".into(),
         })
+    }
+
+    /// Get a clone of the enforcement event broadcast sender, if available.
+    pub fn event_sender(&self) -> Option<tokio::sync::broadcast::Sender<events::DecodedEvent>> {
+        self.event_tx.clone()
     }
 
     /// Allocate a new compact zone_id for BPF maps.

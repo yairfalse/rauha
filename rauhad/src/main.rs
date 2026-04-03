@@ -43,6 +43,9 @@ async fn main() -> anyhow::Result<()> {
     );
 
     // Create platform backend.
+    #[cfg(target_os = "linux")]
+    let (backend_box, event_tx) = backend::create_backend(&root)?;
+    #[cfg(not(target_os = "linux"))]
     let backend_box = backend::create_backend(&root)?;
     let backend: Arc<dyn rauha_common::backend::IsolationBackend> = Arc::from(backend_box);
 
@@ -70,6 +73,9 @@ async fn main() -> anyhow::Result<()> {
     registry.reconcile().await?;
 
     // Set up gRPC services.
+    #[cfg(target_os = "linux")]
+    let zone_svc = server::ZoneServiceImpl::new(registry.clone(), root.clone(), event_tx);
+    #[cfg(not(target_os = "linux"))]
     let zone_svc = server::ZoneServiceImpl::new(registry.clone(), root.clone());
     let container_svc = server::ContainerServiceImpl::new(registry.clone());
     let image_svc = server::ImageServiceImpl::new(image_service);

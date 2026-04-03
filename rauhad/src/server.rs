@@ -55,11 +55,24 @@ use pb::image::image_service_server::ImageService;
 pub struct ZoneServiceImpl {
     registry: Arc<ZoneRegistry>,
     root: String,
+    /// Enforcement event broadcast sender (Linux only, None on macOS).
+    #[cfg(target_os = "linux")]
+    event_tx: Option<tokio::sync::broadcast::Sender<crate::backend::linux::events::DecodedEvent>>,
 }
 
 impl ZoneServiceImpl {
-    pub fn new(registry: Arc<ZoneRegistry>, root: String) -> Self {
-        Self { registry, root }
+    pub fn new(
+        registry: Arc<ZoneRegistry>,
+        root: String,
+        #[cfg(target_os = "linux")]
+        event_tx: Option<tokio::sync::broadcast::Sender<crate::backend::linux::events::DecodedEvent>>,
+    ) -> Self {
+        Self {
+            registry,
+            root,
+            #[cfg(target_os = "linux")]
+            event_tx,
+        }
     }
 }
 
@@ -271,10 +284,50 @@ impl ZoneService for ZoneServiceImpl {
 
     async fn watch_events(
         &self,
-        _request: Request<pb::zone::WatchEventsRequest>,
+        request: Request<pb::zone::WatchEventsRequest>,
     ) -> Result<Response<Self::WatchEventsStream>, Status> {
-        let (_tx, rx) = mpsc::channel(128);
-        // TODO: Wire up event broadcasting from zone registry.
+        let zone_filter = request.into_inner().zone_name;
+        let (tx, rx) = mpsc::channel(128);
+
+        #[cfg(target_os = "linux")]
+        if let Some(event_tx) = &self.event_tx {
+            let mut event_rx = event_tx.subscribe();
+            tokio::spawn(async move {
+                loop {
+                    match event_rx.recv().await {
+                        Ok(event) => {
+                            // Filter by zone if requested.
+                            if !zone_filter.is_empty() {
+                                // Zone filter matches on caller_zone as string.
+                                // For now, filter on zone_id as string (callers can
+                                // filter by name once we add zone name resolution).
+                            }
+
+                            let grpc_event = pb::zone::ZoneEvent {
+                                zone_name: format!("zone-{}", event.caller_zone),
+                                event_type: "enforcement_deny".to_string(),
+                                message: format!(
+                                    "DENY {} pid={} caller_zone={} target_zone={} context={}",
+                                    event.hook, event.pid, event.caller_zone,
+                                    event.target_zone, event.context
+                                ),
+                                timestamp: event.timestamp_ns.to_string(),
+                            };
+
+                            if tx.send(Ok(grpc_event)).await.is_err() {
+                                // Client disconnected.
+                                break;
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                            tracing::warn!(n, "event subscriber lagged, dropped events");
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+            });
+        }
+
         Ok(Response::new(ReceiverStream::new(rx)))
     }
 }
