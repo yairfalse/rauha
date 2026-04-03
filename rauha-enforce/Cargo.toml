@@ -1,0 +1,38 @@
+[package]
+name = "rauha-enforce"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "rauha-enforce"
+path = "src/main.rs"
+
+[dependencies]
+# Shared types
+rauha-common = { path = "../rauha-common" }
+rauha-ebpf-common = { path = "../rauha-ebpf-common", features = ["userspace"] }
+
+# eBPF
+aya.workspace = true
+
+# Async runtime
+tokio.workspace = true
+tokio-util = { version = "0.7", features = ["rt"] }
+
+# Logging
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+# CLI
+clap.workspace = true
+
+# Error handling
+anyhow.workspace = true
+
+# Serialization
+serde.workspace = true
+toml.workspace = true
+
+# Utilities
+nix.workspace = true

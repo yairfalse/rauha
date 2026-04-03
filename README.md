@@ -194,6 +194,7 @@ trait IsolationBackend: Send + Sync {
 | `rauha-ebpf` | eBPF LSM programs (kernel-side, separate build) |
 | `rauha-ebpf-common` | Shared `#[repr(C)]` types between eBPF and userspace |
 | `containerd-shim-rauha-v2` | containerd shim v2 — bridges containerd to rauhad for Kubernetes |
+| `rauha-enforce` | Standalone eBPF enforcement agent — drops onto existing clusters |
 | `xtask` | Build helper for eBPF compilation |
 
 ### Kubernetes Integration

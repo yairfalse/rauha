@@ -2302,6 +2302,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "rauha-enforce"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "aya",
+ "clap",
+ "nix 0.29.0",
+ "rauha-common",
+ "rauha-ebpf-common",
+ "serde",
+ "tokio",
+ "tokio-util",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "rauha-guest-agent"
 version = "0.1.0"
 dependencies = [
