@@ -378,12 +378,20 @@ impl LinuxBackend {
 
 /// Find the rauha-shim binary.
 fn find_shim_binary() -> Result<PathBuf> {
+    let project_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .to_path_buf();
+
     let candidates = [
         // Same directory as the running binary.
         std::env::current_exe()
             .ok()
             .and_then(|p| p.parent().map(|d| d.join("rauha-shim"))),
-        // System path.
+        // Development build paths (debug + release).
+        Some(project_root.join("target/debug/rauha-shim")),
+        Some(project_root.join("target/release/rauha-shim")),
+        // System paths.
         Some(PathBuf::from("/usr/local/bin/rauha-shim")),
         Some(PathBuf::from("/usr/bin/rauha-shim")),
     ];

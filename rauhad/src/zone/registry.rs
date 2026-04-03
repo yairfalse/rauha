@@ -482,7 +482,17 @@ impl ZoneRegistry {
     #[cfg(target_os = "linux")]
     fn is_process_dead(pid: u32) -> bool {
         let ret = unsafe { libc::kill(pid as i32, 0) };
-        ret == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+        if ret == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+            return true;
+        }
+        // Process exists but might be a zombie (parent hasn't called waitpid yet).
+        // Check /proc/{pid}/status for "State: Z (zombie)".
+        if let Ok(status) = std::fs::read_to_string(format!("/proc/{pid}/status")) {
+            if let Some(line) = status.lines().find(|l| l.starts_with("State:")) {
+                return line.contains("Z (zombie)") || line.contains("X (dead)");
+            }
+        }
+        false
     }
 
     #[cfg(not(target_os = "linux"))]

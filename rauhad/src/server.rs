@@ -94,19 +94,13 @@ impl ZoneService for ZoneServiceImpl {
         let policy = if req.policy_toml.is_empty() {
             rauha_common::zone::ZonePolicy::default()
         } else {
-            let (toml_zone_type, parsed_policy) =
+            let (_toml_zone_type, parsed_policy) =
                 crate::zone::policy::parse_policy(&req.policy_toml, &self.root)
                     .map_err(|e| Status::invalid_argument(e.to_string()))?;
 
-            // Reject if TOML zone type conflicts with gRPC zone_type.
-            if toml_zone_type != zone_type {
-                return Err(Status::invalid_argument(format!(
-                    "zone_type '{}' conflicts with policy TOML type '{:?}' — \
-                     use the same type in both or omit [zone].type from the TOML",
-                    req.zone_type, toml_zone_type
-                )));
-            }
-
+            // The gRPC request's zone_type takes precedence over the TOML's
+            // [zone].type field. This allows reusing a policy file across
+            // different zone types.
             parsed_policy
         };
 
