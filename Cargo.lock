@@ -2326,6 +2326,7 @@ dependencies = [
  "clap",
  "containerd-client",
  "nix 0.29.0",
+ "prost 0.13.5",
  "prost-types 0.13.5",
  "rauha-common",
  "rauha-ebpf-common",

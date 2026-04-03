@@ -97,14 +97,21 @@ async fn cmd_run(
     let assignments = watcher::enumerate_cgroups(&policies)?;
     let zone_counter = AtomicU32::new(1);
     let mut cgroup_id_map: HashMap<String, u64> = HashMap::new();
+    // Stable zone_id per zone_name — reuse across containers in the same zone.
+    let mut zone_id_for_name: HashMap<String, u32> = HashMap::new();
 
     for assignment in &assignments {
-        let zone_id = zone_counter.fetch_add(1, Ordering::SeqCst);
+        let zone_id = *zone_id_for_name
+            .entry(assignment.zone_name.clone())
+            .or_insert_with(|| zone_counter.fetch_add(1, Ordering::SeqCst));
 
         mgr.add_zone_member(assignment.cgroup_id, zone_id, rauha_common::zone::ZoneType::NonGlobal)?;
 
-        if let Some(policy) = policies.get(&assignment.zone_name) {
-            mgr.set_zone_policy(zone_id, policy)?;
+        // Only write policy once per zone, not per container.
+        if !zone_id_for_name.contains_key(&assignment.zone_name) || zone_id_for_name[&assignment.zone_name] == zone_id {
+            if let Some(policy) = policies.get(&assignment.zone_name) {
+                mgr.set_zone_policy(zone_id, policy)?;
+            }
         }
 
         cgroup_id_map.insert(assignment.container_id.clone(), assignment.cgroup_id);
@@ -141,7 +148,9 @@ async fn cmd_run(
             event = rx.recv() => {
                 match event {
                     Some(watcher::WatcherEvent::Add(assignment)) => {
-                        let zone_id = zone_counter.fetch_add(1, Ordering::SeqCst);
+                        let zone_id = *zone_id_for_name
+                            .entry(assignment.zone_name.clone())
+                            .or_insert_with(|| zone_counter.fetch_add(1, Ordering::SeqCst));
                         if let Err(e) = mgr.add_zone_member(
                             assignment.cgroup_id,
                             zone_id,
@@ -151,7 +160,16 @@ async fn cmd_run(
                             continue;
                         }
                         if let Some(policy) = policies_arc.get(&assignment.zone_name) {
-                            let _ = mgr.set_zone_policy(zone_id, policy);
+                            if let Err(e) = mgr.set_zone_policy(zone_id, policy) {
+                                tracing::error!(
+                                    %e,
+                                    container = assignment.container_id,
+                                    zone = assignment.zone_name,
+                                    "failed to set zone policy — rolling back membership"
+                                );
+                                let _ = mgr.remove_zone_member(assignment.cgroup_id);
+                                continue;
+                            }
                         }
                         cgroup_id_map.insert(assignment.container_id.clone(), assignment.cgroup_id);
                         tracing::info!(

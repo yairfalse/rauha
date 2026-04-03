@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 use std::os::unix::fs::MetadataExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -192,8 +192,10 @@ pub async fn watch_containerd_events(
     loop {
         match try_watch(&socket_path, &policies, &tx).await {
             Ok(()) => {
-                tracing::info!("containerd event stream ended cleanly");
-                return;
+                // End-of-stream means containerd closed the connection.
+                // Reset backoff — the connection was healthy before it dropped.
+                tracing::warn!("containerd event stream ended — reconnecting");
+                backoff = Duration::from_secs(1);
             }
             Err(e) => {
                 tracing::warn!(
@@ -201,10 +203,10 @@ pub async fn watch_containerd_events(
                     backoff_secs = backoff.as_secs(),
                     "containerd event watch failed — reconnecting"
                 );
-                tokio::time::sleep(backoff).await;
                 backoff = (backoff * 2).min(max_backoff);
             }
         }
+        tokio::time::sleep(backoff).await;
     }
 }
 
@@ -255,12 +257,14 @@ async fn handle_task_start(
     policies: &HashMap<String, ZonePolicy>,
     tx: &mpsc::Sender<WatcherEvent>,
 ) {
-    // The event payload is containerd.events.TaskStart { container_id, pid }.
-    // Decode the container_id from the protobuf Any.
-    let container_id = match extract_container_id(event) {
-        Some(id) => id,
-        None => return,
+    use prost::Message;
+
+    // Decode container_id and pid from the TaskStart event.
+    let start = match TaskStartEvent::decode(event.value.as_slice()) {
+        Ok(s) if !s.container_id.is_empty() => s,
+        _ => return,
     };
+    let container_id = start.container_id;
 
     // Wait briefly for the cgroup to be created.
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -280,8 +284,13 @@ async fn handle_task_start(
         return;
     }
 
-    // Resolve cgroup_id. containerd creates cgroups at known paths.
-    let cgroup_id = resolve_container_cgroup_id(&container_id);
+    // Resolve cgroup_id — prefer /proc/pid/cgroup (fast), fall back to known paths.
+    let cgroup_id = if start.pid > 0 {
+        let id = resolve_cgroup_id_from_pid(start.pid);
+        if id != 0 { id } else { resolve_container_cgroup_id(&container_id) }
+    } else {
+        resolve_container_cgroup_id(&container_id)
+    };
     if cgroup_id == 0 {
         tracing::warn!(container = container_id, "live: could not resolve cgroup_id");
         return;
@@ -315,26 +324,51 @@ async fn handle_task_delete(
         .await;
 }
 
-/// Extract container_id from a containerd TaskStart/TaskDelete protobuf Any.
-///
-/// The payload is `containerd.events.TaskStart { container_id: string, pid: uint32 }`
-/// or `containerd.events.TaskDelete { container_id: string, ... }`.
-/// Both have container_id as the first string field (field 1).
-fn extract_container_id(event: &prost_types::Any) -> Option<String> {
-    // Minimal protobuf decode: field 1 (tag=0x0a), length-delimited string.
-    let data = &event.value;
-    if data.len() < 3 || data[0] != 0x0a {
-        return None;
-    }
-    let len = data[1] as usize;
-    if data.len() < 2 + len {
-        return None;
-    }
-    String::from_utf8(data[2..2 + len].to_vec()).ok()
+/// Minimal containerd event payloads for proper protobuf decoding.
+#[derive(Clone, PartialEq, prost::Message)]
+struct TaskStartEvent {
+    #[prost(string, tag = "1")]
+    container_id: String,
+    #[prost(uint32, tag = "2")]
+    pid: u32,
 }
 
-/// Resolve a container's cgroup_id by checking known cgroup paths.
+#[derive(Clone, PartialEq, prost::Message)]
+struct TaskDeleteEvent {
+    #[prost(string, tag = "1")]
+    container_id: String,
+}
+
+/// Extract container_id from a containerd TaskStart/TaskDelete protobuf Any.
+fn extract_container_id(event: &prost_types::Any) -> Option<String> {
+    use prost::Message;
+
+    let from_start = || {
+        let msg = TaskStartEvent::decode(event.value.as_slice()).ok()?;
+        (!msg.container_id.is_empty()).then_some(msg.container_id)
+    };
+
+    let from_delete = || {
+        let msg = TaskDeleteEvent::decode(event.value.as_slice()).ok()?;
+        (!msg.container_id.is_empty()).then_some(msg.container_id)
+    };
+
+    match event.type_url.as_str() {
+        s if s.contains("TaskStart") => from_start(),
+        s if s.contains("TaskDelete") => from_delete(),
+        _ => from_start().or_else(from_delete),
+    }
+}
+
+/// Resolve a container's cgroup_id from its init process PID.
+///
+/// Reads /proc/{pid}/cgroup to find the cgroup path, then stats the
+/// cgroup directory to get the inode (= cgroup_id). This is fast and
+/// robust — no filesystem walking needed.
+///
+/// Falls back to known path patterns if PID is not available.
 fn resolve_container_cgroup_id(container_id: &str) -> u64 {
+    // Try known cgroup path patterns as a fast path.
     let candidates = [
         format!("/sys/fs/cgroup/system.slice/containerd-{container_id}.scope"),
         format!("/sys/fs/cgroup/kubepods.slice/kubepods-besteffort.slice/kubepods-besteffort-pod{container_id}.slice"),
@@ -347,32 +381,27 @@ fn resolve_container_cgroup_id(container_id: &str) -> u64 {
         }
     }
 
-    // Walk common roots as fallback.
-    for root in ["/sys/fs/cgroup/system.slice", "/sys/fs/cgroup/kubepods.slice"] {
-        let root_path = Path::new(root);
-        if let Some(id) = find_cgroup_by_container_id(root_path, container_id) {
-            return id;
+    0
+}
+
+/// Resolve cgroup_id from a process PID by reading /proc/{pid}/cgroup.
+fn resolve_cgroup_id_from_pid(pid: u32) -> u64 {
+    let cgroup_file = format!("/proc/{pid}/cgroup");
+    let content = match std::fs::read_to_string(&cgroup_file) {
+        Ok(c) => c,
+        Err(_) => return 0,
+    };
+
+    // cgroup v2 format: "0::/path/to/cgroup"
+    for line in content.lines() {
+        if let Some(path) = line.strip_prefix("0::") {
+            let cgroup_path = format!("/sys/fs/cgroup{path}");
+            let p = Path::new(&cgroup_path);
+            if p.exists() {
+                return resolve_cgroup_id(p);
+            }
         }
     }
 
     0
-}
-
-/// Recursively search for a cgroup directory containing the container_id.
-fn find_cgroup_by_container_id(dir: &Path, container_id: &str) -> Option<u64> {
-    let entries = std::fs::read_dir(dir).ok()?;
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if !path.is_dir() {
-            continue;
-        }
-        let name = path.file_name()?.to_str()?;
-        if name.contains(container_id) {
-            return Some(resolve_cgroup_id(&path));
-        }
-        if let Some(id) = find_cgroup_by_container_id(&path, container_id) {
-            return Some(id);
-        }
-    }
-    None
 }
