@@ -1,8 +1,6 @@
 #![no_std]
 #![no_main]
 
-use core::mem::MaybeUninit;
-
 use aya_ebpf::{
     macros::{lsm, map},
     maps::{Array, HashMap, PerCpuArray, ring_buf::RingBuf},
@@ -222,7 +220,7 @@ fn emit_deny_event(hook: u8, caller_zone: u32, target_zone: u32, context: u64) {
     };
 
     if let Some(mut entry) = unsafe { ENFORCEMENT_EVENTS.reserve::<EnforcementEvent>(0) } {
-        entry.write(MaybeUninit::new(event));
+        entry.write(event);
         entry.submit(0);
     }
 }

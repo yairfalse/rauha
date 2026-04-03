@@ -5,6 +5,7 @@ edition = "2021"
 license = "Apache-2.0"
 
 # NOT a workspace member — targets bpfel-unknown-none.
+[workspace]
 
 [dependencies]
 aya-ebpf = "0.1"
