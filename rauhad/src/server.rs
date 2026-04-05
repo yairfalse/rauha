@@ -91,6 +91,14 @@ impl ZoneService for ZoneServiceImpl {
             _ => rauha_common::zone::ZoneType::NonGlobal,
         };
 
+        // Reject oversized policy TOML to prevent memory exhaustion during parsing.
+        const MAX_POLICY_SIZE: usize = 64 * 1024;
+        if req.policy_toml.len() > MAX_POLICY_SIZE {
+            return Err(Status::invalid_argument(format!(
+                "policy_toml exceeds maximum size of {MAX_POLICY_SIZE} bytes"
+            )));
+        }
+
         let policy = if req.policy_toml.is_empty() {
             rauha_common::zone::ZonePolicy::default()
         } else {
@@ -195,6 +203,14 @@ impl ZoneService for ZoneServiceImpl {
         request: Request<pb::zone::ApplyPolicyRequest>,
     ) -> Result<Response<pb::zone::ApplyPolicyResponse>, Status> {
         let req = request.into_inner();
+
+        const MAX_POLICY_SIZE: usize = 64 * 1024;
+        if req.policy_toml.len() > MAX_POLICY_SIZE {
+            return Err(Status::invalid_argument(format!(
+                "policy_toml exceeds maximum size of {MAX_POLICY_SIZE} bytes"
+            )));
+        }
+
         let (_zone_type, policy) =
             crate::zone::policy::parse_policy(&req.policy_toml, &self.root)
                 .map_err(|e| Status::invalid_argument(e.to_string()))?;
