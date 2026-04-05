@@ -6,12 +6,14 @@ use aya::maps::{MapData, RingBuf};
 use rauha_ebpf_common::EnforcementEvent;
 use tokio_util::sync::CancellationToken;
 
-const HOOK_NAMES: [&str; 5] = [
+const HOOK_NAMES: [&str; 7] = [
     "file_open",
     "bprm_check",
     "ptrace_access_check",
     "task_kill",
     "cgroup_attach_task",
+    "capable",
+    "socket_connect",
 ];
 
 pub fn spawn_event_reader(ring_buf: RingBuf<MapData>, cancel: CancellationToken) {

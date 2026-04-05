@@ -16,12 +16,14 @@ use rauha_ebpf_common::*;
 
 const BPF_PIN_PATH: &str = "/sys/fs/bpf/rauha";
 
-const LSM_PROGRAMS: &[&str] = &[
-    "rauha_file_open",
-    "rauha_bprm_check",
-    "rauha_ptrace_check",
-    "rauha_task_kill",
-    "rauha_cgroup_attach",
+const LSM_PROGRAMS: &[(&str, &str)] = &[
+    ("rauha_file_open", "file_open"),
+    ("rauha_bprm_check", "bprm_check_security"),
+    ("rauha_ptrace_check", "ptrace_access_check"),
+    ("rauha_task_kill", "task_kill"),
+    ("rauha_cgroup_attach", "cgroup_attach_task"),
+    ("rauha_capable", "capable"),
+    ("rauha_socket_connect", "socket_connect"),
 ];
 
 const MAP_NAMES: &[&str] = &[
@@ -88,14 +90,14 @@ impl EnforceEbpf {
             .map_err(|e| anyhow::anyhow!("failed to load eBPF: {e} — check CONFIG_BPF_LSM=y and lsm=bpf"))?;
 
         // Attach all LSM programs.
-        for &name in LSM_PROGRAMS {
+        for &(prog_name, hook_name) in LSM_PROGRAMS {
             let prog: &mut Lsm = bpf
-                .program_mut(name)
-                .ok_or_else(|| anyhow::anyhow!("LSM program '{name}' not found"))?
+                .program_mut(prog_name)
+                .ok_or_else(|| anyhow::anyhow!("LSM program '{prog_name}' not found"))?
                 .try_into()?;
-            prog.load(name, &btf)?;
+            prog.load(hook_name, &btf)?;
             prog.attach()?;
-            tracing::info!(program = name, "attached LSM program");
+            tracing::info!(program = prog_name, hook = hook_name, "attached LSM program");
         }
 
         tracing::info!(programs = LSM_PROGRAMS.len(), "eBPF programs loaded");
@@ -167,7 +169,7 @@ impl EnforceEbpf {
         )?;
 
         let mut results = Vec::new();
-        for (idx, &name) in LSM_PROGRAMS.iter().enumerate() {
+        for (idx, &(prog_name, _)) in LSM_PROGRAMS.iter().enumerate() {
             let per_cpu = map.get(&(idx as u32), 0)?;
             let mut total = EnforcementCounters { allow: 0, deny: 0, error: 0 };
             for cpu_val in per_cpu.iter() {
@@ -175,7 +177,7 @@ impl EnforceEbpf {
                 total.deny += cpu_val.deny;
                 total.error += cpu_val.error;
             }
-            results.push((name.to_string(), total));
+            results.push((prog_name.to_string(), total));
         }
 
         Ok(results)

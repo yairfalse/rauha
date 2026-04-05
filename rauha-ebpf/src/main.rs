@@ -17,6 +17,8 @@ mod exec_guard;
 mod ptrace_guard;
 mod signal_guard;
 mod cgroup_lock;
+mod capable_guard;
+mod socket_connect_guard;
 
 /// Maps cgroup_id → ZoneInfoKernel. Tells us which zone a process belongs to.
 #[map]
@@ -334,6 +336,16 @@ pub fn rauha_task_kill(ctx: LsmContext) -> i32 {
 #[lsm(hook = "cgroup_attach_task")]
 pub fn rauha_cgroup_attach(ctx: LsmContext) -> i32 {
     cgroup_lock::cgroup_attach_task(&ctx)
+}
+
+#[lsm(hook = "capable")]
+pub fn rauha_capable(ctx: LsmContext) -> i32 {
+    capable_guard::capable(&ctx)
+}
+
+#[lsm(hook = "socket_connect")]
+pub fn rauha_socket_connect(ctx: LsmContext) -> i32 {
+    socket_connect_guard::socket_connect(&ctx)
 }
 
 #[panic_handler]

@@ -22,6 +22,8 @@ const LSM_PROGRAMS: &[(&str, &str)] = &[
     ("rauha_ptrace_check", "ptrace_access_check"),
     ("rauha_task_kill", "task_kill"),
     ("rauha_cgroup_attach", "cgroup_attach_task"),
+    ("rauha_capable", "capable"),
+    ("rauha_socket_connect", "socket_connect"),
 ];
 
 /// Names of maps to pin for persistence.

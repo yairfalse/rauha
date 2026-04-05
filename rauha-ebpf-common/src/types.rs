@@ -92,7 +92,9 @@ pub const PROG_BPRM_CHECK: u32 = 1;
 pub const PROG_PTRACE_CHECK: u32 = 2;
 pub const PROG_TASK_KILL: u32 = 3;
 pub const PROG_CGROUP_ATTACH: u32 = 4;
-pub const ENFORCEMENT_COUNTER_ENTRIES: u32 = 5;
+pub const PROG_CAPABLE: u32 = 5;
+pub const PROG_SOCKET_CONNECT: u32 = 6;
+pub const ENFORCEMENT_COUNTER_ENTRIES: u32 = 7;
 
 // Hook type constants for EnforcementEvent.
 pub const HOOK_FILE_OPEN: u8 = 0;
@@ -100,6 +102,8 @@ pub const HOOK_BPRM_CHECK: u8 = 1;
 pub const HOOK_PTRACE_CHECK: u8 = 2;
 pub const HOOK_TASK_KILL: u8 = 3;
 pub const HOOK_CGROUP_ATTACH: u8 = 4;
+pub const HOOK_CAPABLE: u8 = 5;
+pub const HOOK_SOCKET_CONNECT: u8 = 6;
 
 // Decision constants for EnforcementEvent.
 pub const DECISION_ALLOW: u8 = 0;
