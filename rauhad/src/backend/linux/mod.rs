@@ -206,18 +206,18 @@ impl LinuxBackend {
     /// Allocate a new compact zone_id for BPF maps.
     fn allocate_zone_id(&self, uuid: Uuid) -> u32 {
         let id = self.next_zone_id.fetch_add(1, Ordering::Relaxed);
-        self.zone_id_map.lock().unwrap_or_else(|e| e.into_inner()).insert(uuid, id);
+        self.zone_id_map.lock().expect("mutex poisoned — daemon state corrupt, restart required").insert(uuid, id);
         id
     }
 
     /// Look up the compact zone_id for a Uuid.
     fn get_zone_id(&self, uuid: &Uuid) -> Option<u32> {
-        self.zone_id_map.lock().unwrap_or_else(|e| e.into_inner()).get(uuid).copied()
+        self.zone_id_map.lock().expect("mutex poisoned — daemon state corrupt, restart required").get(uuid).copied()
     }
 
     /// Remove zone_id mapping.
     fn remove_zone_id(&self, uuid: &Uuid) -> Option<u32> {
-        self.zone_id_map.lock().unwrap_or_else(|e| e.into_inner()).remove(uuid)
+        self.zone_id_map.lock().expect("mutex poisoned — daemon state corrupt, restart required").remove(uuid)
     }
 
     /// Get the socket path for a zone's shim.
@@ -231,7 +231,7 @@ impl LinuxBackend {
 
         // Check if shim is already connected and responsive.
         {
-            let conns = self.shim_connections.lock().unwrap_or_else(|e| e.into_inner());
+            let conns = self.shim_connections.lock().expect("mutex poisoned — daemon state corrupt, restart required");
             if let Some(conn) = conns.get(zone_name) {
                 // Try a quick health check.
                 if conn
@@ -294,7 +294,7 @@ impl LinuxBackend {
         let conn = ShimConnection::new(socket_path);
         self.shim_connections
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .expect("mutex poisoned — daemon state corrupt, restart required")
             .insert(zone_name.to_string(), conn);
 
         tracing::info!(zone = zone_name, "shim spawned");
@@ -303,7 +303,7 @@ impl LinuxBackend {
 
     /// Send a request to a zone's shim.
     fn shim_request(&self, zone_name: &str, request: &ShimRequest) -> Result<ShimResponse> {
-        let conns = self.shim_connections.lock().unwrap_or_else(|e| e.into_inner());
+        let conns = self.shim_connections.lock().expect("mutex poisoned — daemon state corrupt, restart required");
         let conn = conns.get(zone_name).ok_or_else(|| RauhaError::ShimError {
             zone: zone_name.into(),
             message: "no shim connection".into(),
@@ -333,8 +333,8 @@ impl LinuxBackend {
         zone_id: u32,
         net_policy: &NetworkPolicy,
     ) -> Result<()> {
-        let zone_names = self.zone_name_map.lock().unwrap_or_else(|e| e.into_inner());
-        let zone_ids = self.zone_id_map.lock().unwrap_or_else(|e| e.into_inner());
+        let zone_names = self.zone_name_map.lock().expect("mutex poisoned — daemon state corrupt, restart required");
+        let zone_ids = self.zone_id_map.lock().expect("mutex poisoned — daemon state corrupt, restart required");
 
         // Collect the set of peer zone_ids that should be allowed.
         let mut allowed_peer_ids: std::collections::HashSet<u32> = std::collections::HashSet::new();
@@ -416,7 +416,7 @@ impl IsolationBackend for LinuxBackend {
         let zone_id = self.allocate_zone_id(zone.id);
         self.zone_name_map
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .expect("mutex poisoned — daemon state corrupt, restart required")
             .insert(zone.name.clone(), zone.id);
 
         // Re-create cgroup if missing (idempotent).
@@ -433,7 +433,7 @@ impl IsolationBackend for LinuxBackend {
 
         // Re-register IP in allocator if zone has network state.
         if let Some(ref net_state) = zone.network_state {
-            self.ip_allocator.lock().unwrap_or_else(|e| e.into_inner()).mark_allocated(net_state.ip());
+            self.ip_allocator.lock().expect("mutex poisoned — daemon state corrupt, restart required").mark_allocated(net_state.ip());
         }
 
         // Re-create netns if missing (idempotent).
@@ -514,7 +514,7 @@ impl IsolationBackend for LinuxBackend {
         // Track zone name → uuid mapping.
         self.zone_name_map
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .expect("mutex poisoned — daemon state corrupt, restart required")
             .insert(config.name.clone(), zone_uuid);
 
         // Step 1: Create cgroup.
@@ -530,7 +530,7 @@ impl IsolationBackend for LinuxBackend {
         let net_state = if config.policy.network.mode != NetworkMode::Host {
             // Allocate an IP for this zone.
             let ip_state = {
-                let mut alloc = self.ip_allocator.lock().unwrap_or_else(|e| e.into_inner());
+                let mut alloc = self.ip_allocator.lock().expect("mutex poisoned — daemon state corrupt, restart required");
                 let ip = alloc.allocate()?;
                 ZoneNetworkState {
                     ip: ip.octets(),
@@ -595,7 +595,7 @@ impl IsolationBackend for LinuxBackend {
 
         // Shut down shim if running.
         {
-            let mut conns = self.shim_connections.lock().unwrap_or_else(|e| e.into_inner());
+            let mut conns = self.shim_connections.lock().expect("mutex poisoned — daemon state corrupt, restart required");
             if let Some(conn) = conns.remove(&zone.name) {
                 let _ = conn.send_request(&ShimRequest::Shutdown);
             }
@@ -607,7 +607,7 @@ impl IsolationBackend for LinuxBackend {
         let stored_inodes = self
             .registered_inodes
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .expect("mutex poisoned — daemon state corrupt, restart required")
             .remove(&zone.name)
             .unwrap_or_default();
 
@@ -628,7 +628,7 @@ impl IsolationBackend for LinuxBackend {
 
         // Release IP back to allocator.
         if let Some(ref net_state) = zone.network_state {
-            let mut alloc = self.ip_allocator.lock().unwrap_or_else(|e| e.into_inner());
+            let mut alloc = self.ip_allocator.lock().expect("mutex poisoned — daemon state corrupt, restart required");
             alloc.release(net_state.ip());
         }
 
@@ -644,7 +644,7 @@ impl IsolationBackend for LinuxBackend {
         // Destroy cgroup last (must be empty).
         self.cgroup.destroy_zone_cgroup(&zone.name)?;
 
-        self.zone_name_map.lock().unwrap_or_else(|e| e.into_inner()).remove(&zone.name);
+        self.zone_name_map.lock().expect("mutex poisoned — daemon state corrupt, restart required").remove(&zone.name);
 
         // Clean up shim socket.
         let socket_path = Self::shim_socket_path(&zone.name);
@@ -813,7 +813,7 @@ impl IsolationBackend for LinuxBackend {
                 // Store inodes for correct cleanup on zone destroy.
                 self.registered_inodes
                     .lock()
-                    .unwrap_or_else(|e| e.into_inner())
+                    .expect("mutex poisoned — daemon state corrupt, restart required")
                     .entry(zone.name.clone())
                     .or_default()
                     .extend_from_slice(&inodes);
@@ -884,7 +884,7 @@ impl IsolationBackend for LinuxBackend {
         let zone_name = self
             .zone_name_map
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .expect("mutex poisoned — daemon state corrupt, restart required")
             .iter()
             .find(|(_, uuid)| **uuid == container.zone_id)
             .map(|(name, _)| name.clone())
@@ -919,7 +919,7 @@ impl IsolationBackend for LinuxBackend {
         let zone_name = self
             .zone_name_map
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .expect("mutex poisoned — daemon state corrupt, restart required")
             .iter()
             .find(|(_, uuid)| **uuid == container.zone_id)
             .map(|(name, _)| name.clone())
