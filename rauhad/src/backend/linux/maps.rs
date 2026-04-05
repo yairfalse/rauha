@@ -290,9 +290,11 @@ impl MapManager {
 ///
 /// Returns the collected inodes (capped at `max_inodes`).
 pub fn collect_rootfs_inodes(rootfs_path: &std::path::Path, max_inodes: u32) -> Vec<u64> {
+    use std::collections::HashSet;
     use std::os::unix::fs::MetadataExt;
 
     let mut inodes = Vec::new();
+    let mut visited_dirs = HashSet::new(); // Prevents cycles from hardlinked/bind-mounted dirs.
     let mut stack = vec![rootfs_path.to_path_buf()];
 
     while let Some(dir) = stack.pop() {
@@ -326,7 +328,7 @@ pub fn collect_rootfs_inodes(rootfs_path: &std::path::Path, max_inodes: u32) -> 
 
             inodes.push(meta.ino());
 
-            if meta.is_dir() {
+            if meta.is_dir() && visited_dirs.insert(meta.ino()) {
                 stack.push(entry.path());
             }
         }
