@@ -329,6 +329,8 @@ cargo xtask build-ebpf
 
 **Covert channels** via shared kernel resources (CPU cache timing, memory pressure) are not addressable by eBPF. Same limitation as all OS-level isolation.
 
+**IPv4 only.** Zone networking uses the `10.89.0.0/16` subnet. IPv6 addresses are not assigned to zones, and nftables rules only cover IPv4 traffic. Containers can reach IPv6 destinations via the host's network stack, but inter-zone IPv6 enforcement is not implemented.
+
 ## License
 
 Apache-2.0

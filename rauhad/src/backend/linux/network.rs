@@ -4,6 +4,10 @@
 //! - host side: `veth-{zone}` attached to the rauha0 bridge
 //! - zone side: `eth0` inside the zone's network namespace
 //!
+//! TODO(ipv6): Currently IPv4 only (10.89.0.0/16). IPv6 addresses are not
+//! assigned, and nftables rules only cover ip (not ip6) traffic.
+//! See: https://github.com/yairfalse/rauha/issues/24
+//!
 //! The rauha0 bridge connects all zone veth host-side interfaces,
 //! with eBPF-enforced policy controlling which zones can communicate.
 
