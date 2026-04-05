@@ -222,7 +222,15 @@ impl ZoneRegistry {
             .get(zone_name)
             .ok_or_else(|| RauhaError::ZoneNotFound(zone_name.into()))?;
 
-        self.backend.hot_reload_policy(handle, &policy)?;
+        // If the zone was deleted concurrently, the backend call may fail.
+        // Treat "zone not found" backend errors as ZoneNotFound, not Internal.
+        match self.backend.hot_reload_policy(handle, &policy) {
+            Ok(()) => {}
+            Err(RauhaError::ZoneNotFound(_)) => {
+                return Err(RauhaError::ZoneNotFound(zone_name.into()));
+            }
+            Err(e) => return Err(e),
+        }
 
         zone.policy = policy;
         zone.updated_at = Utc::now();
