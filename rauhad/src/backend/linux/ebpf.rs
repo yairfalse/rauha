@@ -311,10 +311,34 @@ impl EbpfManager {
             });
         }
 
-        tracing::info!(
-            cgroup_id = result.helper_cgroup_id,
-            "offset self-test passed — kernel struct offsets verified"
-        );
+        // Ground truth check: verify against /proc/self/cgroup.
+        // The internal check only proves the two derivation paths agree —
+        // they could both be wrong the same way. Cross-check against the
+        // actual cgroup_id from /proc to catch this.
+        match read_proc_self_cgroup_id() {
+            Ok(proc_cgroup_id) => {
+                if result.helper_cgroup_id != proc_cgroup_id {
+                    tracing::warn!(
+                        bpf = result.helper_cgroup_id,
+                        proc = proc_cgroup_id,
+                        "self-test internal check passed but disagrees with /proc — \
+                         offsets may be incorrect for this kernel"
+                    );
+                } else {
+                    tracing::info!(
+                        cgroup_id = result.helper_cgroup_id,
+                        "offset self-test passed — verified against /proc/self/cgroup"
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::debug!(%e, "could not verify self-test against /proc — skipping ground truth check");
+                tracing::info!(
+                    cgroup_id = result.helper_cgroup_id,
+                    "offset self-test passed — internal check only (proc verification unavailable)"
+                );
+            }
+        }
         Ok(())
     }
 
@@ -535,4 +559,27 @@ fn check_kernel_version() -> Result<()> {
 
     tracing::debug!(kernel = release, "kernel version check passed");
     Ok(())
+}
+
+/// Read the current process's cgroup_id from /proc/self/cgroup.
+///
+/// Parses the cgroup v2 entry (line starting with "0::"), stats the
+/// corresponding directory in /sys/fs/cgroup, and returns the inode number.
+/// This is the ground truth for what bpf_get_current_cgroup_id() returns.
+fn read_proc_self_cgroup_id() -> std::result::Result<u64, String> {
+    use std::os::unix::fs::MetadataExt;
+
+    let content = fs::read_to_string("/proc/self/cgroup")
+        .map_err(|e| format!("failed to read /proc/self/cgroup: {e}"))?;
+
+    for line in content.lines() {
+        if let Some(path) = line.strip_prefix("0::") {
+            let cgroup_dir = format!("/sys/fs/cgroup{path}");
+            let meta = fs::metadata(&cgroup_dir)
+                .map_err(|e| format!("failed to stat {cgroup_dir}: {e}"))?;
+            return Ok(meta.ino());
+        }
+    }
+
+    Err("no cgroup v2 entry found in /proc/self/cgroup".into())
 }
