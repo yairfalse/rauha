@@ -95,15 +95,21 @@ impl ZoneRegistry {
 
         let mut handles = Vec::new();
         for zone in &zones {
-            let handle = ZoneHandle {
+            let mut handle = ZoneHandle {
                 id: zone.id,
                 name: zone.name.clone(),
-                platform_id: 0, // Will be set by recover_zone.
+                platform_id: 0, // Updated by recover_zone with live cgroup_id.
                 network_state: zone.network_state.clone(),
             };
 
             match self.backend.recover_zone(&handle, zone.zone_type, &zone.policy) {
                 Ok(()) => {
+                    // Update handle with live cgroup_id from the filesystem.
+                    // recover_zone re-stats the cgroup directory, but the handle
+                    // passed in still has platform_id=0. Resolve it now.
+                    if let Ok(live_cgroup_id) = self.resolve_live_cgroup_id(&zone.name) {
+                        handle.platform_id = live_cgroup_id;
+                    }
                     handles.push(handle.clone());
                     self.handles.write().await.insert(zone.name.clone(), handle);
                     tracing::info!(zone = zone.name, "zone reconciled");
@@ -121,6 +127,27 @@ impl ZoneRegistry {
 
         tracing::info!(recovered = handles.len(), total = zones.len(), "reconciliation complete");
         Ok(())
+    }
+
+    /// Resolve a zone's live cgroup_id from the filesystem.
+    ///
+    /// The cgroup_id is the inode of the cgroup directory. After a crash,
+    /// the cgroup may have been recreated with a new inode — this returns
+    /// the current one, not the stored one.
+    #[cfg(target_os = "linux")]
+    fn resolve_live_cgroup_id(&self, zone_name: &str) -> Result<u64> {
+        use std::os::unix::fs::MetadataExt;
+        let path = format!("/sys/fs/cgroup/rauha.slice/zone-{zone_name}");
+        let meta = std::fs::metadata(&path).map_err(|e| RauhaError::CgroupError {
+            message: format!("failed to stat cgroup {path}: {e}"),
+            hint: "cgroup may not exist".into(),
+        })?;
+        Ok(meta.ino())
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn resolve_live_cgroup_id(&self, _zone_name: &str) -> Result<u64> {
+        Ok(0)
     }
 
     pub async fn create_zone(&self, name: &str, zone_type: ZoneType, policy: ZonePolicy) -> Result<Zone> {
