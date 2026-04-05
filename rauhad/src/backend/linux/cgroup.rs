@@ -208,14 +208,17 @@ fn read_cgroup_u64(cgroup_path: &Path, filename: &str) -> Option<u64> {
     trimmed.parse().ok()
 }
 
+/// Read cumulative CPU usage from cgroup cpu.stat.
+///
+/// Returns cumulative CPU seconds (NOT a percentage). The field is named
+/// `cpu_usage_percent` in the proto for historical reasons but contains
+/// cumulative seconds. Callers computing real utilization need two samples
+/// and the elapsed wall time: `(sample2 - sample1) / elapsed * 100`.
 fn read_cpu_usage(cgroup_path: &Path) -> Option<f64> {
     let content = fs::read_to_string(cgroup_path.join("cpu.stat")).ok()?;
     for line in content.lines() {
         if let Some(value) = line.strip_prefix("usage_usec ") {
             let usec: u64 = value.trim().parse().ok()?;
-            // Convert microseconds to a percentage-like value.
-            // This is cumulative usage, not instantaneous — caller would need
-            // to diff two readings for real percentage. Return raw for now.
             return Some(usec as f64 / 1_000_000.0);
         }
     }
