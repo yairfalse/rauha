@@ -551,10 +551,12 @@ impl IsolationBackend for LinuxBackend {
                 }
             };
 
-            if let Err(e) = namespace::create_netns(&config.name) {
-                tracing::warn!(%e, zone = config.name, "failed to create netns — continuing without");
-            } else if let Err(e) = network::create_veth_pair(&config.name, Some(&ip_state)) {
-                tracing::warn!(%e, zone = config.name, "failed to create veth pair — continuing without");
+            namespace::create_netns(&config.name).map_err(|e| {
+                tracing::error!(%e, zone = config.name, "failed to create netns for bridged zone");
+                e
+            })?;
+            if let Err(e) = network::create_veth_pair(&config.name, Some(&ip_state)) {
+                tracing::warn!(%e, zone = config.name, "failed to create veth pair — zone will have limited networking");
             }
 
             Some(ip_state)
