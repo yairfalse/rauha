@@ -20,7 +20,10 @@ use rauha_ebpf_common::{ZONE_FLAG_GLOBAL, POLICY_FLAG_ALLOW_PTRACE, PROG_PTRACE_
 pub fn ptrace_access_check(ctx: &LsmContext) -> i32 {
     let (ret, is_error) = match try_ptrace_check(ctx) {
         Ok(ret) => (ret, false),
-        Err(_) => (0, true),
+        Err(_) => {
+            crate::emit_error_event(HOOK_PTRACE_CHECK);
+            (0, true)
+        }
     };
     count_decision(PROG_PTRACE_CHECK, ret == 0, is_error);
     ret

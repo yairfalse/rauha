@@ -8,8 +8,8 @@ use aya_ebpf::{
 };
 use rauha_ebpf_common::{
     EnforcementCounters, EnforcementEvent, SelfTestResult, ZoneCommKey, ZoneInfoKernel,
-    ZonePolicyKernel, DECISION_DENY, ENFORCEMENT_COUNTER_ENTRIES, MAX_CGROUPS, MAX_INODES,
-    MAX_ZONES,
+    ZonePolicyKernel, DECISION_DENY, DECISION_ERROR, ENFORCEMENT_COUNTER_ENTRIES, MAX_CGROUPS,
+    MAX_INODES, MAX_ZONES,
 };
 
 mod file_guard;
@@ -216,6 +216,34 @@ fn emit_deny_event(hook: u8, caller_zone: u32, target_zone: u32, context: u64) {
         caller_zone,
         target_zone,
         context,
+        _reserved: [0; 2],
+    };
+
+    if let Some(mut entry) = unsafe { ENFORCEMENT_EVENTS.reserve::<EnforcementEvent>(0) } {
+        entry.write(event);
+        entry.submit(0);
+    }
+}
+
+/// Emit an error enforcement event to the ring buffer.
+///
+/// Called when a hook hits an error path (kernel read failure, null pointer, etc.)
+/// and falls open. Makes the fail-open observable — operators can detect when
+/// enforcement is degraded by monitoring error events.
+#[inline(always)]
+fn emit_error_event(hook: u8) {
+    let pid = (unsafe { aya_ebpf::helpers::bpf_get_current_pid_tgid() } >> 32) as u32;
+    let ts = unsafe { aya_ebpf::helpers::bpf_ktime_get_ns() };
+
+    let event = EnforcementEvent {
+        timestamp_ns: ts,
+        pid,
+        hook,
+        decision: DECISION_ERROR,
+        _pad0: [0; 2],
+        caller_zone: 0,
+        target_zone: 0,
+        context: 0,
         _reserved: [0; 2],
     };
 
