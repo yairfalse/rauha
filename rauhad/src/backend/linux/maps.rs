@@ -178,17 +178,20 @@ impl MapManager {
     /// This is the BPF-touching half of inode registration. Call
     /// `collect_rootfs_inodes` first (outside any lock) to get the inode list,
     /// then call this with the lock held briefly.
-    pub fn insert_inodes(bpf: &mut Bpf, inodes: &[u64], zone_id: u32) -> Result<u32> {
-        let mut count = 0u32;
+    /// Returns the list of successfully inserted inodes (not the full input).
+    /// Callers should store only this list for cleanup — not the original
+    /// input — to avoid removing entries that were never inserted.
+    pub fn insert_inodes(bpf: &mut Bpf, inodes: &[u64], zone_id: u32) -> Result<Vec<u64>> {
+        let mut inserted = Vec::with_capacity(inodes.len());
         for &ino in inodes {
             if let Err(e) = Self::set_inode_zone(bpf, ino, zone_id) {
                 tracing::debug!(ino, zone_id, %e, "failed to register inode");
                 continue;
             }
-            count += 1;
+            inserted.push(ino);
         }
-        tracing::debug!(zone_id, count, total = inodes.len(), "inserted inodes into BPF map");
-        Ok(count)
+        tracing::debug!(zone_id, count = inserted.len(), total = inodes.len(), "inserted inodes into BPF map");
+        Ok(inserted)
     }
 
     /// Remove a batch of inodes from the INODE_ZONE_MAP.

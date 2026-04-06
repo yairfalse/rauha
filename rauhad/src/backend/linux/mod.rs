@@ -822,22 +822,20 @@ impl IsolationBackend for LinuxBackend {
             );
 
             if !inodes.is_empty() {
-                // Store inodes for correct cleanup on zone destroy.
-                self.registered_inodes
-                    .lock()
-                    .unwrap_or_else(|_| { tracing::error!("mutex poisoned"); std::process::abort() })
-                    .entry(zone.name.clone())
-                    .or_default()
-                    .extend_from_slice(&inodes);
-
                 if let Ok(ref mut ebpf_guard) = self.ebpf.lock() {
                     if let Some(ref mut ebpf) = **ebpf_guard {
                         match MapManager::insert_inodes(ebpf.bpf_mut(), &inodes, zone_id) {
-                            Ok(count) => {
+                            Ok(inserted) => {
+                                // Store only successfully inserted inodes for cleanup.
+                                // This prevents removing entries that were never in the map.
+                                lock_or_abort(&self.registered_inodes)
+                                    .entry(zone.name.clone())
+                                    .or_default()
+                                    .extend_from_slice(&inserted);
                                 tracing::info!(
                                     zone = zone.name,
                                     container = %container_id,
-                                    count,
+                                    count = inserted.len(),
                                     collected = inodes.len(),
                                     "registered container rootfs inodes in BPF map"
                                 );
