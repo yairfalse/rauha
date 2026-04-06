@@ -145,28 +145,44 @@ impl EbpfManager {
 
         let mut program_fds = HashMap::new();
 
-        // Attach all LSM programs.
+        // Attach LSM programs. Some hooks may not exist on all kernels
+        // (e.g., cgroup_attach_task is not a BPF LSM hook on some kernels).
+        // Skip unsupported hooks and continue with what loads.
         for &(prog_name, hook_name) in LSM_PROGRAMS {
-            let prog: &mut Lsm = bpf.program_mut(prog_name)
-                .ok_or_else(|| RauhaError::EbpfError {
-                    message: format!("LSM program '{prog_name}' not found in object"),
-                    hint: "rebuild eBPF programs with `cargo xtask build-ebpf`".into(),
-                })?
-                .try_into()
-                .map_err(|e| RauhaError::EbpfError {
-                    message: format!("program '{prog_name}' is not an LSM program: {e}"),
-                    hint: "check the eBPF source uses #[lsm] macro".into(),
-                })?;
+            let prog: &mut Lsm = match bpf.program_mut(prog_name) {
+                Some(p) => match p.try_into() {
+                    Ok(lsm) => lsm,
+                    Err(e) => {
+                        tracing::warn!(program = prog_name, %e, "skipping — not an LSM program");
+                        continue;
+                    }
+                },
+                None => {
+                    tracing::warn!(program = prog_name, "skipping — not found in eBPF object");
+                    continue;
+                }
+            };
 
-            prog.load(hook_name, &btf).map_err(|e| RauhaError::EbpfError {
-                message: format!("failed to load LSM program '{prog_name}' (hook={hook_name}): {e}"),
-                hint: "check BPF verifier output, program may be too complex".into(),
-            })?;
+            match prog.load(hook_name, &btf) {
+                Ok(()) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        program = prog_name,
+                        hook = hook_name,
+                        %e,
+                        "skipping LSM hook — not supported by this kernel"
+                    );
+                    continue;
+                }
+            }
 
-            prog.attach().map_err(|e| RauhaError::EbpfError {
-                message: format!("failed to attach LSM program '{prog_name}': {e}"),
-                hint: "ensure kernel has `lsm=bpf` in boot cmdline".into(),
-            })?;
+            match prog.attach() {
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!(program = prog_name, %e, "skipping — attach failed");
+                    continue;
+                }
+            }
 
             if let Ok(prog_fd) = prog.fd() {
                 program_fds.insert(prog_name.to_string(), prog_fd.as_fd().as_raw_fd());
@@ -175,10 +191,18 @@ impl EbpfManager {
             tracing::info!(program = prog_name, hook = hook_name, "attached LSM program");
         }
 
+        if program_fds.is_empty() {
+            return Err(RauhaError::EbpfError {
+                message: "no LSM programs could be loaded".into(),
+                hint: "check kernel supports BPF LSM hooks".into(),
+            });
+        }
+
         tracing::info!(
-            programs = LSM_PROGRAMS.len(),
+            attached = program_fds.len(),
+            total = LSM_PROGRAMS.len(),
             pin_path = %pin_path.display(),
-            "eBPF programs loaded and attached"
+            "eBPF programs loaded"
         );
 
         let mut mgr = Self { bpf, pin_path, program_fds };
