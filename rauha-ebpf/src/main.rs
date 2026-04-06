@@ -78,9 +78,10 @@ unsafe fn read_kernel_u64(base: u64, offset: usize) -> Result<u64, i64> {
 
 /// Kernel struct field offsets for cgroup ID resolution.
 ///
-/// Defaults for Linux 6.1+. Userspace validates these against the running
-/// kernel's BTF via pahole at startup and rejects mismatches via the
-/// self-test. The offsets are compiled as constants — no runtime patching.
+/// Defaults for Linux 6.1+. Userspace validates ALL offsets against the
+/// running kernel's BTF via pahole at startup — any mismatch blocks loading.
+/// The cgroup chain (TASK_CGROUPS → KERNFS_NODE_ID) is additionally verified
+/// by the runtime self-test. File/inode/binprm offsets are pahole-only.
 ///
 /// Previous approach used #[no_mangle] static + set_global() for runtime
 /// patching, but the Rust nightly BPF compiler emits panic_misaligned_pointer

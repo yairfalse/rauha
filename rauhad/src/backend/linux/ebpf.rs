@@ -109,9 +109,24 @@ impl EbpfManager {
             hint: "kernel must have CONFIG_DEBUG_INFO_BTF=y".into(),
         })?;
 
-        // Resolve struct offsets from the running kernel's BTF via pahole.
-        // These are injected into the eBPF programs as globals before loading.
+        // Validate compiled struct offsets against the running kernel's BTF.
+        // If pahole finds a mismatch, log an error and fail loading — the eBPF
+        // programs would read wrong kernel fields and enforcement would be broken.
         let resolved_offsets = resolve_kernel_offsets();
+        for &(type_name, field_name, _global_name, compiled_default) in OFFSET_DEFS {
+            if let Some(&resolved) = resolved_offsets.get(_global_name) {
+                if resolved != compiled_default {
+                    return Err(RauhaError::EbpfError {
+                        message: format!(
+                            "kernel struct offset mismatch: {type_name}.{field_name} is {resolved} \
+                             on this kernel but eBPF programs were compiled with {compiled_default}"
+                        ),
+                        hint: "update offsets in rauha-ebpf/src/main.rs and rebuild with \
+                               `cargo xtask build-ebpf`".into(),
+                    });
+                }
+            }
+        }
 
         let obj_data = fs::read(ebpf_obj_path).map_err(|e| RauhaError::EbpfError {
             message: format!("failed to read eBPF object: {e}"),
@@ -120,9 +135,6 @@ impl EbpfManager {
 
         let mut loader = BpfLoader::new();
         loader.btf(Some(&btf)).map_pin_path(&pin_path);
-
-        // Offsets are compiled as constants in the eBPF programs (not runtime-patched).
-        // Userspace validates them via pahole + self-test after loading.
 
         let mut bpf = loader
             .load(&obj_data)
