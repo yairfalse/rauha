@@ -81,29 +81,33 @@ fn drain_events(ring_buf: &mut RingBuf<MapData>, tx: &broadcast::Sender<DecodedE
             .get(event.hook as usize)
             .unwrap_or(&"unknown");
 
-        let decision_str = if event.decision == rauha_ebpf_common::DECISION_ERROR {
-            "ERROR"
-        } else {
-            "DENY"
-        };
-
-        if event.decision == rauha_ebpf_common::DECISION_ERROR {
-            tracing::error!(
-                hook = hook,
-                pid = event.pid,
-                "enforcement ERROR — hook failed open, kernel read may have failed. \
-                 Check if kernel struct offsets are correct for this kernel version."
-            );
-        } else {
-            tracing::warn!(
-                hook = hook,
-                pid = event.pid,
-                caller_zone = event.caller_zone,
-                target_zone = event.target_zone,
-                context = event.context,
-                timestamp_ns = event.timestamp_ns,
-                "enforcement DENY"
-            );
+        match event.decision {
+            rauha_ebpf_common::DECISION_ERROR => {
+                tracing::error!(
+                    hook = hook,
+                    pid = event.pid,
+                    "enforcement ERROR — hook failed open, kernel read may have failed. \
+                     Check if kernel struct offsets are correct for this kernel version."
+                );
+            }
+            rauha_ebpf_common::DECISION_DENY => {
+                tracing::warn!(
+                    hook = hook,
+                    pid = event.pid,
+                    caller_zone = event.caller_zone,
+                    target_zone = event.target_zone,
+                    context = event.context,
+                    timestamp_ns = event.timestamp_ns,
+                    "enforcement DENY"
+                );
+            }
+            other => {
+                tracing::debug!(
+                    hook = hook,
+                    decision = other,
+                    "unknown enforcement event decision"
+                );
+            }
         }
 
         // Best-effort broadcast — if no subscribers, the send is a no-op.
