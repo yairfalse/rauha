@@ -81,12 +81,6 @@ fn drain_events(ring_buf: &mut RingBuf<MapData>, tx: &broadcast::Sender<DecodedE
             .get(event.hook as usize)
             .unwrap_or(&"unknown");
 
-        let decision_str = if event.decision == rauha_ebpf_common::DECISION_ERROR {
-            "ERROR"
-        } else {
-            "DENY"
-        };
-
         if event.decision == rauha_ebpf_common::DECISION_ERROR {
             tracing::error!(
                 hook = hook,
