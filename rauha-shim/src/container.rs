@@ -83,6 +83,14 @@ pub fn fork_and_exec(
 
     let hostname = spec.hostname().clone();
 
+    // Pre-allocate log file paths as CStrings for signal-safe use after fork.
+    let stdout_log = std::ffi::CString::new(
+        log_dir.join("stdout.log").to_string_lossy().as_bytes(),
+    ).unwrap_or_default();
+    let stderr_log = std::ffi::CString::new(
+        log_dir.join("stderr.log").to_string_lossy().as_bytes(),
+    ).unwrap_or_default();
+
     // Convert OwnedFd to raw fds for use across fork.
     // We manage lifetime manually after fork (child/parent each close their end).
     let rd_raw = pipe_rd.as_raw_fd();
@@ -104,10 +112,12 @@ pub fn fork_and_exec(
             let _ = nix::unistd::setsid();
 
             // Redirect stdout/stderr to log files.
-            redirect_stdio(&log_dir);
+            // Uses raw open() with pre-allocated CStrings — async-signal-safe.
+            redirect_stdio_raw(&stdout_log, &stderr_log);
 
             // pivot_root into the container rootfs.
             if let Err(e) = do_pivot_root(&rootfs) {
+                // write(2) is signal-safe, eprintln is not — but we exit immediately.
                 eprintln!("pivot_root failed: {e}");
                 std::process::exit(1);
             }
@@ -117,15 +127,14 @@ pub fn fork_and_exec(
                 let _ = nix::unistd::sethostname(h);
             }
 
-            // Set environment.
-            // Clear inherited env, set only what the spec says.
-            for (key, _) in std::env::vars() {
-                std::env::remove_var(&key);
-            }
-            for var in &env_vars {
-                let s = var.to_string_lossy();
-                if let Some((k, v)) = s.split_once('=') {
-                    std::env::set_var(k, v);
+            // Set environment using libc directly — bypasses Rust's env mutex.
+            // std::env::set_var/remove_var are NOT async-signal-safe (they hold
+            // a global lock that may be held by the parent process's other threads).
+            unsafe {
+                libc::clearenv();
+                for var in &env_vars {
+                    // CString is pre-allocated before fork — no allocation here.
+                    libc::putenv(var.as_ptr() as *mut libc::c_char);
                 }
             }
 
@@ -242,16 +251,30 @@ fn do_pivot_root(new_root: &Path) -> anyhow::Result<()> {
 
 /// Redirect stdout and stderr to log files.
 #[cfg(target_os = "linux")]
-fn redirect_stdio(log_dir: &Path) {
-    use std::os::unix::io::AsRawFd;
+/// Redirect stdout/stderr to log files using raw open() syscall.
+///
+/// Async-signal-safe: uses pre-allocated CStrings and libc::open directly.
+/// No Rust allocation, no File::create, no global locks.
+fn redirect_stdio_raw(stdout_path: &std::ffi::CStr, stderr_path: &std::ffi::CStr) {
+    unsafe {
+        let fd = libc::open(
+            stdout_path.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC,
+            0o644,
+        );
+        if fd >= 0 {
+            libc::dup2(fd, 1);
+            libc::close(fd);
+        }
 
-    let stdout_path = log_dir.join("stdout.log");
-    let stderr_path = log_dir.join("stderr.log");
-
-    if let Ok(f) = std::fs::File::create(&stdout_path) {
-        let _ = nix::unistd::dup2(f.as_raw_fd(), 1);
-    }
-    if let Ok(f) = std::fs::File::create(&stderr_path) {
-        let _ = nix::unistd::dup2(f.as_raw_fd(), 2);
+        let fd = libc::open(
+            stderr_path.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC,
+            0o644,
+        );
+        if fd >= 0 {
+            libc::dup2(fd, 2);
+            libc::close(fd);
+        }
     }
 }
