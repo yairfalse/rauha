@@ -49,7 +49,6 @@ static ENFORCEMENT_COUNTERS: PerCpuArray<EnforcementCounters> =
 
 /// Ring buffer for streaming enforcement events to userspace.
 /// 1024 pages = 4MB. At 48 bytes/event, holds ~87K events before wrapping.
-/// Sized to resist audit-evasion attacks (attacker floods denies to fill buffer).
 #[map]
 static ENFORCEMENT_EVENTS: RingBuf = RingBuf::with_byte_size(1024 * 4096, 0);
 
@@ -185,17 +184,10 @@ fn emit_deny_event(hook: u8, caller_zone: u32, target_zone: u32, context: u64) {
         _reserved: [0; 2],
     };
 
-    // Use output() instead of reserve()+write()+submit() to avoid memcpy
-    // alignment checks that emit panic_misaligned_pointer_dereference —
-    // which the BPF verifier rejects.
-    let _ = unsafe { ENFORCEMENT_EVENTS.output(&event, 0) };
+    let _ = ENFORCEMENT_EVENTS.output(&event, 0);
 }
 
 /// Emit an error enforcement event to the ring buffer.
-///
-/// Called when a hook hits an error path (kernel read failure, null pointer, etc.)
-/// and falls open. Makes the fail-open observable — operators can detect when
-/// enforcement is degraded by monitoring error events.
 #[inline(always)]
 fn emit_error_event(hook: u8) {
     let pid = (unsafe { aya_ebpf::helpers::bpf_get_current_pid_tgid() } >> 32) as u32;
@@ -213,7 +205,7 @@ fn emit_error_event(hook: u8) {
         _reserved: [0; 2],
     };
 
-    let _ = unsafe { ENFORCEMENT_EVENTS.output(&event, 0) };
+    let _ = ENFORCEMENT_EVENTS.output(&event, 0);
 }
 
 /// Check if a cross-zone task operation (ptrace, signal) should be denied.
@@ -339,26 +331,5 @@ pub fn rauha_socket_connect(ctx: LsmContext) -> i32 {
 
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo) -> ! {
-    unsafe { core::hint::unreachable_unchecked() }
-}
-
-/// Override the compiler-generated misaligned pointer panic.
-///
-/// The Rust nightly BPF compiler emits `panic_misaligned_pointer_dereference`
-/// for struct copies via memcpy/memmove/memset. The default implementation
-/// ends with a `call` instruction that the BPF verifier rejects
-/// ("last insn is not an exit or jmp"). This no-op override prevents that.
-#[no_mangle]
-#[inline(never)]
-fn _RNvNtCsi6aB7btCd5y_4core9panicking36panic_misaligned_pointer_dereference() {
-    // Intentionally empty — BPF memory is always properly aligned.
-    // This function must exist to satisfy the linker without generating
-    // a call to panic_nounwind_fmt.
-}
-
-/// Override the compiler-generated nounwind format panic.
-#[no_mangle]
-#[inline(never)]
-fn _RNvNtCsi6aB7btCd5y_4core9panicking18panic_nounwind_fmt() {
-    // Intentionally empty — BPF programs cannot panic.
+    loop {}
 }

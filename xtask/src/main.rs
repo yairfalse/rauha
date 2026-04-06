@@ -62,6 +62,9 @@ fn build_ebpf(release: bool) -> Result<()> {
     let mut cmd = Command::new("cargo");
     cmd.current_dir(&ebpf_dir)
         .env_remove("RUSTUP_TOOLCHAIN")
+        // Disable UB checks — the alignment panic intrinsics they emit
+        // produce .text.unlikely. functions that the BPF verifier rejects.
+        .env("RUSTFLAGS", "-Zub-checks=no")
         .args([
             "+nightly",
             "build",
