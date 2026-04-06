@@ -73,17 +73,25 @@ impl EnforceEbpf {
             .map_err(|e| anyhow::anyhow!("failed to load BTF: {e} — kernel needs CONFIG_DEBUG_INFO_BTF=y"))?;
 
         // Resolve kernel struct offsets via pahole.
-        let offsets = resolve_offsets();
+        // Validate compiled offsets against the running kernel via pahole.
+        // Fail if any mismatch — wrong offsets cause silent enforcement failure.
+        let resolved = resolve_offsets();
+        for &(_, _, global_name, default) in OFFSET_DEFS {
+            if let Some(&(_, val)) = resolved.iter().find(|(n, _)| n == global_name) {
+                if val != default {
+                    anyhow::bail!(
+                        "kernel offset mismatch for {global_name}: kernel={val}, compiled={default}. \
+                         Rebuild eBPF with `cargo xtask build-ebpf`"
+                    );
+                }
+            }
+        }
 
         let obj_data = fs::read(&obj_path)
             .map_err(|e| anyhow::anyhow!("failed to read eBPF object {}: {e}", obj_path.display()))?;
 
         let mut loader = BpfLoader::new();
         loader.btf(Some(&btf)).map_pin_path(&pin_path);
-
-        for (name, val) in &offsets {
-            loader.set_global(name.as_str(), val, true);
-        }
 
         let mut bpf = loader
             .load(&obj_data)
