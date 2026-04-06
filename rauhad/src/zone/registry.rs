@@ -25,6 +25,10 @@ pub struct ZoneRegistry {
     handles: RwLock<HashMap<String, ZoneHandle>>,
     /// In-memory cache of container handles (needed for start/stop operations).
     container_handles: RwLock<HashMap<Uuid, ContainerHandle>>,
+    /// Serializes zone create/delete operations to prevent TOCTOU races.
+    /// The duplicate check and metadata write must be atomic — this lock
+    /// ensures no two creates with the same name can interleave.
+    zone_mutation_lock: tokio::sync::Mutex<()>,
 }
 
 /// Validate that a zone name is safe (no path traversal, no special chars).
@@ -66,6 +70,7 @@ impl ZoneRegistry {
             root,
             handles: RwLock::new(HashMap::new()),
             container_handles: RwLock::new(HashMap::new()),
+            zone_mutation_lock: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -127,7 +132,12 @@ impl ZoneRegistry {
         // Validate zone name: reject path traversal and unsafe characters.
         validate_zone_name(name)?;
 
-        // Check for duplicates.
+        // Serialize zone mutations to prevent TOCTOU: two concurrent creates
+        // with the same name could both pass the duplicate check before either
+        // writes to metadata. The lock ensures check-and-create is atomic.
+        let _guard = self.zone_mutation_lock.lock().await;
+
+        // Check for duplicates (protected by zone_mutation_lock).
         if self.metadata.get_zone(name)?.is_some() {
             return Err(RauhaError::ZoneAlreadyExists(name.into()));
         }
@@ -167,6 +177,8 @@ impl ZoneRegistry {
     }
 
     pub async fn delete_zone(&self, name: &str, force: bool) -> Result<()> {
+        let _guard = self.zone_mutation_lock.lock().await;
+
         let zone = self
             .metadata
             .get_zone(name)?
@@ -1122,5 +1134,34 @@ mod tests {
 
         let zone = reg.get_zone("pol").await.unwrap();
         assert_eq!(zone.policy.resources.pids_max, 999);
+    }
+
+    #[tokio::test]
+    async fn concurrent_create_same_name_one_wins() {
+        let tmp = TempDir::new().unwrap();
+        let reg = Arc::new(test_registry(&tmp));
+
+        let mut handles = Vec::new();
+        for _ in 0..10 {
+            let r = Arc::clone(&reg);
+            handles.push(tokio::spawn(async move {
+                r.create_zone("dup-race", ZoneType::NonGlobal, ZonePolicy::default())
+                    .await
+            }));
+        }
+
+        let mut results = Vec::new();
+        for handle in handles {
+            results.push(handle.await.unwrap());
+        }
+
+        let successes = results.iter().filter(|r| r.is_ok()).count();
+        let already_exists = results
+            .iter()
+            .filter(|r| matches!(r, Err(RauhaError::ZoneAlreadyExists(_))))
+            .count();
+
+        assert_eq!(successes, 1, "exactly one create should succeed");
+        assert_eq!(already_exists, 9, "all others should get AlreadyExists");
     }
 }
