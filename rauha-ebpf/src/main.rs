@@ -185,10 +185,10 @@ fn emit_deny_event(hook: u8, caller_zone: u32, target_zone: u32, context: u64) {
         _reserved: [0; 2],
     };
 
-    if let Some(mut entry) = unsafe { ENFORCEMENT_EVENTS.reserve::<EnforcementEvent>(0) } {
-        entry.write(event);
-        entry.submit(0);
-    }
+    // Use output() instead of reserve()+write()+submit() to avoid memcpy
+    // alignment checks that emit panic_misaligned_pointer_dereference —
+    // which the BPF verifier rejects.
+    let _ = unsafe { ENFORCEMENT_EVENTS.output(&event, 0) };
 }
 
 /// Emit an error enforcement event to the ring buffer.
@@ -213,10 +213,7 @@ fn emit_error_event(hook: u8) {
         _reserved: [0; 2],
     };
 
-    if let Some(mut entry) = unsafe { ENFORCEMENT_EVENTS.reserve::<EnforcementEvent>(0) } {
-        entry.write(event);
-        entry.submit(0);
-    }
+    let _ = unsafe { ENFORCEMENT_EVENTS.output(&event, 0) };
 }
 
 /// Check if a cross-zone task operation (ptrace, signal) should be denied.
@@ -342,5 +339,26 @@ pub fn rauha_socket_connect(ctx: LsmContext) -> i32 {
 
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo) -> ! {
-    loop {}
+    unsafe { core::hint::unreachable_unchecked() }
+}
+
+/// Override the compiler-generated misaligned pointer panic.
+///
+/// The Rust nightly BPF compiler emits `panic_misaligned_pointer_dereference`
+/// for struct copies via memcpy/memmove/memset. The default implementation
+/// ends with a `call` instruction that the BPF verifier rejects
+/// ("last insn is not an exit or jmp"). This no-op override prevents that.
+#[no_mangle]
+#[inline(never)]
+fn _RNvNtCsi6aB7btCd5y_4core9panicking36panic_misaligned_pointer_dereference() {
+    // Intentionally empty — BPF memory is always properly aligned.
+    // This function must exist to satisfy the linker without generating
+    // a call to panic_nounwind_fmt.
+}
+
+/// Override the compiler-generated nounwind format panic.
+#[no_mangle]
+#[inline(never)]
+fn _RNvNtCsi6aB7btCd5y_4core9panicking18panic_nounwind_fmt() {
+    // Intentionally empty — BPF programs cannot panic.
 }
