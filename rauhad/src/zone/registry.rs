@@ -1135,4 +1135,33 @@ mod tests {
         let zone = reg.get_zone("pol").await.unwrap();
         assert_eq!(zone.policy.resources.pids_max, 999);
     }
+
+    #[tokio::test]
+    async fn concurrent_create_same_name_one_wins() {
+        let tmp = TempDir::new().unwrap();
+        let reg = Arc::new(test_registry(&tmp));
+
+        let mut handles = Vec::new();
+        for _ in 0..10 {
+            let r = Arc::clone(&reg);
+            handles.push(tokio::spawn(async move {
+                r.create_zone("dup-race", ZoneType::NonGlobal, ZonePolicy::default())
+                    .await
+            }));
+        }
+
+        let mut results = Vec::new();
+        for handle in handles {
+            results.push(handle.await.unwrap());
+        }
+
+        let successes = results.iter().filter(|r| r.is_ok()).count();
+        let already_exists = results
+            .iter()
+            .filter(|r| matches!(r, Err(RauhaError::ZoneAlreadyExists(_))))
+            .count();
+
+        assert_eq!(successes, 1, "exactly one create should succeed");
+        assert_eq!(already_exists, 9, "all others should get AlreadyExists");
+    }
 }
