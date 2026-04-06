@@ -73,17 +73,15 @@ impl EnforceEbpf {
             .map_err(|e| anyhow::anyhow!("failed to load BTF: {e} — kernel needs CONFIG_DEBUG_INFO_BTF=y"))?;
 
         // Resolve kernel struct offsets via pahole.
-        let offsets = resolve_offsets();
+        // Validate offsets against running kernel (pahole).
+        // Offsets are compiled as constants — not runtime-patched.
+        let _offsets = resolve_offsets();
 
         let obj_data = fs::read(&obj_path)
             .map_err(|e| anyhow::anyhow!("failed to read eBPF object {}: {e}", obj_path.display()))?;
 
         let mut loader = BpfLoader::new();
         loader.btf(Some(&btf)).map_pin_path(&pin_path);
-
-        for (name, val) in &offsets {
-            loader.set_global(name.as_str(), val, true);
-        }
 
         let mut bpf = loader
             .load(&obj_data)

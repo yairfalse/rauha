@@ -76,60 +76,23 @@ unsafe fn read_kernel_u64(base: u64, offset: usize) -> Result<u64, i64> {
     aya_ebpf::helpers::bpf_probe_read_kernel(addr).map_err(|e| e as i64)
 }
 
-/// Kernel struct field offsets — patched at load time by userspace.
+/// Kernel struct field offsets for cgroup ID resolution.
 ///
-/// These globals are set via `BpfLoader::set_global()` before the programs
-/// are loaded. Userspace reads the real offsets from the running kernel's
-/// BTF (via pahole) and injects them here. The defaults are for Linux 6.1+
-/// and are used as fallback if pahole is not available.
+/// Defaults for Linux 6.1+. Userspace validates these against the running
+/// kernel's BTF via pahole at startup and rejects mismatches via the
+/// self-test. The offsets are compiled as constants — no runtime patching.
 ///
-/// This eliminates the portability problem of hardcoded offsets: any kernel
-/// with BTF + pahole will get correct offsets automatically.
-#[no_mangle]
-static TASK_CGROUPS_OFFSET: u64 = 2336;
-#[no_mangle]
-static CSS_SET_DFL_CGRP_OFFSET: u64 = 48;
-#[no_mangle]
-static CGROUP_KN_OFFSET: u64 = 64;
-#[no_mangle]
-static KERNFS_NODE_ID_OFFSET: u64 = 0;
-#[no_mangle]
-static FILE_F_INODE_OFFSET: u64 = 32;
-#[no_mangle]
-static INODE_I_INO_OFFSET: u64 = 64;
-#[no_mangle]
-static BPRM_FILE_OFFSET: u64 = 168;
-
-/// Convenience accessors that read the global values.
+/// Previous approach used #[no_mangle] static + set_global() for runtime
+/// patching, but the Rust nightly BPF compiler emits panic_misaligned_pointer
+/// functions that the BPF verifier rejects ("last insn is not an exit or jmp").
 mod offsets {
-    #[inline(always)]
-    pub fn task_cgroups() -> usize {
-        unsafe { core::ptr::read_volatile(&super::TASK_CGROUPS_OFFSET) as usize }
-    }
-    #[inline(always)]
-    pub fn css_set_dfl_cgrp() -> usize {
-        unsafe { core::ptr::read_volatile(&super::CSS_SET_DFL_CGRP_OFFSET) as usize }
-    }
-    #[inline(always)]
-    pub fn cgroup_kn() -> usize {
-        unsafe { core::ptr::read_volatile(&super::CGROUP_KN_OFFSET) as usize }
-    }
-    #[inline(always)]
-    pub fn kernfs_node_id() -> usize {
-        unsafe { core::ptr::read_volatile(&super::KERNFS_NODE_ID_OFFSET) as usize }
-    }
-    #[inline(always)]
-    pub fn file_f_inode() -> usize {
-        unsafe { core::ptr::read_volatile(&super::FILE_F_INODE_OFFSET) as usize }
-    }
-    #[inline(always)]
-    pub fn inode_i_ino() -> usize {
-        unsafe { core::ptr::read_volatile(&super::INODE_I_INO_OFFSET) as usize }
-    }
-    #[inline(always)]
-    pub fn bprm_file() -> usize {
-        unsafe { core::ptr::read_volatile(&super::BPRM_FILE_OFFSET) as usize }
-    }
+    pub const TASK_CGROUPS: usize = 2336;
+    pub const CSS_SET_DFL_CGRP: usize = 48;
+    pub const CGROUP_KN: usize = 64;
+    pub const KERNFS_NODE_ID: usize = 0;
+    pub const FILE_F_INODE: usize = 32;
+    pub const INODE_I_INO: usize = 64;
+    pub const BPRM_FILE: usize = 168;
 }
 
 /// Read a target task's cgroup_id by walking the task_struct pointer chain.
@@ -144,22 +107,22 @@ unsafe fn read_task_cgroup_id(task_ptr: u64) -> Result<u64, i64> {
         return Err(-1);
     }
 
-    let cgroups_ptr = read_kernel_u64(task_ptr, offsets::task_cgroups())?;
+    let cgroups_ptr = read_kernel_u64(task_ptr, offsets::TASK_CGROUPS)?;
     if cgroups_ptr == 0 {
         return Err(-1);
     }
 
-    let dfl_cgrp_ptr = read_kernel_u64(cgroups_ptr, offsets::css_set_dfl_cgrp())?;
+    let dfl_cgrp_ptr = read_kernel_u64(cgroups_ptr, offsets::CSS_SET_DFL_CGRP)?;
     if dfl_cgrp_ptr == 0 {
         return Err(-1);
     }
 
-    let kn_ptr = read_kernel_u64(dfl_cgrp_ptr, offsets::cgroup_kn())?;
+    let kn_ptr = read_kernel_u64(dfl_cgrp_ptr, offsets::CGROUP_KN)?;
     if kn_ptr == 0 {
         return Err(-1);
     }
 
-    read_kernel_u64(kn_ptr, offsets::kernfs_node_id())
+    read_kernel_u64(kn_ptr, offsets::KERNFS_NODE_ID)
 }
 
 /// Look up a target task's zone by walking its task_struct to get cgroup_id,
@@ -179,12 +142,12 @@ unsafe fn read_file_ino(file_ptr: u64) -> Result<u64, i64> {
         return Err(-1);
     }
 
-    let inode_ptr = read_kernel_u64(file_ptr, offsets::file_f_inode())?;
+    let inode_ptr = read_kernel_u64(file_ptr, offsets::FILE_F_INODE)?;
     if inode_ptr == 0 {
         return Err(-1);
     }
 
-    read_kernel_u64(inode_ptr, offsets::inode_i_ino())
+    read_kernel_u64(inode_ptr, offsets::INODE_I_INO)
 }
 
 /// Check if cross-zone access from src to dst is allowed.

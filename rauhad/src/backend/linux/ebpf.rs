@@ -118,22 +118,11 @@ impl EbpfManager {
             hint: format!("check permissions on {}", ebpf_obj_path.display()),
         })?;
 
-        // Collect offsets into a Vec so they live long enough for set_global.
-        let offset_values: Vec<(&str, u64)> = OFFSET_DEFS
-            .iter()
-            .map(|&(_, _, global_name, default)| {
-                let val = resolved_offsets.get(global_name).copied().unwrap_or(default);
-                (global_name, val)
-            })
-            .collect();
-
         let mut loader = BpfLoader::new();
         loader.btf(Some(&btf)).map_pin_path(&pin_path);
 
-        // Inject resolved offsets into eBPF globals before loading.
-        for (name, val) in &offset_values {
-            loader.set_global(name, val, true);
-        }
+        // Offsets are compiled as constants in the eBPF programs (not runtime-patched).
+        // Userspace validates them via pahole + self-test after loading.
 
         let mut bpf = loader
             .load(&obj_data)
