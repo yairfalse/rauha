@@ -45,11 +45,11 @@ static SELF_TEST: Array<SelfTestResult> = Array::with_max_entries(1, 0);
 static ENFORCEMENT_COUNTERS: PerCpuArray<EnforcementCounters> =
     PerCpuArray::with_max_entries(ENFORCEMENT_COUNTER_ENTRIES, 0);
 
-/// Ring buffer for streaming enforcement deny events to userspace.
-/// 256 pages = 1MB. At 48 bytes/event, holds ~21K events before wrapping.
-/// Only deny events are emitted — allows are tracked by counters only.
+/// Ring buffer for streaming enforcement events to userspace.
+/// 1024 pages = 4MB. At 48 bytes/event, holds ~87K events before wrapping.
+/// Sized to resist audit-evasion attacks (attacker floods denies to fill buffer).
 #[map]
-static ENFORCEMENT_EVENTS: RingBuf = RingBuf::with_byte_size(256 * 4096, 0);
+static ENFORCEMENT_EVENTS: RingBuf = RingBuf::with_byte_size(1024 * 4096, 0);
 
 /// Look up the caller's zone from their cgroup_id.
 /// Returns None if the process is not in any zone (global/unzoned).
