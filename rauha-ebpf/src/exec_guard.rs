@@ -6,7 +6,7 @@
 use aya_ebpf::programs::LsmContext;
 
 use crate::{lookup_caller_zone, is_cross_zone_allowed, read_file_ino, read_kernel_u64,
-            count_decision, emit_deny_event, offsets, INODE_ZONE_MAP};
+            count_decision, emit_deny_event, emit_error_event, offsets, INODE_ZONE_MAP};
 use rauha_ebpf_common::{ZONE_FLAG_GLOBAL, PROG_BPRM_CHECK, HOOK_BPRM_CHECK};
 
 /// Called from the bprm_check_security LSM hook.
@@ -18,7 +18,10 @@ use rauha_ebpf_common::{ZONE_FLAG_GLOBAL, PROG_BPRM_CHECK, HOOK_BPRM_CHECK};
 pub fn bprm_check_security(ctx: &LsmContext) -> i32 {
     let (ret, is_error) = match try_bprm_check(ctx) {
         Ok(ret) => (ret, false),
-        Err(_) => (0, true),
+        Err(_) => {
+            emit_error_event(HOOK_BPRM_CHECK);
+            (0, true)
+        }
     };
     count_decision(PROG_BPRM_CHECK, ret == 0, is_error);
     ret

@@ -103,6 +103,7 @@ pub const HOOK_CGROUP_ATTACH: u8 = 4;
 
 // Decision constants for EnforcementEvent.
 pub const DECISION_ALLOW: u8 = 0;
+pub const DECISION_ERROR: u8 = 2;
 pub const DECISION_DENY: u8 = 1;
 
 /// Enforcement event emitted from BPF hooks via ring buffer.

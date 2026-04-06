@@ -22,7 +22,11 @@ use rauha_ebpf_common::{ZONE_FLAG_GLOBAL, PROG_CGROUP_ATTACH, HOOK_CGROUP_ATTACH
 pub fn cgroup_attach_task(ctx: &LsmContext) -> i32 {
     let (ret, is_error) = match try_cgroup_attach(ctx) {
         Ok(ret) => (ret, false),
-        Err(_) => (0, true), // Fail open — blocking cgroup moves breaks shim operation.
+        Err(_) => {
+            // Fail open — blocking cgroup moves breaks shim operation.
+            crate::emit_error_event(HOOK_CGROUP_ATTACH);
+            (0, true)
+        }
     };
     count_decision(PROG_CGROUP_ATTACH, ret == 0, is_error);
     ret

@@ -81,15 +81,24 @@ fn drain_events(ring_buf: &mut RingBuf<MapData>, tx: &broadcast::Sender<DecodedE
             .get(event.hook as usize)
             .unwrap_or(&"unknown");
 
-        tracing::warn!(
-            hook = hook,
-            pid = event.pid,
-            caller_zone = event.caller_zone,
-            target_zone = event.target_zone,
-            context = event.context,
-            timestamp_ns = event.timestamp_ns,
-            "enforcement DENY"
-        );
+        if event.decision == rauha_ebpf_common::DECISION_ERROR {
+            tracing::error!(
+                hook = hook,
+                pid = event.pid,
+                "enforcement ERROR — hook failed open, kernel read may have failed. \
+                 Check if kernel struct offsets are correct for this kernel version."
+            );
+        } else {
+            tracing::warn!(
+                hook = hook,
+                pid = event.pid,
+                caller_zone = event.caller_zone,
+                target_zone = event.target_zone,
+                context = event.context,
+                timestamp_ns = event.timestamp_ns,
+                "enforcement DENY"
+            );
+        }
 
         // Best-effort broadcast — if no subscribers, the send is a no-op.
         let _ = tx.send(DecodedEvent {
