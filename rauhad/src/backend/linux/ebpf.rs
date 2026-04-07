@@ -47,7 +47,7 @@ const OFFSET_DEFS: &[(&str, &str, &str, u64)] = &[
     ("task_struct", "cgroups", "TASK_CGROUPS_OFFSET", 3920),
     ("css_set", "dfl_cgrp", "CSS_SET_DFL_CGRP_OFFSET", 136),
     ("cgroup", "kn", "CGROUP_KN_OFFSET", 256),
-    ("kernfs_node", "id", "KERNFS_NODE_ID_OFFSET", 0),
+    ("kernfs_node", "id", "KERNFS_NODE_ID_OFFSET", 96),
     ("file", "f_inode", "FILE_F_INODE_OFFSET", 32),
     ("inode", "i_ino", "INODE_I_INO_OFFSET", 64),
     ("linux_binprm", "executable", "BPRM_FILE_OFFSET", 48),
@@ -529,8 +529,13 @@ fn pahole_field_offset(
     let stdout = String::from_utf8_lossy(&output.stdout);
     for line in stdout.lines() {
         let trimmed = line.trim();
-        // Match lines containing the field name followed by a /* offset comment.
-        if !trimmed.contains(field_name) {
+        // Match lines containing the field name as a whole word (not substring).
+        // E.g., searching for "id" must not match "void" or "unsigned".
+        let is_word_match = trimmed.split_whitespace().any(|word| {
+            let clean = word.trim_end_matches(';');
+            clean == field_name
+        });
+        if !is_word_match {
             continue;
         }
         // Parse offset from the /*  OFFSET  SIZE */ comment.

@@ -90,7 +90,7 @@ mod offsets {
     pub const TASK_CGROUPS: usize = 3920;
     pub const CSS_SET_DFL_CGRP: usize = 136;
     pub const CGROUP_KN: usize = 256;
-    pub const KERNFS_NODE_ID: usize = 0;
+    pub const KERNFS_NODE_ID: usize = 96;
     pub const FILE_F_INODE: usize = 32;
     pub const INODE_I_INO: usize = 64;
     // linux_binprm renamed 'file' to 'executable' in recent kernels.
