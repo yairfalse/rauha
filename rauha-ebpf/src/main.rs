@@ -86,13 +86,15 @@ unsafe fn read_kernel_u64(base: u64, offset: usize) -> Result<u64, i64> {
 /// patching, but the Rust nightly BPF compiler emits panic_misaligned_pointer
 /// functions that the BPF verifier rejects ("last insn is not an exit or jmp").
 mod offsets {
-    pub const TASK_CGROUPS: usize = 2336;
-    pub const CSS_SET_DFL_CGRP: usize = 48;
-    pub const CGROUP_KN: usize = 64;
+    // Verified via pahole on Linux 6.19.9 (Fedora 43).
+    pub const TASK_CGROUPS: usize = 3920;
+    pub const CSS_SET_DFL_CGRP: usize = 136;
+    pub const CGROUP_KN: usize = 256;
     pub const KERNFS_NODE_ID: usize = 0;
     pub const FILE_F_INODE: usize = 32;
     pub const INODE_I_INO: usize = 64;
-    pub const BPRM_FILE: usize = 168;
+    // linux_binprm renamed 'file' to 'executable' in recent kernels.
+    pub const BPRM_FILE: usize = 48;
 }
 
 /// Read a target task's cgroup_id by walking the task_struct pointer chain.

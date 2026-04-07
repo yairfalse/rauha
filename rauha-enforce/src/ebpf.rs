@@ -254,13 +254,13 @@ fn policy_to_kernel(policy: &ZonePolicy) -> ZonePolicyKernel {
 
 /// Offset definitions: (struct, field, global_name, default)
 const OFFSET_DEFS: &[(&str, &str, &str, u64)] = &[
-    ("task_struct", "cgroups", "TASK_CGROUPS_OFFSET", 2336),
-    ("css_set", "dfl_cgrp", "CSS_SET_DFL_CGRP_OFFSET", 48),
-    ("cgroup", "kn", "CGROUP_KN_OFFSET", 64),
+    ("task_struct", "cgroups", "TASK_CGROUPS_OFFSET", 3920),
+    ("css_set", "dfl_cgrp", "CSS_SET_DFL_CGRP_OFFSET", 136),
+    ("cgroup", "kn", "CGROUP_KN_OFFSET", 256),
     ("kernfs_node", "id", "KERNFS_NODE_ID_OFFSET", 0),
     ("file", "f_inode", "FILE_F_INODE_OFFSET", 32),
     ("inode", "i_ino", "INODE_I_INO_OFFSET", 64),
-    ("linux_binprm", "file", "BPRM_FILE_OFFSET", 168),
+    ("linux_binprm", "executable", "BPRM_FILE_OFFSET", 48),
 ];
 
 fn resolve_offsets() -> Vec<(String, u64)> {
