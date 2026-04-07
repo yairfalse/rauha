@@ -53,6 +53,13 @@ fn try_capable(ctx: &LsmContext) -> Result<i32, i64> {
         None => return Ok(0), // No policy → default allow.
     };
 
+    // caps_mask == 0 means no capability restrictions configured.
+    // This is the default for policies without a [capabilities] section.
+    // Only enforce when the policy explicitly lists allowed capabilities.
+    if policy.caps_mask == 0 {
+        return Ok(0);
+    }
+
     let cap_bit = 1u64 << (cap as u64);
     if policy.caps_mask & cap_bit != 0 {
         return Ok(0); // Capability explicitly permitted.
