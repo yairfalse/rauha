@@ -255,7 +255,15 @@ impl EbpfManager {
     pub fn health_check(&self) -> Result<Vec<ProgramStatus>> {
         let mut statuses = Vec::new();
 
+        // Only check programs that were successfully loaded and attached.
+        // Programs skipped during load (unsupported kernel hooks) are not
+        // included — their absence is expected, not a health failure.
         for &(prog_name, _) in LSM_PROGRAMS {
+            // Skip programs that weren't loaded (no fd recorded).
+            if !self.program_fds.contains_key(prog_name) {
+                continue;
+            }
+
             let loaded = self.bpf.program(prog_name).is_some();
 
             let attached = if let Some(&fd) = self.program_fds.get(prog_name) {
