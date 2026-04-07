@@ -77,13 +77,22 @@ pub fn serve_attach_session(
                     match nix::unistd::read(pty_master_fd, &mut buf) {
                         Ok(0) | Err(_) => break, // PTY closed
                         Ok(n) => {
+                            tracing::debug!(bytes = n, "relay: PTY → socket");
                             if write_all_fd(stream_fd, &buf[..n]).is_err() {
                                 break; // client disconnected
                             }
                         }
                     }
                 }
+                // Read any remaining data before checking POLLHUP.
+                // POLLIN and POLLHUP can arrive together — always drain first.
                 if revents.contains(PollFlags::POLLHUP) || revents.contains(PollFlags::POLLERR) {
+                    // One last read attempt to drain buffered data.
+                    while let Ok(n) = nix::unistd::read(pty_master_fd, &mut buf) {
+                        if n == 0 { break; }
+                        tracing::debug!(bytes = n, "relay: PTY → socket (drain)");
+                        if write_all_fd(stream_fd, &buf[..n]).is_err() { break; }
+                    }
                     break;
                 }
             }
