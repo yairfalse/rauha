@@ -220,18 +220,17 @@ pub fn fork_and_exec_pty(
             }
             let _ = nix::unistd::chdir("/");
 
-            // Set environment.
-            for (key, _) in std::env::vars() {
-                std::env::remove_var(&key);
-            }
-            for var in &c_env {
-                let s = var.to_string_lossy();
-                if let Some((k, v)) = s.split_once('=') {
-                    std::env::set_var(k, v);
+            // Set environment using libc directly — Rust's std::env functions
+            // are NOT async-signal-safe (they hold a global mutex that may be
+            // held by another thread in the parent process after fork).
+            unsafe {
+                libc::clearenv();
+                for var in &c_env {
+                    libc::putenv(var.as_ptr() as *mut libc::c_char);
                 }
-            }
-            if std::env::var("TERM").is_err() {
-                std::env::set_var("TERM", "xterm-256color");
+                // Set TERM if not already in env.
+                let term = c"TERM=xterm-256color";
+                libc::putenv(term.as_ptr() as *mut libc::c_char);
             }
 
             let err = nix::unistd::execvp(&c_args[0], &c_args);
