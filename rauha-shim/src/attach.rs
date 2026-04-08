@@ -213,6 +213,12 @@ pub fn fork_and_exec_pty(
             // Set controlling terminal.
             unsafe { libc::ioctl(0, libc::TIOCSCTTY, 0) };
 
+            // Enter a new mount namespace for chroot isolation.
+            if let Err(e) = nix::sched::unshare(nix::sched::CloneFlags::CLONE_NEWNS) {
+                eprintln!("unshare(CLONE_NEWNS) failed: {e}");
+                std::process::exit(1);
+            }
+
             // Chroot into container rootfs.
             if let Err(e) = nix::unistd::chroot(&rootfs) {
                 eprintln!("chroot failed: {e}");

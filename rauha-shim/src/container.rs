@@ -115,6 +115,13 @@ pub fn fork_and_exec(
             // Uses raw open() with pre-allocated CStrings — async-signal-safe.
             redirect_stdio_raw(&stdout_log, &stderr_log);
 
+            // Enter a new mount namespace. pivot_root requires its own mount
+            // namespace — it can't change the root of the host namespace.
+            if let Err(e) = nix::sched::unshare(nix::sched::CloneFlags::CLONE_NEWNS) {
+                eprintln!("unshare(CLONE_NEWNS) failed: {e}");
+                std::process::exit(1);
+            }
+
             // pivot_root into the container rootfs.
             if let Err(e) = do_pivot_root(&rootfs) {
                 // write(2) is signal-safe, eprintln is not — but we exit immediately.
