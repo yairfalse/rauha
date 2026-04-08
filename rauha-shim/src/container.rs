@@ -115,10 +115,22 @@ pub fn fork_and_exec(
             // Uses raw open() with pre-allocated CStrings — async-signal-safe.
             redirect_stdio_raw(&stdout_log, &stderr_log);
 
-            // Enter a new mount namespace. pivot_root requires its own mount
-            // namespace — it can't change the root of the host namespace.
+            // Enter a new mount namespace and make all mounts private.
+            // pivot_root requires: (1) own mount namespace, (2) private root mount.
+            // Without MS_PRIVATE|MS_REC, inherited shared mounts cause EINVAL.
             if let Err(e) = nix::sched::unshare(nix::sched::CloneFlags::CLONE_NEWNS) {
                 eprintln!("unshare(CLONE_NEWNS) failed: {e}");
+                std::process::exit(1);
+            }
+            // Make all mounts private — required for pivot_root to work.
+            if let Err(e) = nix::mount::mount(
+                None::<&str>,
+                "/",
+                None::<&str>,
+                nix::mount::MsFlags::MS_PRIVATE | nix::mount::MsFlags::MS_REC,
+                None::<&str>,
+            ) {
+                eprintln!("mount(MS_PRIVATE) failed: {e}");
                 std::process::exit(1);
             }
 
