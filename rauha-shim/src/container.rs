@@ -119,8 +119,9 @@ pub fn fork_and_exec(
             // pivot_root requires: (1) own mount namespace, (2) private root mount.
             // Without MS_PRIVATE|MS_REC, inherited shared mounts cause EINVAL.
             if let Err(e) = nix::sched::unshare(nix::sched::CloneFlags::CLONE_NEWNS) {
-                eprintln!("unshare(CLONE_NEWNS) failed: {e}");
-                std::process::exit(1);
+                let msg = b"unshare(CLONE_NEWNS) failed\n";
+                unsafe { libc::write(2, msg.as_ptr() as *const _, msg.len()); }
+                unsafe { libc::_exit(1); }
             }
             // Make all mounts private — required for pivot_root to work.
             if let Err(e) = nix::mount::mount(
@@ -130,15 +131,16 @@ pub fn fork_and_exec(
                 nix::mount::MsFlags::MS_PRIVATE | nix::mount::MsFlags::MS_REC,
                 None::<&str>,
             ) {
-                eprintln!("mount(MS_PRIVATE) failed: {e}");
-                std::process::exit(1);
+                let msg = b"mount(MS_PRIVATE) failed\n";
+                unsafe { libc::write(2, msg.as_ptr() as *const _, msg.len()); }
+                unsafe { libc::_exit(1); }
             }
 
             // pivot_root into the container rootfs.
-            if let Err(e) = do_pivot_root(&rootfs) {
-                // write(2) is signal-safe, eprintln is not — but we exit immediately.
-                eprintln!("pivot_root failed: {e}");
-                std::process::exit(1);
+            if do_pivot_root(&rootfs).is_err() {
+                let msg = b"pivot_root failed\n";
+                unsafe { libc::write(2, msg.as_ptr() as *const _, msg.len()); }
+                unsafe { libc::_exit(1); }
             }
 
             // Set hostname.
@@ -161,9 +163,10 @@ pub fn fork_and_exec(
             let _ = nix::unistd::chdir(cwd_cstr.as_c_str());
 
             // Replace process with container command (execvp, no shell involved).
-            let err = nix::unistd::execvp(&c_args[0], &c_args);
-            eprintln!("execvp failed: {err:?}");
-            std::process::exit(127);
+            let _ = nix::unistd::execvp(&c_args[0], &c_args);
+            let msg = b"execvp failed\n";
+            unsafe { libc::write(2, msg.as_ptr() as *const _, msg.len()); }
+            unsafe { libc::_exit(127); }
         }
         ForkResult::Parent { child } => {
             // Drop read end (closes it).

@@ -214,28 +214,30 @@ pub fn fork_and_exec_pty(
             unsafe { libc::ioctl(0, libc::TIOCSCTTY, 0) };
 
             // Chroot into container rootfs.
-            if let Err(e) = nix::unistd::chroot(&rootfs) {
-                eprintln!("chroot failed: {e}");
-                std::process::exit(1);
+            if nix::unistd::chroot(&rootfs).is_err() {
+                // Use write(2) + _exit(2) — eprintln/exit are NOT fork-safe.
+                let msg = b"chroot failed\n";
+                unsafe { libc::write(2, msg.as_ptr() as *const _, msg.len()); }
+                unsafe { libc::_exit(1); }
             }
             let _ = nix::unistd::chdir("/");
 
             // Set environment using libc directly — Rust's std::env functions
-            // are NOT async-signal-safe (they hold a global mutex that may be
-            // held by another thread in the parent process after fork).
+            // hold a global mutex that may be locked by a relay thread at fork time.
             unsafe {
                 libc::clearenv();
                 for var in &c_env {
                     libc::putenv(var.as_ptr() as *mut libc::c_char);
                 }
-                // Set TERM if not already in env.
                 let term = c"TERM=xterm-256color";
                 libc::putenv(term.as_ptr() as *mut libc::c_char);
             }
 
-            let err = nix::unistd::execvp(&c_args[0], &c_args);
-            eprintln!("execvp failed: {err:?}");
-            std::process::exit(127);
+            // execvp replaces the process — if it returns, it failed.
+            let _ = nix::unistd::execvp(&c_args[0], &c_args);
+            let msg = b"execvp failed\n";
+            unsafe { libc::write(2, msg.as_ptr() as *const _, msg.len()); }
+            unsafe { libc::_exit(127); }
         }
         ForkResult::Parent { child } => {
             drop(pipe_rd);
