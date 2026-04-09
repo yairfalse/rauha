@@ -627,9 +627,11 @@ impl ContainerService for ContainerServiceImpl {
                 socket_path: Some(path),
                 ..
             } => {
+                tracing::debug!(path = %path, "connecting to exec socket");
                 let stream = tokio::net::UnixStream::connect(&path).await.map_err(|e| {
                     Status::internal(format!("failed to connect to exec socket: {e}"))
                 })?;
+                tracing::debug!("connected to exec socket");
                 let (r, w) = stream.into_split();
                 spawn_exec_relay(r, w, tx, in_stream);
             }
@@ -795,10 +797,15 @@ fn spawn_exec_relay<R, W>(
         use tokio::io::AsyncReadExt;
         let mut reader = reader;
         let mut buf = [0u8; 4096];
+        tracing::debug!("exec relay reader started");
         loop {
             match reader.read(&mut buf).await {
-                Ok(0) => break,
+                Ok(0) => {
+                    tracing::debug!("exec relay: EOF");
+                    break;
+                }
                 Ok(n) => {
+                    tracing::debug!(bytes = n, "exec relay: read data");
                     let resp = pb::container::ExecStreamResponse {
                         message: Some(
                             pb::container::exec_stream_response::Message::StdoutData(

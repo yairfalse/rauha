@@ -40,6 +40,33 @@ pub fn serve_attach_session(
 
     // Spawn a dedicated thread for this attach session.
     std::thread::spawn(move || {
+        // Pre-buffer: read any data that arrives from the PTY before the client
+        // connects. Short-lived commands (like /bin/echo) may finish before the
+        // client connects — their output is in the PTY buffer. On Linux, once
+        // the PTY slave closes and the buffer is drained, read() returns EIO.
+        // We must capture the data before that happens.
+        let mut pre_buf = Vec::new();
+        {
+            // Set the PTY master to non-blocking for pre-buffering.
+            unsafe { libc::fcntl(pty_master_fd, libc::F_SETFL, libc::O_NONBLOCK) };
+            let mut tmp = [0u8; 4096];
+            // Brief wait for the exec child to produce output.
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            // Drain whatever is available.
+            loop {
+                match nix::unistd::read(pty_master_fd, &mut tmp) {
+                    Ok(0) => break,
+                    Ok(n) => pre_buf.extend_from_slice(&tmp[..n]),
+                    Err(_) => break, // EAGAIN or EIO — done.
+                }
+            }
+            // Set back to blocking for the relay loop.
+            unsafe { libc::fcntl(pty_master_fd, libc::F_SETFL, 0) };
+        }
+        if !pre_buf.is_empty() {
+            tracing::debug!(bytes = pre_buf.len(), "pre-buffered PTY output");
+        }
+
         // Accept exactly one connection.
         let stream = match listener.accept() {
             Ok((stream, _)) => stream,
@@ -48,6 +75,14 @@ pub fn serve_attach_session(
                 return;
             }
         };
+
+        // Write pre-buffered data to the client immediately.
+        if !pre_buf.is_empty() {
+            if write_all_fd(stream.as_raw_fd(), &pre_buf).is_err() {
+                tracing::debug!("failed to write pre-buffered data to client");
+                return;
+            }
+        }
 
         stream.set_nonblocking(true).ok();
 
