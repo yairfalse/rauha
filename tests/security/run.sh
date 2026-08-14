@@ -4,6 +4,7 @@ set -euo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 RUNTIME="$ROOT/.sykli/runtime"
+RECEIPT="$ROOT/.sykli/receipt.json"
 
 running_lima() {
     limactl list --format '{{.Name}} {{.Status}}' | awk '$2 == "Running" { print $1 }'
@@ -41,6 +42,7 @@ fingerprint_linux() {
 }
 
 if [ "${1:-}" = "--gate" ]; then
+    [ "$#" -eq 1 ] || { echo "--gate takes no additional arguments" >&2; exit 2; }
     kind=$(sed -n 's/^kind=//p' "$RUNTIME")
     case "$kind" in
         linux)
@@ -57,17 +59,20 @@ if [ "${1:-}" = "--gate" ]; then
             ;;
     esac
 fi
+[ "$#" -eq 0 ] || { echo "usage: tests/security/run.sh" >&2; exit 2; }
 
 mkdir -p "$ROOT/.sykli"
+# ponytail: live host state is not hermetic; use Sykli --no-cache when it exists.
+RUN_ID=$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')
 if [ "$(uname -s)" = Linux ]; then
     {
-        printf 'kind=linux\n'
+        printf 'run_id=%s\nkind=linux\n' "$RUN_ID"
         fingerprint_linux
     } >"$RUNTIME"
 else
     instance=$(select_lima)
     {
-        printf 'kind=lima\ninstance=%s\n' "$instance"
+        printf 'run_id=%s\nkind=lima\ninstance=%s\n' "$RUN_ID" "$instance"
         limactl shell "$instance" -- bash -c "$(declare -f fingerprint_linux); fingerprint_linux"
     } >"$RUNTIME"
 fi
@@ -79,4 +84,9 @@ if ! "$SYKLI_BIN" --version 2>/dev/null | grep -Eq '^sykli 0\.1\.'; then
 fi
 
 cd "$ROOT"
-exec "$SYKLI_BIN" run sykli.json "$@"
+run_status=0
+"$SYKLI_BIN" run sykli.json --json >"$RECEIPT" || run_status=$?
+verify_status=0
+"$SYKLI_BIN" verify "$RECEIPT" --contract sykli.json || verify_status=$?
+[ "$verify_status" -eq 0 ] || exit "$verify_status"
+exit "$run_status"

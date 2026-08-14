@@ -4,6 +4,10 @@ on:
   workflow_call:
   workflow_dispatch:
 
+concurrency:
+  group: ${{ github.repository }}-rauha-privileged
+  cancel-in-progress: false
+
 jobs:
   runtime:
     name: Integration and oracle
@@ -41,5 +45,5 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: rauha-security-receipt
-          path: .sykli/
-          if-no-files-found: warn
+          path: .sykli/receipt.json
+          if-no-files-found: error

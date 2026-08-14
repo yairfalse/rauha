@@ -4,6 +4,7 @@ set -euo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 cd "$ROOT"
+export RAUHA_ADDR='http://[::1]:9876'
 
 [ "$(uname -s)" = Linux ] || { echo "Linux is required" >&2; exit 2; }
 test -r /sys/kernel/btf/vmlinux || { echo "kernel BTF is required" >&2; exit 2; }
@@ -45,16 +46,29 @@ cleanup() {
 }
 trap cleanup EXIT
 
+if "$ROOT/target/debug/rauha" zone list >/dev/null 2>&1; then
+    echo "refusing to test against an endpoint that was already active at $RAUHA_ADDR" >&2
+    exit 2
+fi
+
 sudo env RAUHA_ROOT="$RUN_ROOT" "$ROOT/target/debug/rauhad" >"$DAEMON_LOG" 2>&1 &
 DAEMON_PID=$!
 
+READY=false
 for _ in $(seq 1 30); do
+    if ! sudo kill -0 "$DAEMON_PID" 2>/dev/null; then
+        wait "$DAEMON_PID" 2>/dev/null || true
+        tail -100 "$DAEMON_LOG" >&2
+        echo "rauhad exited before becoming ready" >&2
+        exit 1
+    fi
     if "$ROOT/target/debug/rauha" zone list >/dev/null 2>&1; then
+        READY=true
         break
     fi
     sleep 1
 done
-if ! "$ROOT/target/debug/rauha" zone list >/dev/null 2>&1; then
+if [ "$READY" != true ]; then
     tail -100 "$DAEMON_LOG" >&2
     exit 1
 fi
@@ -62,7 +76,7 @@ fi
 FAILURES=0
 TEST_TIMEOUT=${RAUHA_TEST_TIMEOUT_SECONDS:-120}
 for test_script in tests/integration/*.sh; do
-    if ! sudo env RAUHA_BIN="$ROOT/target/debug/rauha" RAUHA_ROOT="$RUN_ROOT" \
+    if ! sudo env RAUHA_ADDR="$RAUHA_ADDR" RAUHA_BIN="$ROOT/target/debug/rauha" RAUHA_ROOT="$RUN_ROOT" \
         timeout --foreground --kill-after=5s "$TEST_TIMEOUT" bash "$test_script"; then
         echo "FAILED: $test_script" >&2
         FAILURES=$((FAILURES + 1))

@@ -60,6 +60,8 @@ jobs:
       - name: Build eBPF object and offsets
         run: cargo xtask build-ebpf
 
+  # Never execute fork code on a privileged self-hosted runner. A maintainer
+  # must move an external contribution onto a repository branch first.
   privileged:
-    if: github.event_name == 'push' && vars.RAUHA_PRIVILEGED_CI == 'true'
+    if: vars.RAUHA_PRIVILEGED_CI == 'true' && (github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository)
     uses: ./.github/workflows/privileged.yml
