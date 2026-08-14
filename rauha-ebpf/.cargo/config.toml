@@ -1,5 +1,7 @@
 [build]
 target = "bpfel-unknown-none"
+# Keep eBPF artifacts in this crate's own target/ (xtask and docs expect them here).
+target-dir = "target"
 
 [unstable]
 build-std = ["core"]

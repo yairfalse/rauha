@@ -1,3 +1,4 @@
+use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -10,6 +11,7 @@ use rauha_ebpf_common::offsets::{
 };
 
 #[derive(Parser)]
+#[allow(clippy::enum_variant_names)] // Keep the established `build-*` CLI names.
 enum Cli {
     /// Build the eBPF programs for rauha-ebpf.
     BuildEbpf {
@@ -53,6 +55,19 @@ fn project_root() -> PathBuf {
         .to_path_buf()
 }
 
+fn target_dir(root: &Path, configured: Option<&OsStr>, fallback: PathBuf) -> PathBuf {
+    match configured.map(PathBuf::from) {
+        Some(path) if path.is_absolute() => path,
+        Some(path) => root.join(path),
+        None => fallback,
+    }
+}
+
+fn configured_target_dir(root: &Path, fallback: PathBuf) -> PathBuf {
+    let configured = std::env::var_os("CARGO_TARGET_DIR");
+    target_dir(root, configured.as_deref(), fallback)
+}
+
 fn build_ebpf(release: bool) -> Result<()> {
     let root = project_root();
     let ebpf_dir = root.join("rauha-ebpf");
@@ -64,15 +79,17 @@ fn build_ebpf(release: bool) -> Result<()> {
         );
     }
 
+    let ebpf_target = configured_target_dir(&root, ebpf_dir.join("target"));
     let generated_offsets = generate_ebpf_offsets(&root)?;
 
     let mut cmd = Command::new("cargo");
     cmd.current_dir(&ebpf_dir)
         .env_remove("RUSTUP_TOOLCHAIN")
+        .env("CARGO_TARGET_DIR", &ebpf_target)
         .env("RAUHA_EBPF_OFFSETS", &generated_offsets.source_path)
         // Disable UB checks — the alignment panic intrinsics they emit
         // produce .text.unlikely. functions that the BPF verifier rejects.
-        .env("RUSTFLAGS", "-Zub-checks=no")
+        .env("RUSTFLAGS", "-Zub-checks=no -Dwarnings")
         .args([
             "+nightly",
             "build",
@@ -94,8 +111,7 @@ fn build_ebpf(release: bool) -> Result<()> {
     }
 
     let profile = if release { "release" } else { "debug" };
-    let artifact = ebpf_dir
-        .join("target")
+    let artifact = ebpf_target
         .join("bpfel-unknown-none")
         .join(profile)
         .join("rauha-ebpf");
@@ -120,7 +136,7 @@ fn generate_ebpf_offsets(root: &Path) -> Result<GeneratedOffsets> {
 
     let offsets = resolve_kernel_offsets().map_err(anyhow::Error::msg)?;
 
-    let out_dir = root.join("target").join("rauha-ebpf-generated");
+    let out_dir = configured_target_dir(root, root.join("target")).join("rauha-ebpf-generated");
     fs::create_dir_all(&out_dir)
         .with_context(|| format!("failed to create {}", out_dir.display()))?;
     let source_path = out_dir.join("offsets.rs");
@@ -156,17 +172,20 @@ fn write_offsets_sidecar(artifact: &Path, offsets: &[ResolvedOffset]) -> Result<
 
 fn build_guest_agent(release: bool, target: &str) -> Result<()> {
     let root = project_root();
+    let target_dir = configured_target_dir(&root, root.join("target"));
 
     println!("Building rauha-guest-agent for {target}...");
 
     let mut cmd = Command::new("cargo");
-    cmd.current_dir(&root).args([
-        "build",
-        "--package",
-        "rauha-guest-agent",
-        "--target",
-        target,
-    ]);
+    cmd.current_dir(&root)
+        .env("CARGO_TARGET_DIR", &target_dir)
+        .args([
+            "build",
+            "--package",
+            "rauha-guest-agent",
+            "--target",
+            target,
+        ]);
 
     if release {
         cmd.arg("--release");
@@ -180,8 +199,7 @@ fn build_guest_agent(release: bool, target: &str) -> Result<()> {
     }
 
     let profile = if release { "release" } else { "debug" };
-    let artifact = root
-        .join("target")
+    let artifact = target_dir
         .join(target)
         .join(profile)
         .join("rauha-guest-agent");
@@ -195,9 +213,9 @@ fn build_initramfs(release: bool, target: &str) -> Result<()> {
     build_guest_agent(release, target)?;
 
     let root = project_root();
+    let target_dir = configured_target_dir(&root, root.join("target"));
     let profile = if release { "release" } else { "debug" };
-    let agent_binary = root
-        .join("target")
+    let agent_binary = target_dir
         .join(target)
         .join(profile)
         .join("rauha-guest-agent");
@@ -206,7 +224,7 @@ fn build_initramfs(release: bool, target: &str) -> Result<()> {
         bail!("Guest agent binary not found at {}", agent_binary.display());
     }
 
-    let vm_dir = root.join("target").join("vm-assets");
+    let vm_dir = target_dir.join("vm-assets");
     let initramfs_root = vm_dir.join("initramfs");
 
     // Create initramfs directory structure.
@@ -278,4 +296,21 @@ poweroff -f
     println!("Initramfs built: {}", initramfs_path.display());
     println!("Size: {} bytes", std::fs::metadata(&initramfs_path)?.len());
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn relative_target_dir_is_resolved_from_project_root() {
+        assert_eq!(
+            target_dir(
+                Path::new("/repo"),
+                Some(OsStr::new("cache")),
+                PathBuf::from("unused")
+            ),
+            PathBuf::from("/repo/cache")
+        );
+    }
 }

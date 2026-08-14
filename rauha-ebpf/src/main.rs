@@ -55,7 +55,7 @@ static ENFORCEMENT_EVENTS: RingBuf = RingBuf::with_byte_size(1024 * 4096, 0);
 /// Look up the caller's zone from their cgroup_id.
 /// Returns None if the process is not in any zone (global/unzoned).
 #[inline(always)]
-fn lookup_caller_zone(ctx: &LsmContext) -> Option<ZoneInfoKernel> {
+fn lookup_caller_zone(_ctx: &LsmContext) -> Option<ZoneInfoKernel> {
     let cgroup_id = unsafe { aya_ebpf::helpers::bpf_get_current_cgroup_id() };
     unsafe { ZONE_MEMBERSHIP.get(&cgroup_id).copied() }
 }
@@ -162,7 +162,7 @@ fn is_cross_zone_allowed(src_zone: u32, dst_zone: u32) -> bool {
 /// Counters (count_decision) remain the source of truth for totals.
 #[inline(always)]
 fn emit_deny_event(hook: u8, caller_zone: u32, target_zone: u32, context: u64) {
-    let pid = (unsafe { aya_ebpf::helpers::bpf_get_current_pid_tgid() } >> 32) as u32;
+    let pid = (aya_ebpf::helpers::bpf_get_current_pid_tgid() >> 32) as u32;
     let ts = unsafe { aya_ebpf::helpers::bpf_ktime_get_ns() };
 
     let event = EnforcementEvent {
@@ -183,7 +183,7 @@ fn emit_deny_event(hook: u8, caller_zone: u32, target_zone: u32, context: u64) {
 /// Emit an error enforcement event to the ring buffer.
 #[inline(always)]
 fn emit_error_event(hook: u8) {
-    let pid = (unsafe { aya_ebpf::helpers::bpf_get_current_pid_tgid() } >> 32) as u32;
+    let pid = (aya_ebpf::helpers::bpf_get_current_pid_tgid() >> 32) as u32;
     let ts = unsafe { aya_ebpf::helpers::bpf_ktime_get_ns() };
 
     let event = EnforcementEvent {
@@ -273,7 +273,7 @@ unsafe fn maybe_run_self_test() {
 /// `is_error`: true if the hook hit an error path.
 #[inline(always)]
 fn count_decision(prog_idx: u32, allow: bool, is_error: bool) {
-    if let Some(counters) = unsafe { ENFORCEMENT_COUNTERS.get_ptr_mut(prog_idx) } {
+    if let Some(counters) = ENFORCEMENT_COUNTERS.get_ptr_mut(prog_idx) {
         let c = unsafe { &mut *counters };
         if is_error {
             c.error += 1;

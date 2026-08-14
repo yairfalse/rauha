@@ -6,17 +6,55 @@ on:
     branches:
       - main
 
+permissions:
+  checks: write
+  contents: read
+
 jobs:
-  linux-build:
-    name: Linux build
+  quality:
+    name: Workspace quality
     runs-on: arc-arm64
     steps:
       - uses: actions/checkout@v4
 
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
       - name: Install native dependencies
         run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config protobuf-compiler build-essential
 
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Lint workspace
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Test workspace
+        run: cargo test --workspace
+
+      - name: Audit dependencies
+        uses: rustsec/audit-check@v2.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  ebpf:
+    name: eBPF build
+    runs-on: arc-arm64
+    steps:
+      - uses: actions/checkout@v4
+
       - uses: dtolnay/rust-toolchain@stable
 
-      - name: Check Linux daemon and CLI
-        run: cargo check -p rauhad -p rauha-cli -p rauha-common -p rauha-enforcer-api
+      - name: Install eBPF build dependencies
+        run: sudo apt-get update && sudo apt-get install -y build-essential dwarves
+
+      - name: Install nightly Rust
+        run: rustup toolchain install nightly --component rust-src
+
+      - name: Build eBPF object and offsets
+        run: cargo xtask build-ebpf
+
+  privileged:
+    if: github.event_name == 'push' && vars.RAUHA_PRIVILEGED_CI == 'true'
+    uses: ./.github/workflows/privileged.yml
