@@ -109,23 +109,11 @@ pub struct SamplingConfig {
     pub rate_limit_per_second: BTreeMap<String, u64>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub struct DropConfig {
-    #[serde(default = "default_drop_events")]
+    #[serde(default)]
     pub events: Vec<String>,
-}
-
-impl Default for DropConfig {
-    fn default() -> Self {
-        Self {
-            events: default_drop_events(),
-        }
-    }
-}
-
-fn default_drop_events() -> Vec<String> {
-    vec!["shim.__ping__".into()]
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -219,11 +207,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_observability_is_json_auto_low_noise() {
+    fn default_observability_is_json_auto() {
         let config = ObservabilityConfig::default();
         assert_eq!(config.format, LogFormat::Auto);
         assert_eq!(config.environment, "unknown");
-        assert_eq!(config.drop.events, vec!["shim.__ping__"]);
+        assert!(config.drop.events.is_empty());
     }
 
     #[test]

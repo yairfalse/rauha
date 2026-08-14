@@ -333,6 +333,7 @@ impl RuntimeEvent {
     }
 
     fn emit_trace(&self) {
+        let payload = self.machine_json().unwrap_or_default();
         tracing::trace!(
             event.name = %self.event_name,
             event.version = self.event_version,
@@ -355,11 +356,13 @@ impl RuntimeEvent {
             error.code = self.error_code.as_deref().unwrap_or(""),
             error.kind = self.error_kind.as_deref().unwrap_or(""),
             degraded_reason = self.degraded_reason.as_deref().unwrap_or(""),
+            event.payload = payload.as_str(),
             "rauha.evidence"
         );
     }
 
     fn emit_info(&self) {
+        let payload = self.machine_json().unwrap_or_default();
         tracing::info!(
             event.name = %self.event_name,
             event.version = self.event_version,
@@ -382,11 +385,13 @@ impl RuntimeEvent {
             error.code = self.error_code.as_deref().unwrap_or(""),
             error.kind = self.error_kind.as_deref().unwrap_or(""),
             degraded_reason = self.degraded_reason.as_deref().unwrap_or(""),
+            event.payload = payload.as_str(),
             "rauha.evidence"
         );
     }
 
     fn emit_warn(&self) {
+        let payload = self.machine_json().unwrap_or_default();
         tracing::warn!(
             event.name = %self.event_name,
             event.version = self.event_version,
@@ -409,11 +414,13 @@ impl RuntimeEvent {
             error.code = self.error_code.as_deref().unwrap_or(""),
             error.kind = self.error_kind.as_deref().unwrap_or(""),
             degraded_reason = self.degraded_reason.as_deref().unwrap_or(""),
+            event.payload = payload.as_str(),
             "rauha.evidence"
         );
     }
 
     fn emit_error(&self) {
+        let payload = self.machine_json().unwrap_or_default();
         tracing::error!(
             event.name = %self.event_name,
             event.version = self.event_version,
@@ -436,6 +443,7 @@ impl RuntimeEvent {
             error.code = self.error_code.as_deref().unwrap_or(""),
             error.kind = self.error_kind.as_deref().unwrap_or(""),
             degraded_reason = self.degraded_reason.as_deref().unwrap_or(""),
+            event.payload = payload.as_str(),
             "rauha.evidence"
         );
     }
