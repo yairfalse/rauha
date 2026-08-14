@@ -33,12 +33,24 @@ fingerprint_linux() {
     printf 'kernel='
     uname -srvm
     printf 'boot_id='
-    cat /proc/sys/kernel/random/boot_id
+    if [ -r /proc/sys/kernel/random/boot_id ]; then
+        cat /proc/sys/kernel/random/boot_id
+    else
+        printf 'unavailable\n'
+    fi
     printf 'lsm='
-    cat /sys/kernel/security/lsm
+    if [ -r /sys/kernel/security/lsm ]; then
+        cat /sys/kernel/security/lsm
+    else
+        printf 'unavailable'
+    fi
     printf '\n'
     printf 'btf_sha256='
-    sha256sum /sys/kernel/btf/vmlinux | cut -d' ' -f1
+    if [ -r /sys/kernel/btf/vmlinux ] && command -v sha256sum >/dev/null 2>&1; then
+        sha256sum /sys/kernel/btf/vmlinux | cut -d' ' -f1
+    else
+        printf 'unavailable\n'
+    fi
 }
 
 if [ "${1:-}" = "--gate" ]; then
