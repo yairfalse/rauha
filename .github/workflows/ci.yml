@@ -52,8 +52,10 @@ jobs:
       - name: Install nightly Rust
         run: rustup toolchain install nightly --component rust-src
 
+      - uses: cargo-bins/cargo-binstall@v1.21.1
+
       - name: Install bpf-linker
-        run: cargo install bpf-linker
+        run: cargo binstall --no-confirm bpf-linker@0.11.0
 
       - name: Build eBPF object and offsets
         run: cargo xtask build-ebpf
