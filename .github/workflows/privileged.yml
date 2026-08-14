@@ -25,6 +25,9 @@ jobs:
       - name: Install nightly Rust
         run: rustup toolchain install nightly --component rust-src
 
+      - name: Install bpf-linker
+        run: cargo install bpf-linker
+
       - name: Build runtime and eBPF
         run: |
           cargo build --workspace
@@ -53,7 +56,7 @@ jobs:
           target/debug/rauha zone list
 
           for test_script in tests/integration/*.sh; do
-            bash "$test_script"
+            sudo env RAUHA_BIN="$RAUHA_BIN" RAUHA_ROOT="$RAUHA_ROOT" bash "$test_script"
           done
 
           RAUHA_GRPC_ENDPOINT=http://[::1]:9876 cargo test --manifest-path eval/oracle/Cargo.toml
