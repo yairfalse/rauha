@@ -156,16 +156,12 @@ fn generate_rules(zone_name: &str, policy: &ZonePolicy) -> String {
                     "block out quick on ! lo0 from <{table_name}> to any\n"
                 ));
                 for dest in &policy.network.allowed_egress {
-                    rules.push_str(&format!(
-                        "pass out quick from <{table_name}> to {dest}\n"
-                    ));
+                    rules.push_str(&format!("pass out quick from <{table_name}> to {dest}\n"));
                 }
             }
             if !policy.network.allowed_ingress.is_empty() {
                 for source in &policy.network.allowed_ingress {
-                    rules.push_str(&format!(
-                        "pass in quick from {source} to <{table_name}>\n"
-                    ));
+                    rules.push_str(&format!("pass in quick from {source} to <{table_name}>\n"));
                 }
             }
             // Cross-VM allowed_zones: generate pass rules using peer zone's
@@ -173,7 +169,10 @@ fn generate_rules(zone_name: &str, policy: &ZonePolicy) -> String {
             // we reference the peer zone's IP table so pf resolves the address.
             for peer_zone in &policy.network.allowed_zones {
                 // Skip names with characters unsafe for pf table identifiers.
-                if !peer_zone.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+                if !peer_zone
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+                {
                     continue;
                 }
                 let peer_table = format!("zone-{peer_zone}-ips");

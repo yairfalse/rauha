@@ -106,10 +106,12 @@ impl ContentStore {
             return Ok(None);
         }
         let digest_str = std::fs::read_to_string(&ref_path)?;
-        let digest =
-            Digest::parse(digest_str.trim()).ok_or_else(|| {
-                std::io::Error::new(std::io::ErrorKind::InvalidData, "corrupt manifest reference")
-            })?;
+        let digest = Digest::parse(digest_str.trim()).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "corrupt manifest reference",
+            )
+        })?;
         Ok(Some(self.get_blob(&digest)?))
     }
 
@@ -140,7 +142,7 @@ mod tests {
 
     #[test]
     fn digest_parse() {
-        let hex = "a" .repeat(64);
+        let hex = "a".repeat(64);
         let valid = format!("sha256:{hex}");
         assert!(Digest::parse(&valid).is_some());
         assert!(Digest::parse("md5:abc").is_none());
@@ -165,9 +167,13 @@ mod tests {
         let store = ContentStore::new(dir.path()).unwrap();
 
         let manifest = br#"{"schemaVersion": 2}"#;
-        store.put_manifest("docker.io/library/nginx:latest", manifest).unwrap();
+        store
+            .put_manifest("docker.io/library/nginx:latest", manifest)
+            .unwrap();
 
-        let loaded = store.get_manifest("docker.io/library/nginx:latest").unwrap();
+        let loaded = store
+            .get_manifest("docker.io/library/nginx:latest")
+            .unwrap();
         assert_eq!(loaded.unwrap(), manifest);
 
         assert!(store.get_manifest("nonexistent").unwrap().is_none());

@@ -112,12 +112,7 @@ impl DistributionClient {
         ];
 
         let body = self
-            .authenticated_get(
-                &url,
-                &reference.registry,
-                &reference.repository,
-                accept,
-            )
+            .authenticated_get(&url, &reference.registry, &reference.repository, accept)
             .await?;
 
         let canonical = reference.to_string_canonical();
@@ -133,12 +128,11 @@ impl DistributionClient {
         }
 
         // Try parsing as a manifest list / OCI index.
-        let index: OciIndex = serde_json::from_slice(&body).map_err(|e| {
-            RauhaError::ImagePullError {
+        let index: OciIndex =
+            serde_json::from_slice(&body).map_err(|e| RauhaError::ImagePullError {
                 reference: canonical.clone(),
                 message: format!("invalid manifest JSON (not a manifest or index): {e}"),
-            }
-        })?;
+            })?;
 
         // Pick the platform manifest matching current OS/arch.
         let (target_os, target_arch) = current_platform();
@@ -162,9 +156,7 @@ impl DistributionClient {
             })
             .ok_or_else(|| RauhaError::ImagePullError {
                 reference: canonical.clone(),
-                message: format!(
-                    "no manifest for platform {target_os}/{target_arch} in index"
-                ),
+                message: format!("no manifest for platform {target_os}/{target_arch} in index"),
             })?;
 
         // Fetch the platform-specific manifest by digest.
@@ -336,19 +328,21 @@ impl DistributionClient {
                 });
             }
 
-            resp.bytes().await.map(|b| b.to_vec()).map_err(|e| {
-                RauhaError::ImagePullError {
+            resp.bytes()
+                .await
+                .map(|b| b.to_vec())
+                .map_err(|e| RauhaError::ImagePullError {
                     reference: url.to_string(),
                     message: format!("read body failed: {e}"),
-                }
-            })
+                })
         } else if resp.status().is_success() {
-            resp.bytes().await.map(|b| b.to_vec()).map_err(|e| {
-                RauhaError::ImagePullError {
+            resp.bytes()
+                .await
+                .map(|b| b.to_vec())
+                .map_err(|e| RauhaError::ImagePullError {
                     reference: url.to_string(),
                     message: format!("read body failed: {e}"),
-                }
-            })
+                })
         } else {
             Err(RauhaError::ImagePullError {
                 reference: url.to_string(),
@@ -436,11 +430,7 @@ impl DistributionClient {
     }
 
     /// Parse `Www-Authenticate: Bearer realm="...",service="...",scope="..."` and fetch a token.
-    async fn fetch_token(
-        &self,
-        www_authenticate: &str,
-        scope: &str,
-    ) -> Result<String, RauhaError> {
+    async fn fetch_token(&self, www_authenticate: &str, scope: &str) -> Result<String, RauhaError> {
         let realm = extract_param(www_authenticate, "realm").unwrap_or_default();
         let service = extract_param(www_authenticate, "service").unwrap_or_default();
 
@@ -544,10 +534,7 @@ mod tests {
             extract_param(header, "realm"),
             Some("https://auth.docker.io/token")
         );
-        assert_eq!(
-            extract_param(header, "service"),
-            Some("registry.docker.io")
-        );
+        assert_eq!(extract_param(header, "service"), Some("registry.docker.io"));
         assert_eq!(
             extract_param(header, "scope"),
             Some("repository:library/nginx:pull")

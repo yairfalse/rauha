@@ -933,10 +933,10 @@ impl ContainerService for ContainerServiceImpl {
                     let mut writer = write_half;
                     while let Some(Ok(msg)) = in_stream.next().await {
                         match msg.message {
-                            Some(pb::container::attach_request::Message::StdinData(data)) => {
-                                if writer.write_all(&data).await.is_err() {
-                                    break;
-                                }
+                            Some(pb::container::attach_request::Message::StdinData(data))
+                                if writer.write_all(&data).await.is_err() =>
+                            {
+                                break;
                             }
                             Some(pb::container::attach_request::Message::Resize(resize)) => {
                                 resize_target.resize(resize.rows, resize.cols).await;
@@ -1002,10 +1002,10 @@ fn spawn_exec_relay<R, W>(
         let mut in_stream = in_stream;
         while let Some(Ok(msg)) = in_stream.next().await {
             match msg.message {
-                Some(pb::container::exec_stream_request::Message::StdinData(data)) => {
-                    if writer.write_all(&data).await.is_err() {
-                        break;
-                    }
+                Some(pb::container::exec_stream_request::Message::StdinData(data))
+                    if writer.write_all(&data).await.is_err() =>
+                {
+                    break;
                 }
                 Some(pb::container::exec_stream_request::Message::Resize(resize)) => {
                     if let Some(target) = &resize_target {
@@ -1825,6 +1825,7 @@ fn project_enforcement_event(event: &FalseEvent) -> EnforcementEventSummary {
 }
 
 /// Validate the request before touching any zone/container state.
+#[allow(clippy::result_large_err)] // `tonic::Status` is the handler's native error type.
 fn validate_sandbox_request(req: &pb::sandbox::RunSandboxRequest) -> Result<(), Status> {
     if req.image.trim().is_empty() {
         return Err(Status::invalid_argument("image is required"));

@@ -14,9 +14,7 @@ const FALLBACK_NAMESERVERS: &[&str] = &["1.1.1.1", "8.8.8.8"];
 /// Reads the host's /etc/resolv.conf. If all nameservers are localhost
 /// stubs (e.g. systemd-resolved's 127.0.0.53), falls back to public DNS.
 pub fn generate_resolv_conf() -> String {
-    generate_resolv_conf_from(
-        std::fs::read_to_string("/etc/resolv.conf").unwrap_or_default(),
-    )
+    generate_resolv_conf_from(std::fs::read_to_string("/etc/resolv.conf").unwrap_or_default())
 }
 
 /// Testable inner function that operates on the content string directly.

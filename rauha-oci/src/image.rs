@@ -67,12 +67,11 @@ impl ImageService {
     where
         F: FnMut(PullProgress),
     {
-        let reference = ImageReference::parse(reference_str).map_err(|e| {
-            RauhaError::ImagePullError {
+        let reference =
+            ImageReference::parse(reference_str).map_err(|e| RauhaError::ImagePullError {
                 reference: reference_str.into(),
                 message: e,
-            }
-        })?;
+            })?;
 
         on_progress(PullProgress {
             status: "pulling manifest".into(),
@@ -141,7 +140,8 @@ impl ImageService {
                         }
                         let pct = (current * 100 / effective_total) as i64;
                         // Throttle: report every 5% or at 100%.
-                        if pct >= last_reported_pct + 5 || (pct == 100 && last_reported_pct != 100) {
+                        if pct >= last_reported_pct + 5 || (pct == 100 && last_reported_pct != 100)
+                        {
                             last_reported_pct = pct;
                             on_progress(PullProgress {
                                 status: status_prefix.clone(),
@@ -172,26 +172,25 @@ impl ImageService {
     /// Phase 3 simplification: no overlayfs — all layers extracted into a single directory.
     pub fn prepare_rootfs(&self, reference_str: &str, target: &Path) -> Result<(), RauhaError> {
         let canonical = {
-            let reference = ImageReference::parse(reference_str).map_err(|e| {
-                RauhaError::ImagePullError {
+            let reference =
+                ImageReference::parse(reference_str).map_err(|e| RauhaError::ImagePullError {
                     reference: reference_str.into(),
                     message: e,
-                }
-            })?;
+                })?;
             reference.to_string_canonical()
         };
 
         // Load manifest from content store.
-        let manifest_bytes =
-            self.content
-                .get_manifest(&canonical)
-                .map_err(|e| RauhaError::ContentError {
-                    message: format!("failed to read manifest: {e}"),
-                })?
-                .ok_or_else(|| RauhaError::ImagePullError {
-                    reference: reference_str.into(),
-                    message: "image not pulled — run `rauha image pull` first".into(),
-                })?;
+        let manifest_bytes = self
+            .content
+            .get_manifest(&canonical)
+            .map_err(|e| RauhaError::ContentError {
+                message: format!("failed to read manifest: {e}"),
+            })?
+            .ok_or_else(|| RauhaError::ImagePullError {
+                reference: reference_str.into(),
+                message: "image not pulled — run `rauha image pull` first".into(),
+            })?;
 
         let manifest: OciManifest =
             serde_json::from_slice(&manifest_bytes).map_err(|e| RauhaError::ContentError {
@@ -204,10 +203,9 @@ impl ImageService {
 
         // Unpack layers in order.
         for layer in &manifest.layers {
-            let digest =
-                Digest::parse(&layer.digest).ok_or_else(|| RauhaError::RootfsError {
-                    message: format!("invalid layer digest: {}", layer.digest),
-                })?;
+            let digest = Digest::parse(&layer.digest).ok_or_else(|| RauhaError::RootfsError {
+                message: format!("invalid layer digest: {}", layer.digest),
+            })?;
 
             let blob_path = self.content.blob_file_path(&digest);
             tracing::info!(layer = %digest, "unpacking layer");
@@ -236,12 +234,11 @@ impl ImageService {
     /// Thread-safe: a per-image lock prevents concurrent extractions of the
     /// same image from racing.
     pub fn prepare_base_rootfs(&self, reference_str: &str) -> Result<PathBuf, RauhaError> {
-        let reference = ImageReference::parse(reference_str).map_err(|e| {
-            RauhaError::ImagePullError {
+        let reference =
+            ImageReference::parse(reference_str).map_err(|e| RauhaError::ImagePullError {
                 reference: reference_str.into(),
                 message: e,
-            }
-        })?;
+            })?;
 
         let canonical = reference.to_string_canonical();
         let safe_name = canonical.replace(['/', ':'], "_");
@@ -311,36 +308,31 @@ impl ImageService {
     /// rather than merging them all into one directory.
     pub fn layer_digests(&self, reference_str: &str) -> Result<(Vec<String>, PathBuf), RauhaError> {
         let canonical = {
-            let reference = ImageReference::parse(reference_str).map_err(|e| {
-                RauhaError::ImagePullError {
+            let reference =
+                ImageReference::parse(reference_str).map_err(|e| RauhaError::ImagePullError {
                     reference: reference_str.into(),
                     message: e,
-                }
-            })?;
+                })?;
             reference.to_string_canonical()
         };
 
-        let manifest_bytes =
-            self.content
-                .get_manifest(&canonical)
-                .map_err(|e| RauhaError::ContentError {
-                    message: format!("failed to read manifest: {e}"),
-                })?
-                .ok_or_else(|| RauhaError::ImagePullError {
-                    reference: reference_str.into(),
-                    message: "image not pulled — run `rauha image pull` first".into(),
-                })?;
+        let manifest_bytes = self
+            .content
+            .get_manifest(&canonical)
+            .map_err(|e| RauhaError::ContentError {
+                message: format!("failed to read manifest: {e}"),
+            })?
+            .ok_or_else(|| RauhaError::ImagePullError {
+                reference: reference_str.into(),
+                message: "image not pulled — run `rauha image pull` first".into(),
+            })?;
 
         let manifest: OciManifest =
             serde_json::from_slice(&manifest_bytes).map_err(|e| RauhaError::ContentError {
                 message: format!("corrupt manifest: {e}"),
             })?;
 
-        let digests = manifest
-            .layers
-            .iter()
-            .map(|l| l.digest.clone())
-            .collect();
+        let digests = manifest.layers.iter().map(|l| l.digest.clone()).collect();
 
         let content_root = self.root.join("content");
         Ok((digests, content_root))
@@ -348,36 +340,32 @@ impl ImageService {
 
     /// Return the safe name for an image reference (used for directory paths).
     pub fn image_safe_name(&self, reference_str: &str) -> Result<String, RauhaError> {
-        let reference = ImageReference::parse(reference_str).map_err(|e| {
-            RauhaError::ImagePullError {
+        let reference =
+            ImageReference::parse(reference_str).map_err(|e| RauhaError::ImagePullError {
                 reference: reference_str.into(),
                 message: e,
-            }
-        })?;
+            })?;
         Ok(reference.to_string_canonical().replace(['/', ':'], "_"))
     }
 
     /// Get the image config (CMD, ENV, WORKDIR, etc.) from a pulled image.
     pub fn inspect(&self, reference_str: &str) -> Result<OciImageConfig, RauhaError> {
         let canonical = {
-            let reference = ImageReference::parse(reference_str).map_err(|e| {
-                RauhaError::ImagePullError {
+            let reference =
+                ImageReference::parse(reference_str).map_err(|e| RauhaError::ImagePullError {
                     reference: reference_str.into(),
                     message: e,
-                }
-            })?;
+                })?;
             reference.to_string_canonical()
         };
 
-        let manifest_bytes =
-            self.content
-                .get_manifest(&canonical)
-                .map_err(|e| RauhaError::ContentError {
-                    message: format!("failed to read manifest: {e}"),
-                })?
-                .ok_or_else(|| RauhaError::ImageNotFound(
-                    reference_str.into(),
-                ))?;
+        let manifest_bytes = self
+            .content
+            .get_manifest(&canonical)
+            .map_err(|e| RauhaError::ContentError {
+                message: format!("failed to read manifest: {e}"),
+            })?
+            .ok_or_else(|| RauhaError::ImageNotFound(reference_str.into()))?;
 
         let manifest: OciManifest =
             serde_json::from_slice(&manifest_bytes).map_err(|e| RauhaError::ContentError {
@@ -404,24 +392,21 @@ impl ImageService {
     /// Get full image inspection: config, digest, layers, size.
     pub fn inspect_full(&self, reference_str: &str) -> Result<ImageInspection, RauhaError> {
         let canonical = {
-            let reference = ImageReference::parse(reference_str).map_err(|e| {
-                RauhaError::ImagePullError {
+            let reference =
+                ImageReference::parse(reference_str).map_err(|e| RauhaError::ImagePullError {
                     reference: reference_str.into(),
                     message: e,
-                }
-            })?;
+                })?;
             reference.to_string_canonical()
         };
 
-        let manifest_bytes =
-            self.content
-                .get_manifest(&canonical)
-                .map_err(|e| RauhaError::ContentError {
-                    message: format!("failed to read manifest: {e}"),
-                })?
-                .ok_or_else(|| RauhaError::ImageNotFound(
-                    reference_str.into(),
-                ))?;
+        let manifest_bytes = self
+            .content
+            .get_manifest(&canonical)
+            .map_err(|e| RauhaError::ContentError {
+                message: format!("failed to read manifest: {e}"),
+            })?
+            .ok_or_else(|| RauhaError::ImageNotFound(reference_str.into()))?;
 
         let manifest: OciManifest =
             serde_json::from_slice(&manifest_bytes).map_err(|e| RauhaError::ContentError {
@@ -481,8 +466,7 @@ impl ImageService {
                 continue;
             }
 
-            let digest_str =
-                std::fs::read_to_string(&path).unwrap_or_default();
+            let digest_str = std::fs::read_to_string(&path).unwrap_or_default();
             let digest_str = digest_str.trim();
 
             // Recover reference from filename.
@@ -520,12 +504,11 @@ impl ImageService {
     /// Remove an image's manifest reference (blobs are kept for potential sharing).
     pub fn remove_image(&self, reference_str: &str) -> Result<(), RauhaError> {
         let canonical = {
-            let reference = ImageReference::parse(reference_str).map_err(|e| {
-                RauhaError::ImagePullError {
+            let reference =
+                ImageReference::parse(reference_str).map_err(|e| RauhaError::ImagePullError {
                     reference: reference_str.into(),
                     message: e,
-                }
-            })?;
+                })?;
             reference.to_string_canonical()
         };
 
@@ -544,6 +527,66 @@ impl ImageService {
 
         Ok(())
     }
+}
+
+/// Unpack a tar layer into a target directory, handling OCI whiteout files.
+pub fn unpack_layer(
+    archive: &mut tar::Archive<flate2::read::GzDecoder<std::fs::File>>,
+    target: &Path,
+) -> Result<(), RauhaError> {
+    for entry in archive.entries().map_err(|e| RauhaError::RootfsError {
+        message: format!("failed to read tar entries: {e}"),
+    })? {
+        let mut entry = entry.map_err(|e| RauhaError::RootfsError {
+            message: format!("corrupt tar entry: {e}"),
+        })?;
+
+        let path = entry.path().map_err(|e| RauhaError::RootfsError {
+            message: format!("invalid tar entry path: {e}"),
+        })?;
+        let path = path.to_path_buf();
+
+        // Check for OCI whiteout markers.
+        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+            if name == ".wh..wh..opq" {
+                // Opaque whiteout: remove all existing contents of the parent directory.
+                if let Some(parent) = path.parent() {
+                    let full_parent = target.join(parent);
+                    if full_parent.exists() {
+                        let _ = std::fs::remove_dir_all(&full_parent);
+                        let _ = std::fs::create_dir_all(&full_parent);
+                    }
+                }
+                continue;
+            }
+            if let Some(original) = name.strip_prefix(".wh.") {
+                // File whiteout: delete the corresponding file.
+                if let Some(parent) = path.parent() {
+                    let to_delete = target.join(parent).join(original);
+                    if to_delete.is_dir() {
+                        let _ = std::fs::remove_dir_all(&to_delete);
+                    } else {
+                        let _ = std::fs::remove_file(&to_delete);
+                    }
+                }
+                continue;
+            }
+        }
+
+        // Validate path: prevent path traversal.
+        let full_path = target.join(&path);
+        if !full_path.starts_with(target) {
+            continue;
+        }
+
+        entry
+            .unpack_in(target)
+            .map_err(|e| RauhaError::RootfsError {
+                message: format!("failed to unpack {}: {e}", path.display()),
+            })?;
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -576,9 +619,7 @@ pub(crate) mod tests {
     }
 
     /// Set up a content store with a fake manifest and layers.
-    fn setup_content_store_with_image(
-        dir: &std::path::Path,
-    ) -> (Arc<ContentStore>, String) {
+    fn setup_content_store_with_image(dir: &std::path::Path) -> (Arc<ContentStore>, String) {
         let content_dir = dir.join("content");
         let store = Arc::new(ContentStore::new(&content_dir).unwrap());
 
@@ -871,62 +912,4 @@ pub(crate) mod tests {
             "layer2"
         );
     }
-}
-
-/// Unpack a tar layer into a target directory, handling OCI whiteout files.
-pub fn unpack_layer(
-    archive: &mut tar::Archive<flate2::read::GzDecoder<std::fs::File>>,
-    target: &Path,
-) -> Result<(), RauhaError> {
-    for entry in archive.entries().map_err(|e| RauhaError::RootfsError {
-        message: format!("failed to read tar entries: {e}"),
-    })? {
-        let mut entry = entry.map_err(|e| RauhaError::RootfsError {
-            message: format!("corrupt tar entry: {e}"),
-        })?;
-
-        let path = entry.path().map_err(|e| RauhaError::RootfsError {
-            message: format!("invalid tar entry path: {e}"),
-        })?;
-        let path = path.to_path_buf();
-
-        // Check for OCI whiteout markers.
-        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-            if name == ".wh..wh..opq" {
-                // Opaque whiteout: remove all existing contents of the parent directory.
-                if let Some(parent) = path.parent() {
-                    let full_parent = target.join(parent);
-                    if full_parent.exists() {
-                        let _ = std::fs::remove_dir_all(&full_parent);
-                        let _ = std::fs::create_dir_all(&full_parent);
-                    }
-                }
-                continue;
-            }
-            if let Some(original) = name.strip_prefix(".wh.") {
-                // File whiteout: delete the corresponding file.
-                if let Some(parent) = path.parent() {
-                    let to_delete = target.join(parent).join(original);
-                    if to_delete.is_dir() {
-                        let _ = std::fs::remove_dir_all(&to_delete);
-                    } else {
-                        let _ = std::fs::remove_file(&to_delete);
-                    }
-                }
-                continue;
-            }
-        }
-
-        // Validate path: prevent path traversal.
-        let full_path = target.join(&path);
-        if !full_path.starts_with(target) {
-            continue;
-        }
-
-        entry.unpack_in(target).map_err(|e| RauhaError::RootfsError {
-            message: format!("failed to unpack {}: {e}", path.display()),
-        })?;
-    }
-
-    Ok(())
 }

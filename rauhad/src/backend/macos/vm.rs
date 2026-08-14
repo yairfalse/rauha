@@ -134,11 +134,14 @@ impl VmManager {
 
     #[cfg(target_os = "macos")]
     fn boot_vm_inner(&self, zone_name: &str, config: &VmConfig) -> Result<()> {
-        use std::sync::{Arc, Condvar};
         use objc2_foundation::{NSArray, NSString, NSURL};
         use objc2_virtualization::*;
+        use std::sync::{Arc, Condvar};
 
-        eprintln!("[vm] creating boot loader + VM configuration (cpus={}, mem={})", config.cpus, config.memory_bytes);
+        eprintln!(
+            "[vm] creating boot loader + VM configuration (cpus={}, mem={})",
+            config.cpus, config.memory_bytes
+        );
 
         // Capture paths as strings so the closure is UnwindSafe.
         let kernel_path_str = self.kernel_path.to_string_lossy().to_string();
@@ -153,16 +156,14 @@ impl VmManager {
         // configurations instead of returning NSError.
         let vm_config_result = unsafe {
             objc2::exception::catch(move || {
-                let kernel_url =
-                    NSURL::fileURLWithPath(&NSString::from_str(&kernel_path_str));
+                let kernel_url = NSURL::fileURLWithPath(&NSString::from_str(&kernel_path_str));
                 let boot_loader = {
                     let loader = VZLinuxBootLoader::initWithKernelURL(
                         VZLinuxBootLoader::alloc(),
                         &kernel_url,
                     );
-                    let initramfs_url = NSURL::fileURLWithPath(&NSString::from_str(
-                        &initramfs_path_str,
-                    ));
+                    let initramfs_url =
+                        NSURL::fileURLWithPath(&NSString::from_str(&initramfs_path_str));
                     loader.setInitialRamdiskURL(Some(&initramfs_url));
                     loader.setCommandLine(&NSString::from_str("console=hvc0"));
                     loader
@@ -265,10 +266,7 @@ impl VmManager {
         }
 
         // Create a serial dispatch queue for this VM.
-        let queue = dispatch2::DispatchQueue::new(
-            &format!("com.rauha.vm.{zone_name}"),
-            None,
-        );
+        let queue = dispatch2::DispatchQueue::new(&format!("com.rauha.vm.{zone_name}"), None);
 
         // Create the VM bound to our queue.
         eprintln!("[vm] creating VZVirtualMachine on dispatch queue");
@@ -370,11 +368,7 @@ impl VmManager {
     /// Virtualization.framework — VM operations must happen on the queue
     /// the VM was created on).
     #[cfg(target_os = "macos")]
-    pub fn connect_vsock(
-        &self,
-        zone_name: &str,
-        port: u32,
-    ) -> Result<std::os::fd::OwnedFd> {
+    pub fn connect_vsock(&self, zone_name: &str, port: u32) -> Result<std::os::fd::OwnedFd> {
         use std::os::fd::{FromRawFd, OwnedFd};
         use std::sync::{Arc, Condvar};
 
@@ -396,55 +390,50 @@ impl VmManager {
         let cond_clone = Arc::clone(&cond);
 
         // Dispatch the entire vsock connect operation to the VM's queue.
-        queue.exec_async(move || {
-            unsafe {
-                let vm_ref = &*(vm_ptr as *const objc2_virtualization::VZVirtualMachine);
-                let socket_devices = vm_ref.socketDevices();
+        queue.exec_async(move || unsafe {
+            let vm_ref = &*(vm_ptr as *const objc2_virtualization::VZVirtualMachine);
+            let socket_devices = vm_ref.socketDevices();
 
-                if socket_devices.count() == 0 {
-                    let mut guard = result_clone.lock().unwrap();
-                    *guard = Some(Err("VM has no socket devices".into()));
-                    cond_clone.notify_one();
-                    return;
-                }
-
-                let base_device = socket_devices.objectAtIndex(0);
-                let socket_device: &objc2_virtualization::VZVirtioSocketDevice =
-                    &*(&*base_device as *const _ as *const _);
-
-                let rc = Arc::clone(&result_clone);
-                let cc = Arc::clone(&cond_clone);
-
-                socket_device.connectToPort_completionHandler(
-                    port,
-                    &block2::RcBlock::new(
-                        move |conn: *mut objc2_virtualization::VZVirtioSocketConnection,
-                              err: *mut objc2_foundation::NSError| {
-                            let res = if !err.is_null() {
-                                let e = &*err;
-                                Err(format!("vsock connect failed: {e}"))
-                            } else if conn.is_null() {
-                                Err("vsock connect returned null connection".into())
-                            } else {
-                                let connection = &*conn;
-                                let fd = connection.fileDescriptor();
-                                let duped = libc::dup(fd);
-                                if duped < 0 {
-                                    Err(format!(
-                                        "dup failed: {}",
-                                        std::io::Error::last_os_error()
-                                    ))
-                                } else {
-                                    Ok(duped)
-                                }
-                            };
-                            let mut guard = rc.lock().unwrap();
-                            *guard = Some(res);
-                            cc.notify_one();
-                        },
-                    ),
-                );
+            if socket_devices.count() == 0 {
+                let mut guard = result_clone.lock().unwrap();
+                *guard = Some(Err("VM has no socket devices".into()));
+                cond_clone.notify_one();
+                return;
             }
+
+            let base_device = socket_devices.objectAtIndex(0);
+            let socket_device: &objc2_virtualization::VZVirtioSocketDevice =
+                &*(&*base_device as *const _ as *const _);
+
+            let rc = Arc::clone(&result_clone);
+            let cc = Arc::clone(&cond_clone);
+
+            socket_device.connectToPort_completionHandler(
+                port,
+                &block2::RcBlock::new(
+                    move |conn: *mut objc2_virtualization::VZVirtioSocketConnection,
+                          err: *mut objc2_foundation::NSError| {
+                        let res = if !err.is_null() {
+                            let e = &*err;
+                            Err(format!("vsock connect failed: {e}"))
+                        } else if conn.is_null() {
+                            Err("vsock connect returned null connection".into())
+                        } else {
+                            let connection = &*conn;
+                            let fd = connection.fileDescriptor();
+                            let duped = libc::dup(fd);
+                            if duped < 0 {
+                                Err(format!("dup failed: {}", std::io::Error::last_os_error()))
+                            } else {
+                                Ok(duped)
+                            }
+                        };
+                        let mut guard = rc.lock().unwrap();
+                        *guard = Some(res);
+                        cc.notify_one();
+                    },
+                ),
+            );
         });
 
         // Drop the vms lock before waiting — we don't need it anymore.
@@ -472,11 +461,7 @@ impl VmManager {
     }
 
     #[cfg(not(target_os = "macos"))]
-    pub fn connect_vsock(
-        &self,
-        zone_name: &str,
-        _port: u32,
-    ) -> Result<std::os::fd::OwnedFd> {
+    pub fn connect_vsock(&self, zone_name: &str, _port: u32) -> Result<std::os::fd::OwnedFd> {
         Err(RauhaError::BackendError(format!(
             "vsock not available on this platform (zone: {zone_name})"
         )))
@@ -500,8 +485,7 @@ impl VmManager {
             let queue = entry.queue.0.clone();
             queue.exec_async(move || {
                 unsafe {
-                    let vm_ref = &*(vm_ptr
-                        as *const objc2_virtualization::VZVirtualMachine);
+                    let vm_ref = &*(vm_ptr as *const objc2_virtualization::VZVirtualMachine);
                     let vm_ref_safe = std::panic::AssertUnwindSafe(vm_ref);
                     let _ = objc2::exception::catch(move || {
                         if vm_ref_safe.canRequestStop() {
@@ -520,11 +504,9 @@ impl VmManager {
             // Wait for the stop to complete (with timeout).
             let (lock, cvar) = &*done;
             let guard = lock.lock().unwrap();
-            let _ = cvar.wait_timeout_while(
-                guard,
-                std::time::Duration::from_secs(5),
-                |finished| !*finished,
-            );
+            let _ = cvar.wait_timeout_while(guard, std::time::Duration::from_secs(5), |finished| {
+                !*finished
+            });
 
             tracing::info!(zone = zone_name, "VM shut down");
         }

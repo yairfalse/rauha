@@ -4,19 +4,19 @@
 //! key/value pairs. All BPF map access goes through MapManager.
 
 use aya::maps::HashMap as AyaHashMap;
-use aya::Bpf;
+use aya::Ebpf;
 
 use rauha_common::error::{RauhaError, Result};
 use rauha_common::zone::{ZonePolicy, ZoneType};
-use rauha_enforcer_api::ZoneEnforcement;
 use rauha_ebpf_common::*;
+use rauha_enforcer_api::ZoneEnforcement;
 
 pub struct MapManager;
 
 impl MapManager {
     /// Register a cgroup as belonging to a zone.
     pub fn add_zone_member(
-        bpf: &mut Bpf,
+        bpf: &mut Ebpf,
         cgroup_id: u64,
         zone_id: u32,
         zone_type: ZoneType,
@@ -42,10 +42,11 @@ impl MapManager {
                 hint: "check eBPF object was built correctly".into(),
             })?;
 
-        map.insert(cgroup_id, info, 0).map_err(|e| RauhaError::EbpfError {
-            message: format!("failed to insert zone membership: {e}"),
-            hint: "map may be full (check MAX_CGROUPS)".into(),
-        })?;
+        map.insert(cgroup_id, info, 0)
+            .map_err(|e| RauhaError::EbpfError {
+                message: format!("failed to insert zone membership: {e}"),
+                hint: "map may be full (check MAX_CGROUPS)".into(),
+            })?;
 
         tracing::debug!(cgroup_id, zone_id, "added zone member to BPF map");
         Ok(())
@@ -55,7 +56,7 @@ impl MapManager {
     ///
     /// NotFound is acceptable (idempotent cleanup) and logged at debug level.
     /// Other errors propagate.
-    pub fn remove_zone_member(bpf: &mut Bpf, cgroup_id: u64) -> Result<()> {
+    pub fn remove_zone_member(bpf: &mut Ebpf, cgroup_id: u64) -> Result<()> {
         let mut map: AyaHashMap<_, u64, ZoneInfoKernel> =
             AyaHashMap::try_from(bpf.map_mut("ZONE_MEMBERSHIP").ok_or_else(|| {
                 RauhaError::EbpfError {
@@ -79,7 +80,7 @@ impl MapManager {
     }
 
     /// Set the enforcement policy for a zone in the BPF map.
-    pub fn set_zone_policy(bpf: &mut Bpf, zone_id: u32, policy: &ZonePolicy) -> Result<()> {
+    pub fn set_zone_policy(bpf: &mut Ebpf, zone_id: u32, policy: &ZonePolicy) -> Result<()> {
         Self::set_zone_policy_kernel(bpf, zone_id, policy_to_kernel(policy)?)
     }
 
@@ -91,7 +92,7 @@ impl MapManager {
     /// crosses the seam (`ZoneEnforcement`) lands in the same map entry as
     /// policy applied from a full `ZonePolicy`.
     pub fn set_zone_policy_kernel(
-        bpf: &mut Bpf,
+        bpf: &mut Ebpf,
         zone_id: u32,
         kernel_policy: ZonePolicyKernel,
     ) -> Result<()> {
@@ -107,19 +108,24 @@ impl MapManager {
                 hint: "check eBPF object was built correctly".into(),
             })?;
 
-        map.insert(zone_id, kernel_policy, 0).map_err(|e| RauhaError::EbpfError {
-            message: format!("failed to insert zone policy: {e}"),
-            hint: "map may be full (check MAX_ZONES)".into(),
-        })?;
+        map.insert(zone_id, kernel_policy, 0)
+            .map_err(|e| RauhaError::EbpfError {
+                message: format!("failed to insert zone policy: {e}"),
+                hint: "map may be full (check MAX_ZONES)".into(),
+            })?;
 
-        tracing::debug!(zone_id, caps_mask = kernel_policy.caps_mask, "set zone policy in BPF map");
+        tracing::debug!(
+            zone_id,
+            caps_mask = kernel_policy.caps_mask,
+            "set zone policy in BPF map"
+        );
         Ok(())
     }
 
     /// Remove a zone's policy from BPF maps.
     ///
     /// NotFound is acceptable (idempotent cleanup) and logged at debug level.
-    pub fn remove_zone_policy(bpf: &mut Bpf, zone_id: u32) -> Result<()> {
+    pub fn remove_zone_policy(bpf: &mut Ebpf, zone_id: u32) -> Result<()> {
         let mut map: AyaHashMap<_, u32, ZonePolicyKernel> =
             AyaHashMap::try_from(bpf.map_mut("ZONE_POLICY").ok_or_else(|| {
                 RauhaError::EbpfError {
@@ -142,7 +148,7 @@ impl MapManager {
     }
 
     /// Track an inode as belonging to a zone.
-    pub fn set_inode_zone(bpf: &mut Bpf, inode: u64, zone_id: u32) -> Result<()> {
+    pub fn set_inode_zone(bpf: &mut Ebpf, inode: u64, zone_id: u32) -> Result<()> {
         let mut map: AyaHashMap<_, u64, u32> =
             AyaHashMap::try_from(bpf.map_mut("INODE_ZONE_MAP").ok_or_else(|| {
                 RauhaError::EbpfError {
@@ -155,16 +161,17 @@ impl MapManager {
                 hint: "check eBPF object was built correctly".into(),
             })?;
 
-        map.insert(inode, zone_id, 0).map_err(|e| RauhaError::EbpfError {
-            message: format!("failed to insert inode zone mapping: {e}"),
-            hint: "map may be full (check MAX_INODES)".into(),
-        })?;
+        map.insert(inode, zone_id, 0)
+            .map_err(|e| RauhaError::EbpfError {
+                message: format!("failed to insert inode zone mapping: {e}"),
+                hint: "map may be full (check MAX_INODES)".into(),
+            })?;
 
         Ok(())
     }
 
     /// Remove an inode from zone tracking.
-    pub fn remove_inode_zone(bpf: &mut Bpf, inode: u64) -> Result<()> {
+    pub fn remove_inode_zone(bpf: &mut Ebpf, inode: u64) -> Result<()> {
         let mut map: AyaHashMap<_, u64, u32> =
             AyaHashMap::try_from(bpf.map_mut("INODE_ZONE_MAP").ok_or_else(|| {
                 RauhaError::EbpfError {
@@ -195,7 +202,7 @@ impl MapManager {
     /// Returns the list of successfully inserted inodes (not the full input).
     /// Callers should store only this list for cleanup — not the original
     /// input — to avoid removing entries that were never inserted.
-    pub fn insert_inodes(bpf: &mut Bpf, inodes: &[u64], zone_id: u32) -> Result<Vec<u64>> {
+    pub fn insert_inodes(bpf: &mut Ebpf, inodes: &[u64], zone_id: u32) -> Result<Vec<u64>> {
         let mut inserted = Vec::with_capacity(inodes.len());
         for &ino in inodes {
             if let Err(e) = Self::set_inode_zone(bpf, ino, zone_id) {
@@ -204,12 +211,17 @@ impl MapManager {
             }
             inserted.push(ino);
         }
-        tracing::debug!(zone_id, count = inserted.len(), total = inodes.len(), "inserted inodes into BPF map");
+        tracing::debug!(
+            zone_id,
+            count = inserted.len(),
+            total = inodes.len(),
+            "inserted inodes into BPF map"
+        );
         Ok(inserted)
     }
 
     /// Remove a batch of inodes from the INODE_ZONE_MAP.
-    pub fn remove_inodes(bpf: &mut Bpf, inodes: &[u64]) -> Result<u32> {
+    pub fn remove_inodes(bpf: &mut Ebpf, inodes: &[u64]) -> Result<u32> {
         let mut count = 0u32;
         for &ino in inodes {
             if let Err(e) = Self::remove_inode_zone(bpf, ino) {
@@ -223,7 +235,7 @@ impl MapManager {
     }
 
     /// Allow cross-zone communication between two zones.
-    pub fn allow_zone_comm(bpf: &mut Bpf, src_zone: u32, dst_zone: u32) -> Result<()> {
+    pub fn allow_zone_comm(bpf: &mut Ebpf, src_zone: u32, dst_zone: u32) -> Result<()> {
         let key = ZoneCommKey { src_zone, dst_zone };
 
         let mut map: AyaHashMap<_, ZoneCommKey, u8> =
@@ -250,7 +262,7 @@ impl MapManager {
     /// Deny cross-zone communication between two zones.
     ///
     /// NotFound is acceptable (pair may not have been allowed) and logged at debug.
-    pub fn deny_zone_comm(bpf: &mut Bpf, src_zone: u32, dst_zone: u32) -> Result<()> {
+    pub fn deny_zone_comm(bpf: &mut Ebpf, src_zone: u32, dst_zone: u32) -> Result<()> {
         let key = ZoneCommKey { src_zone, dst_zone };
 
         let mut map: AyaHashMap<_, ZoneCommKey, u8> =
@@ -276,7 +288,7 @@ impl MapManager {
 
     /// Atomically update a zone's policy (hot reload).
     /// BPF HashMap::insert is atomic — the kernel sees either the old or new value, never partial.
-    pub fn hot_reload_policy(bpf: &mut Bpf, zone_id: u32, policy: &ZonePolicy) -> Result<()> {
+    pub fn hot_reload_policy(bpf: &mut Ebpf, zone_id: u32, policy: &ZonePolicy) -> Result<()> {
         Self::set_zone_policy(bpf, zone_id, policy)?;
         tracing::info!(zone_id, "hot-reloaded zone policy in BPF map");
         Ok(())
@@ -447,8 +459,11 @@ mod tests {
 
     #[test]
     fn policy_to_kernel_caps_mask_correct() {
-        let k = policy_to_kernel(&default_policy_with_caps(vec!["CAP_NET_ADMIN", "CAP_SYS_ADMIN"]))
-            .unwrap();
+        let k = policy_to_kernel(&default_policy_with_caps(vec![
+            "CAP_NET_ADMIN",
+            "CAP_SYS_ADMIN",
+        ]))
+        .unwrap();
         // CAP_NET_ADMIN = bit 12, CAP_SYS_ADMIN = bit 21
         assert_eq!(k.caps_mask, (1 << 12) | (1 << 21));
     }

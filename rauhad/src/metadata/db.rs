@@ -1,7 +1,7 @@
-use redb::{Database, ReadableTable, TableDefinition};
 use rauha_common::container::Container;
 use rauha_common::error::{RauhaError, Result};
 use rauha_common::zone::Zone;
+use redb::{Database, ReadableTable, TableDefinition};
 use std::path::Path;
 use std::sync::Arc;
 use uuid::Uuid;
@@ -72,19 +72,17 @@ impl MetadataStore {
             .open_table(ZONES_TABLE)
             .map_err(|e| RauhaError::MetadataError(e.to_string()))?;
         match table.get(name) {
-            Ok(Some(value)) => {
-                match postcard::from_bytes::<Zone>(value.value()) {
-                    Ok(zone) => Ok(Some(zone)),
-                    Err(e) => {
-                        tracing::warn!(
-                            zone = name,
-                            error = %e,
-                            "zone metadata is incompatible (schema changed?) — treating as missing"
-                        );
-                        Ok(None)
-                    }
+            Ok(Some(value)) => match postcard::from_bytes::<Zone>(value.value()) {
+                Ok(zone) => Ok(Some(zone)),
+                Err(e) => {
+                    tracing::warn!(
+                        zone = name,
+                        error = %e,
+                        "zone metadata is incompatible (schema changed?) — treating as missing"
+                    );
+                    Ok(None)
                 }
-            }
+            },
             Ok(None) => Ok(None),
             Err(e) => Err(RauhaError::MetadataError(e.to_string())),
         }
@@ -118,7 +116,10 @@ impl MetadataStore {
             .open_table(ZONES_TABLE)
             .map_err(|e| RauhaError::MetadataError(e.to_string()))?;
         let mut zones = Vec::new();
-        for entry in table.iter().map_err(|e| RauhaError::MetadataError(e.to_string()))? {
+        for entry in table
+            .iter()
+            .map_err(|e| RauhaError::MetadataError(e.to_string()))?
+        {
             let (key, value) = entry.map_err(|e| RauhaError::MetadataError(e.to_string()))?;
             match postcard::from_bytes::<Zone>(value.value()) {
                 Ok(zone) => zones.push(zone),
@@ -210,7 +211,10 @@ impl MetadataStore {
             .open_table(CONTAINERS_TABLE)
             .map_err(|e| RauhaError::MetadataError(e.to_string()))?;
         let mut containers = Vec::new();
-        for entry in table.iter().map_err(|e| RauhaError::MetadataError(e.to_string()))? {
+        for entry in table
+            .iter()
+            .map_err(|e| RauhaError::MetadataError(e.to_string()))?
+        {
             let (_, value) = entry.map_err(|e| RauhaError::MetadataError(e.to_string()))?;
             let container: Container = postcard::from_bytes(value.value())
                 .map_err(|e| RauhaError::MetadataError(e.to_string()))?;

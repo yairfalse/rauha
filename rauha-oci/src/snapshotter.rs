@@ -42,7 +42,11 @@ impl OverlayfsSnapshotter {
         layer_digests: &[String],
         content_root: &Path,
     ) -> Result<Vec<PathBuf>> {
-        let layers_dir = self.root.join("images").join(image_safe_name).join("layers");
+        let layers_dir = self
+            .root
+            .join("images")
+            .join(image_safe_name)
+            .join("layers");
         std::fs::create_dir_all(&layers_dir).map_err(|e| RauhaError::RootfsError {
             message: format!("failed to create layers dir: {e}"),
         })?;
@@ -85,10 +89,9 @@ impl OverlayfsSnapshotter {
 
             tracing::info!(layer = i, digest = %digest, "extracting layer");
 
-            let file =
-                std::fs::File::open(&blob_path).map_err(|e| RauhaError::RootfsError {
-                    message: format!("failed to open layer blob {digest}: {e}"),
-                })?;
+            let file = std::fs::File::open(&blob_path).map_err(|e| RauhaError::RootfsError {
+                message: format!("failed to open layer blob {digest}: {e}"),
+            })?;
 
             let decoder = flate2::read::GzDecoder::new(file);
             let mut archive = tar::Archive::new(decoder);
@@ -253,10 +256,9 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
         let src_path = entry.path();
         let dst_path = dst.join(entry.file_name());
 
-        let meta =
-            std::fs::symlink_metadata(&src_path).map_err(|e| RauhaError::RootfsError {
-                message: format!("failed to stat {}: {e}", src_path.display()),
-            })?;
+        let meta = std::fs::symlink_metadata(&src_path).map_err(|e| RauhaError::RootfsError {
+            message: format!("failed to stat {}: {e}", src_path.display()),
+        })?;
 
         if meta.is_symlink() {
             let link_target =
@@ -364,8 +366,7 @@ mod tests {
         let content_dir = dir.path().join("content");
         let store = crate::content::ContentStore::new(&content_dir).unwrap();
 
-        let layer_data =
-            crate::image::tests::make_tar_gz(&[("file.txt", b"content")]);
+        let layer_data = crate::image::tests::make_tar_gz(&[("file.txt", b"content")]);
         let digest = store.put_blob(&layer_data).unwrap();
 
         let snap = OverlayfsSnapshotter::new(dir.path());

@@ -607,7 +607,10 @@ pub mod conformance {
             .register_host_path(&zone, "/zones/zone-7/rootfs", true)
             .await
             .expect("register host path");
-        backend.stats(&zone).await.expect("stats for registered zone");
+        backend
+            .stats(&zone)
+            .await
+            .expect("stats for registered zone");
 
         let report = backend
             .verify(&zone, &EnforcementPolicy::default())
@@ -718,10 +721,7 @@ mod tests {
     #[tokio::test]
     async fn noop_remove_zone_blocks_on_members_without_drain() {
         let (enforcer, zone) = loaded_noop_with_zone("z").await;
-        enforcer
-            .attach_container(&zone, "c1", 1)
-            .await
-            .unwrap();
+        enforcer.attach_container(&zone, "c1", 1).await.unwrap();
 
         // Members present and drain=false -> refused.
         assert!(enforcer.remove_zone("z", false).await.is_err());
@@ -758,7 +758,10 @@ mod tests {
         assert!(policy.zone.allow_ptrace);
         assert_eq!(policy.zone.kind, ZoneKind::Privileged);
         // Default policy keeps the restrictive zone baseline.
-        assert_eq!(EnforcementPolicy::default().zone, ZoneEnforcement::default());
+        assert_eq!(
+            EnforcementPolicy::default().zone,
+            ZoneEnforcement::default()
+        );
     }
 
     #[tokio::test]

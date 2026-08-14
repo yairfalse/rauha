@@ -194,7 +194,10 @@ fn write_cgroup_file(cgroup_path: &Path, filename: &str, value: &str) -> Result<
     let file_path = cgroup_path.join(filename);
     fs::write(&file_path, value).map_err(|e| RauhaError::CgroupError {
         message: format!("failed to write {} to {}: {e}", value, file_path.display()),
-        hint: format!("check that {} controller is enabled in the parent cgroup", filename.split('.').next().unwrap_or("unknown")),
+        hint: format!(
+            "check that {} controller is enabled in the parent cgroup",
+            filename.split('.').next().unwrap_or("unknown")
+        ),
     })?;
     Ok(())
 }

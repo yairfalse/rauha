@@ -24,9 +24,7 @@ pub enum ZoneAction {
     /// List all zones
     List,
     /// Show detailed zone information
-    Inspect {
-        name: String,
-    },
+    Inspect { name: String },
     /// Delete a zone
     Delete {
         name: String,
@@ -34,9 +32,7 @@ pub enum ZoneAction {
         force: bool,
     },
     /// Verify zone isolation integrity
-    Verify {
-        name: String,
-    },
+    Verify { name: String },
 }
 
 pub async fn handle(action: ZoneAction, out: OutputMode) -> anyhow::Result<()> {
@@ -97,8 +93,8 @@ pub async fn handle(action: ZoneAction, out: OutputMode) -> anyhow::Result<()> {
                     println!("No zones found.");
                 } else {
                     println!(
-                        "{:<20} {:<12} {:<12} {:<10} {}",
-                        "NAME", "TYPE", "STATE", "CONTAINERS", "CREATED"
+                        "{:<20} {:<12} {:<12} {:<10} CREATED",
+                        "NAME", "TYPE", "STATE", "CONTAINERS"
                     );
                     for z in &resp.zones {
                         println!(
@@ -116,9 +112,9 @@ pub async fn handle(action: ZoneAction, out: OutputMode) -> anyhow::Result<()> {
                 .await?
                 .into_inner();
 
-            let z = resp.zone.ok_or_else(|| {
-                anyhow::anyhow!("zone not found: {}", name)
-            })?;
+            let z = resp
+                .zone
+                .ok_or_else(|| anyhow::anyhow!("zone not found: {}", name))?;
 
             {
                 let policy_resp = client

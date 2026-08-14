@@ -12,20 +12,22 @@
 
 mod ebpf;
 mod events;
-mod mapper;
 mod policy;
 mod watcher;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
-#[command(name = "rauha-enforce", about = "Map existing workloads to Rauha zones")]
+#[command(
+    name = "rauha-enforce",
+    about = "Map existing workloads to Rauha zones"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
@@ -58,9 +60,7 @@ enum Commands {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::from_default_env().add_directive("rauha_enforce=info".parse()?),
-        )
+        .with_env_filter(EnvFilter::from_default_env().add_directive("rauha_enforce=info".parse()?))
         .init();
 
     let cli = Cli::parse();
@@ -106,10 +106,16 @@ async fn cmd_run(
             .entry(assignment.zone_name.clone())
             .or_insert_with(|| zone_counter.fetch_add(1, Ordering::SeqCst));
 
-        mgr.add_zone_member(assignment.cgroup_id, zone_id, rauha_common::zone::ZoneType::NonGlobal)?;
+        mgr.add_zone_member(
+            assignment.cgroup_id,
+            zone_id,
+            rauha_common::zone::ZoneType::NonGlobal,
+        )?;
 
         // Only write policy once per zone, not per container.
-        if !zone_id_for_name.contains_key(&assignment.zone_name) || zone_id_for_name[&assignment.zone_name] == zone_id {
+        if !zone_id_for_name.contains_key(&assignment.zone_name)
+            || zone_id_for_name[&assignment.zone_name] == zone_id
+        {
             if let Some(policy) = policies.get(&assignment.zone_name) {
                 mgr.set_zone_policy(zone_id, policy)?;
             }
@@ -213,10 +219,8 @@ fn print_status_summary(
     mgr: &ebpf::EnforceEbpf,
 ) {
     let enforced = assignments.len();
-    let zone_names: std::collections::HashSet<&str> = assignments
-        .iter()
-        .map(|a| a.zone_name.as_str())
-        .collect();
+    let zone_names: std::collections::HashSet<&str> =
+        assignments.iter().map(|a| a.zone_name.as_str()).collect();
 
     tracing::info!(
         programs = "7/7",

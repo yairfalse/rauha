@@ -1,7 +1,7 @@
 //! Rauha gRPC client wrapper.
 //!
-//! Thin wrapper around the generated gRPC clients for zone, container, and
-//! image services. Connects to rauhad at the configured endpoint.
+//! Thin wrapper around the generated gRPC clients for zone and container
+//! services. Connects to rauhad at the configured endpoint.
 
 use anyhow::{Context, Result};
 use tonic::transport::Channel;
@@ -13,13 +13,9 @@ pub mod pb {
     pub mod container {
         tonic::include_proto!("rauha.container.v1");
     }
-    pub mod image {
-        tonic::include_proto!("rauha.image.v1");
-    }
 }
 
 use pb::container::container_service_client::ContainerServiceClient;
-use pb::image::image_service_client::ImageServiceClient;
 use pb::zone::zone_service_client::ZoneServiceClient;
 
 /// Client handle to rauhad's gRPC API.
@@ -27,7 +23,6 @@ use pb::zone::zone_service_client::ZoneServiceClient;
 pub struct RauhaClient {
     pub zones: ZoneServiceClient<Channel>,
     pub containers: ContainerServiceClient<Channel>,
-    pub images: ImageServiceClient<Channel>,
 }
 
 impl RauhaClient {
@@ -40,14 +35,12 @@ impl RauhaClient {
 
         Ok(Self {
             zones: ZoneServiceClient::new(channel.clone()),
-            containers: ContainerServiceClient::new(channel.clone()),
-            images: ImageServiceClient::new(channel),
+            containers: ContainerServiceClient::new(channel),
         })
     }
 
     /// Default endpoint from env or fallback.
     pub fn endpoint() -> String {
-        std::env::var("RAUHA_ADDR")
-            .unwrap_or_else(|_| "http://[::1]:9876".to_string())
+        std::env::var("RAUHA_ADDR").unwrap_or_else(|_| "http://[::1]:9876".to_string())
     }
 }

@@ -58,11 +58,7 @@ pub async fn handle_exec(args: ExecArgs) -> anyhow::Result<()> {
 
     // If TTY mode, set terminal to raw mode.
     #[cfg(unix)]
-    let _raw_guard = if use_tty {
-        set_raw_mode()
-    } else {
-        None
-    };
+    let _raw_guard = if use_tty { set_raw_mode() } else { None };
 
     // Spawn task to read stdin and send to server.
     let tx_clone = tx.clone();

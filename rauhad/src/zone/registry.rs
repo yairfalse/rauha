@@ -916,10 +916,10 @@ impl ZoneRegistry {
                 .await
                 .map_err(|e| RauhaError::BackendError(format!("shim task panicked: {e}")))?
         } else {
-            return Err(RauhaError::ShimError {
+            Err(RauhaError::ShimError {
                 zone: zone_name.into(),
                 message: format!("shim socket not found at {socket_path}"),
-            });
+            })
         }
     }
 
@@ -980,7 +980,7 @@ impl tokio::io::AsyncRead for VsockAsyncStream {
 
             match guard.try_io(|inner| {
                 use std::io::Read;
-                (&*inner.get_ref()).read(buf.initialize_unfilled())
+                inner.get_ref().read(buf.initialize_unfilled())
             }) {
                 Ok(Ok(n)) => {
                     buf.advance(n);
@@ -1008,7 +1008,7 @@ impl tokio::io::AsyncWrite for VsockAsyncStream {
 
             match guard.try_io(|inner| {
                 use std::io::Write;
-                (&*inner.get_ref()).write(buf)
+                inner.get_ref().write(buf)
             }) {
                 Ok(result) => return std::task::Poll::Ready(result),
                 Err(_would_block) => continue,
