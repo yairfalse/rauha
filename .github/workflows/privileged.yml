@@ -11,7 +11,7 @@ concurrency:
 jobs:
   runtime:
     name: Integration and oracle
-    runs-on: [self-hosted, linux, rauha-bpf]
+    runs-on: arc-arm64
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
