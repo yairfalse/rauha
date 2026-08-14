@@ -1,2 +1,6 @@
 target/
 *.redb
+.sykli/
+.teko/
+.toimija/current.*
+.toimija/sessions/

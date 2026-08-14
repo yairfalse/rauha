@@ -9,7 +9,7 @@ IMAGE="${TEST_IMAGE:-alpine:latest}"
 
 cleanup() {
     echo "Cleaning up..."
-    $RAUHA zone delete --name "$ZONE_NAME" --force 2>/dev/null || true
+    $RAUHA zone delete "$ZONE_NAME" --force 2>/dev/null || true
 }
 trap cleanup EXIT
 
@@ -78,7 +78,7 @@ echo "10. Deleting container..."
 $RAUHA delete "$CONTAINER_ID" --force || echo "   (may already be deleted)"
 
 echo "11. Deleting zone..."
-$RAUHA zone delete --name "$ZONE_NAME" --force
+$RAUHA zone delete "$ZONE_NAME" --force
 
 echo "12. Verifying zone removed..."
 if $RAUHA zone list 2>/dev/null | grep -q "$ZONE_NAME"; then

@@ -22,14 +22,14 @@ RAUHA_ROOT="${RAUHA_ROOT:-/var/lib/rauha}"
 BLOBS_DIR="${RAUHA_ROOT}/content/blobs/sha256"
 MANIFESTS_DIR="${RAUHA_ROOT}/content/manifests"
 
-blob_count=$(ls "$BLOBS_DIR" 2>/dev/null | wc -l)
+blob_count=$(find "$BLOBS_DIR" -maxdepth 1 -type f -print | wc -l)
 if [ "$blob_count" -lt 2 ]; then
     echo "FAIL: expected at least 2 blobs (config + layer), found $blob_count"
     exit 1
 fi
 echo "   blobs: $blob_count"
 
-manifest_count=$(ls "$MANIFESTS_DIR"/*.json 2>/dev/null | wc -l)
+manifest_count=$(find "$MANIFESTS_DIR" -maxdepth 1 -type f -name '*.json' -print | wc -l)
 if [ "$manifest_count" -lt 1 ]; then
     echo "FAIL: expected at least 1 manifest reference, found $manifest_count"
     exit 1
@@ -41,7 +41,7 @@ $RAUHA image remove "$IMAGE"
 
 echo "6. Verifying removal..."
 # Manifest ref should be gone, blobs remain (content-addressable dedup).
-manifest_count_after=$(ls "$MANIFESTS_DIR"/*.json 2>/dev/null | wc -l)
+manifest_count_after=$(find "$MANIFESTS_DIR" -maxdepth 1 -type f -name '*.json' -print | wc -l)
 if [ "$manifest_count_after" -ge "$manifest_count" ]; then
     echo "FAIL: manifest ref not removed"
     exit 1

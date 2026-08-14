@@ -9,7 +9,7 @@ IMAGE="${TEST_IMAGE:-alpine:latest}"
 
 cleanup() {
     echo "Cleaning up..."
-    $RAUHA zone delete --name "$ZONE_NAME" --force 2>/dev/null || true
+    $RAUHA zone delete "$ZONE_NAME" --force 2>/dev/null || true
 }
 trap cleanup EXIT
 
@@ -69,7 +69,7 @@ echo "9. Stopping container..."
 $RAUHA stop "$CONTAINER_ID" || true
 
 echo "10. Deleting zone..."
-$RAUHA zone delete --name "$ZONE_NAME" --force
+$RAUHA zone delete "$ZONE_NAME" --force
 
 echo "11. Verifying cgroup removed..."
 if [ -d "$CGROUP_DIR" ]; then

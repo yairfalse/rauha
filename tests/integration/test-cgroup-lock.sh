@@ -17,15 +17,20 @@ FIFO="/tmp/rauha-test-cglock-$$"
 RESULT_FILE="/tmp/rauha-test-cglock-result-$$"
 ERR_FILE="/tmp/rauha-test-cglock-error-$$"
 HELPER_PID=""
+CONTAINER_ID=""
 
 cleanup() {
     if [ -n "${HELPER_PID:-}" ]; then
         kill "$HELPER_PID" 2>/dev/null || true
         wait "$HELPER_PID" 2>/dev/null || true
     fi
+    if [ -n "${CONTAINER_ID:-}" ]; then
+        $RAUHA stop "$CONTAINER_ID" 2>/dev/null || true
+        $RAUHA delete "$CONTAINER_ID" --force 2>/dev/null || true
+    fi
     rm -f "$FIFO" "$RESULT_FILE" "$ERR_FILE"
-    $RAUHA zone delete --name "$ZONE_A" --force 2>/dev/null || true
-    $RAUHA zone delete --name "$ZONE_B" --force 2>/dev/null || true
+    $RAUHA zone delete "$ZONE_A" --force 2>/dev/null || true
+    $RAUHA zone delete "$ZONE_B" --force 2>/dev/null || true
 }
 trap cleanup EXIT
 
@@ -143,5 +148,7 @@ echo "  PASS: cross-zone cgroup move correctly denied"
 
 # Cleanup the container.
 $RAUHA stop "$CONTAINER_ID" 2>/dev/null || true
+$RAUHA delete "$CONTAINER_ID" --force 2>/dev/null || true
+CONTAINER_ID=""
 
 echo "=== All cgroup_lock tests passed ==="

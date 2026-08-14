@@ -13,7 +13,7 @@ NAMED_ZONE="test-sandbox-$$"
 
 cleanup() {
     echo "Cleaning up..."
-    $RAUHA zone delete --name "$NAMED_ZONE" --force 2>/dev/null || true
+    $RAUHA zone delete "$NAMED_ZONE" --force 2>/dev/null || true
 }
 trap cleanup EXIT
 

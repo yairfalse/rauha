@@ -1,0 +1,95 @@
+#!/usr/bin/env bash
+# Prove that a strict workload cannot alter or act as the Linux host.
+set -euo pipefail
+
+RAUHA=${RAUHA_BIN:-cargo run --bin rauha --}
+ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+ZONE="test-host-boundaries-$$"
+NAME="boundary-$$"
+IMAGE=${TEST_IMAGE:-alpine:latest}
+HOSTNAME_BEFORE=$(hostname)
+CONTAINER_ID=""
+SENTINEL_PID=""
+FAILURES=0
+
+fail() {
+    echo "FAIL: $*" >&2
+    FAILURES=$((FAILURES + 1))
+}
+
+cleanup() {
+    if [ -n "$SENTINEL_PID" ]; then
+        kill "$SENTINEL_PID" 2>/dev/null || true
+        wait "$SENTINEL_PID" 2>/dev/null || true
+    fi
+    if [ -n "$CONTAINER_ID" ]; then
+        $RAUHA stop "$CONTAINER_ID" 2>/dev/null || true
+        $RAUHA delete "$CONTAINER_ID" --force 2>/dev/null || true
+    fi
+    $RAUHA zone delete "$ZONE" --force 2>/dev/null || true
+    if [ "$(hostname)" != "$HOSTNAME_BEFORE" ]; then
+        hostname "$HOSTNAME_BEFORE"
+    fi
+}
+trap cleanup EXIT
+
+echo "=== Test: strict host boundaries ==="
+$RAUHA image pull "$IMAGE" >/dev/null
+$RAUHA zone create --name "$ZONE" --policy "$ROOT/policies/strict.toml"
+CONTAINER_ID=$($RAUHA run --zone "$ZONE" --name "$NAME" "$IMAGE" /bin/sleep 120)
+
+PID=""
+for _ in $(seq 1 30); do
+    PID=$($RAUHA ps --zone "$ZONE" | awk -v id="$CONTAINER_ID" '$1 == id { print $5 }')
+    [ -n "$PID" ] && [ -r "/proc/$PID/status" ] && break
+    sleep 1
+done
+if [ -z "$PID" ] || [ ! -r "/proc/$PID/status" ]; then
+    echo "FAIL: could not resolve workload PID" >&2
+    exit 1
+fi
+
+if [ "$(hostname)" != "$HOSTNAME_BEFORE" ]; then
+    fail "workload changed host hostname from $HOSTNAME_BEFORE to $(hostname)"
+    hostname "$HOSTNAME_BEFORE"
+else
+    echo "PASS: host hostname unchanged"
+fi
+
+HOST_NET=$(stat -Lc '%d:%i' /proc/self/ns/net)
+ZONE_NET=$(stat -Lc '%d:%i' "/var/run/netns/rauha-$ZONE")
+WORKLOAD_NET=$(stat -Lc '%d:%i' "/proc/$PID/ns/net")
+[ "$WORKLOAD_NET" = "$ZONE_NET" ] || fail "workload netns $WORKLOAD_NET does not match zone $ZONE_NET"
+[ "$WORKLOAD_NET" != "$HOST_NET" ] || fail "workload remains in host netns"
+
+HOST_UTS=$(stat -Lc '%d:%i' /proc/self/ns/uts)
+WORKLOAD_UTS=$(stat -Lc '%d:%i' "/proc/$PID/ns/uts")
+[ "$WORKLOAD_UTS" != "$HOST_UTS" ] || fail "workload remains in host UTS namespace"
+
+HOST_PIDNS=$(stat -Lc '%d:%i' /proc/self/ns/pid)
+WORKLOAD_PIDNS=$(stat -Lc '%d:%i' "/proc/$PID/ns/pid")
+[ "$WORKLOAD_PIDNS" != "$HOST_PIDNS" ] || fail "workload remains in host PID namespace"
+
+CAPEFF=$(awk '/^CapEff:/ { print $2 }' "/proc/$PID/status")
+NO_NEW_PRIVS=$(awk '/^NoNewPrivs:/ { print $2 }' "/proc/$PID/status")
+SECCOMP=$(awk '/^Seccomp:/ { print $2 }' "/proc/$PID/status")
+[ "$CAPEFF" = 0000000000000000 ] || fail "strict policy has effective capabilities $CAPEFF"
+[ "$NO_NEW_PRIVS" = 1 ] || fail "NoNewPrivs is $NO_NEW_PRIVS, expected 1"
+[ "$SECCOMP" = 2 ] || fail "Seccomp is $SECCOMP, expected filter mode (2)"
+
+sleep 120 &
+SENTINEL_PID=$!
+$RAUHA run --zone "$ZONE" --name "signal-$NAME" "$IMAGE" /bin/kill -TERM "$SENTINEL_PID" >/dev/null
+sleep 1
+if kill -0 "$SENTINEL_PID" 2>/dev/null; then
+    echo "PASS: workload could not signal unzoned host sentinel"
+else
+    fail "workload signaled unzoned host process $SENTINEL_PID"
+    SENTINEL_PID=""
+fi
+
+if [ "$FAILURES" -ne 0 ]; then
+    echo "=== FAIL: $FAILURES strict host boundary violation(s) ===" >&2
+    exit 1
+fi
+echo "=== PASS: strict host boundaries ==="

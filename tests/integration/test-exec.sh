@@ -9,7 +9,7 @@ IMAGE="${TEST_IMAGE:-alpine:latest}"
 
 cleanup() {
     echo "Cleaning up..."
-    $RAUHA zone delete --name "$ZONE_NAME" --force 2>/dev/null || true
+    $RAUHA zone delete "$ZONE_NAME" --force 2>/dev/null || true
 }
 trap cleanup EXIT
 

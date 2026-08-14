@@ -9,7 +9,7 @@ IMAGE="${TEST_IMAGE:-alpine:latest}"
 
 cleanup() {
     echo "Cleaning up..."
-    $RAUHA zone delete --name "$ZONE_NAME" --force 2>/dev/null || true
+    $RAUHA zone delete "$ZONE_NAME" --force 2>/dev/null || true
 }
 trap cleanup EXIT
 
@@ -29,7 +29,7 @@ echo "   container ID: $CONTAINER_ID"
 sleep 2
 
 echo "4. Testing one-shot logs (all lines)..."
-LOG_OUTPUT=$($RAUHA logs "$CONTAINER_ID" 2>/dev/null || true)
+LOG_OUTPUT=$(timeout "${RAUHA_LOG_TIMEOUT_SECONDS:-15}" $RAUHA logs "$CONTAINER_ID" 2>/dev/null || true)
 if echo "$LOG_OUTPUT" | grep -q "hello-from-logs"; then
     echo "   one-shot logs contain expected output (OK)"
 else
@@ -38,7 +38,7 @@ else
 fi
 
 echo "5. Testing tail mode (last 1 line)..."
-TAIL_OUTPUT=$($RAUHA logs "$CONTAINER_ID" --tail 1 2>/dev/null || true)
+TAIL_OUTPUT=$(timeout "${RAUHA_LOG_TIMEOUT_SECONDS:-15}" $RAUHA logs "$CONTAINER_ID" --tail 1 2>/dev/null || true)
 if echo "$TAIL_OUTPUT" | grep -q "line3"; then
     echo "   tail=1 shows last line (OK)"
 else
