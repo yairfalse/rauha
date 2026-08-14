@@ -6,8 +6,8 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Mutex;
 
 use rauha_common::error::{RauhaError, Result};
 use rauha_common::zone::{ZonePolicy, ZoneType};
@@ -20,7 +20,9 @@ use rauha_enforcer_api::{
 use super::ebpf::EbpfManager;
 use super::events;
 use super::lock_backend;
-use super::maps::{MapManager, enforcement_to_kernel};
+use super::maps::{enforcement_to_kernel, MapManager};
+
+type TraitZones = HashMap<String, (u32, ZoneType)>;
 
 pub(super) struct LinuxEnforcer {
     root: String,
@@ -34,7 +36,7 @@ pub(super) struct LinuxEnforcer {
     /// directly as an `EnforcerBackend` — the `linux_enforcer_passes_basic_conformance`
     /// test below, and the future migration where `LinuxBackend` consumes the
     /// trait and this becomes the single map.
-    trait_zones: Mutex<HashMap<String, (u32, ZoneType)>>,
+    trait_zones: Mutex<TraitZones>,
     trait_next_zone_id: AtomicU32,
 }
 
@@ -206,7 +208,7 @@ impl LinuxEnforcer {
     fn with_bpf<T>(
         &self,
         operation: &str,
-        f: impl FnOnce(&mut aya::Bpf) -> Result<T>,
+        f: impl FnOnce(&mut aya::Ebpf) -> Result<T>,
     ) -> Result<T> {
         let mut ebpf_guard = lock_backend(&self.ebpf, "linux_enforcer.ebpf")?;
         let ebpf = ebpf_guard.as_mut().ok_or_else(|| RauhaError::EbpfError {
@@ -242,10 +244,7 @@ impl LinuxEnforcer {
 
     fn lock_trait_zones(
         &self,
-    ) -> std::result::Result<
-        std::sync::MutexGuard<'_, HashMap<String, (u32, ZoneType)>>,
-        EnforcerError,
-    > {
+    ) -> std::result::Result<std::sync::MutexGuard<'_, TraitZones>, EnforcerError> {
         self.trait_zones
             .lock()
             .map_err(|_| EnforcerError::Verifier("linux enforcer zone registry poisoned".into()))

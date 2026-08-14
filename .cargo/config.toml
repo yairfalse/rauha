@@ -1,2 +1,10 @@
+[build]
+# Keep the target dir local: rauhad locates rauha-shim via target/debug|release,
+# demo.sh runs ./target/release/*, and the codesign step targets target/debug/rauhad.
+target-dir = "target"
+
+[alias]
+xtask = "run -p xtask --"
+
 [target.aarch64-unknown-linux-musl]
 linker = "aarch64-linux-musl-gcc"

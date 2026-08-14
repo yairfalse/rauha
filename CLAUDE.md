@@ -75,7 +75,9 @@ RAUHA_GRPC_ENDPOINT=http://[::1]:9876 cargo test -- case_001  # one case
 
 Proto files are in `proto/` (zone.proto, container.proto, image.proto, sandbox.proto). They compile automatically via `build.rs` in rauhad and rauha-cli. `sandbox.proto` defines `SandboxService.RunSandbox` (package `rauha.sandbox.v1`) — the agent-sandbox task contract that runs a command in its own zone and captures stdout/stderr/exit-code plus enforcement events into one result. `SandboxServiceImpl` (`rauhad/src/server.rs`) implements it on top of the zone/container primitives: resolve-or-allocate a zone, create+start one container, poll to exit (or timeout), read shim log files for output, and drain the enforcement-event broadcast scoped to the task's zone. Temporary zones (empty `name`) are torn down after the run unless `keep_zone` is set; a runtime failure that prevents producing a result comes back as a `runtime_error` result, not a gRPC error. The `rauha sandbox` CLI mirrors the task's exit code.
 
-Most read-only/list commands accept `--json`; streaming/interactive commands (`trace`, `top`, `events`, `logs`, `exec`, `attach`, `setup`) do not.
+Most read-only/list commands accept `--json`; `events --json` emits JSON Lines.
+Interactive commands (`top`, `logs`, `exec`, `attach`, `setup`) do not support
+it, and the unimplemented `trace` command exits with an error.
 
 ## Core Principles
 

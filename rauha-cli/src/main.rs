@@ -103,7 +103,7 @@ async fn main() {
         Commands::Delete(args) => commands::run::handle_delete(args, out).await,
         Commands::Image(action) => commands::image::handle(action, out).await,
         Commands::Policy { action } => commands::policy::handle(action, out).await,
-        Commands::Trace(args) => commands::trace::handle_trace(args, out).await,
+        Commands::Trace(args) => commands::trace::handle_trace(args).await,
         Commands::Top(args) => commands::trace::handle_top(args).await,
         Commands::Events(args) => commands::trace::handle_events(args, out).await,
         Commands::Logs(args) => commands::logs::handle_logs(args).await,

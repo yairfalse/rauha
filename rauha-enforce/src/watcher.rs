@@ -122,15 +122,9 @@ fn scan_cgroup_dir(
 /// container task. The annotations map contains container labels.
 fn read_container_zone_label(container_id: &str) -> Option<String> {
     let state_paths = [
-        format!(
-            "/run/containerd/io.containerd.runtime.v2.task/default/{container_id}/config.json"
-        ),
-        format!(
-            "/run/containerd/io.containerd.runtime.v2.task/k8s.io/{container_id}/config.json"
-        ),
-        format!(
-            "/run/containerd/io.containerd.runtime.v2.task/moby/{container_id}/config.json"
-        ),
+        format!("/run/containerd/io.containerd.runtime.v2.task/default/{container_id}/config.json"),
+        format!("/run/containerd/io.containerd.runtime.v2.task/k8s.io/{container_id}/config.json"),
+        format!("/run/containerd/io.containerd.runtime.v2.task/moby/{container_id}/config.json"),
     ];
 
     for path in &state_paths {
@@ -171,7 +165,10 @@ pub enum WatcherEvent {
     /// A new container with a zone label was started.
     Add(ZoneAssignment),
     /// A container was stopped/deleted.
-    Remove { container_id: String, cgroup_id: u64 },
+    Remove {
+        container_id: String,
+        cgroup_id: u64,
+    },
 }
 
 /// Watch containerd for container start/stop events.
@@ -215,10 +212,11 @@ async fn try_watch(
     policies: &HashMap<String, ZonePolicy>,
     tx: &mpsc::Sender<WatcherEvent>,
 ) -> anyhow::Result<()> {
-    use containerd_client::{connect, services::v1::events_client::EventsClient};
     use containerd_client::services::v1::SubscribeRequest;
+    use containerd_client::{connect, services::v1::events_client::EventsClient};
 
-    let channel = connect(socket_path).await
+    let channel = connect(socket_path)
+        .await
         .map_err(|e| anyhow::anyhow!("failed to connect to containerd at {socket_path}: {e}"))?;
 
     let mut client = EventsClient::new(channel);
@@ -287,12 +285,19 @@ async fn handle_task_start(
     // Resolve cgroup_id — prefer /proc/pid/cgroup (fast), fall back to known paths.
     let cgroup_id = if start.pid > 0 {
         let id = resolve_cgroup_id_from_pid(start.pid);
-        if id != 0 { id } else { resolve_container_cgroup_id(&container_id) }
+        if id != 0 {
+            id
+        } else {
+            resolve_container_cgroup_id(&container_id)
+        }
     } else {
         resolve_container_cgroup_id(&container_id)
     };
     if cgroup_id == 0 {
-        tracing::warn!(container = container_id, "live: could not resolve cgroup_id");
+        tracing::warn!(
+            container = container_id,
+            "live: could not resolve cgroup_id"
+        );
         return;
     }
 
@@ -305,10 +310,7 @@ async fn handle_task_start(
         .await;
 }
 
-async fn handle_task_delete(
-    event: &prost_types::Any,
-    tx: &mpsc::Sender<WatcherEvent>,
-) {
+async fn handle_task_delete(event: &prost_types::Any, tx: &mpsc::Sender<WatcherEvent>) {
     let container_id = match extract_container_id(event) {
         Some(id) => id,
         None => return,

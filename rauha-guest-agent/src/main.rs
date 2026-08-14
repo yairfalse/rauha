@@ -7,6 +7,7 @@ mod attach;
 mod container;
 
 use std::collections::HashMap;
+#[cfg(not(target_os = "linux"))]
 use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
 
@@ -417,6 +418,7 @@ fn listen_vsock(port: u16, state: &mut AgentState) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[cfg(not(target_os = "linux"))]
 fn listen_unix(path: &str, state: &mut AgentState) -> anyhow::Result<()> {
     if std::path::Path::new(path).exists() {
         std::fs::remove_file(path)?;

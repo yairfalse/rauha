@@ -29,30 +29,11 @@ pub struct EventsArgs {
     pub zone: Option<String>,
 }
 
-#[derive(Serialize)]
-struct TracePlaceholder<'a> {
-    ok: bool,
-    zone: &'a str,
-    status: &'a str,
-}
-
-pub async fn handle_trace(args: TraceArgs, out: OutputMode) -> anyhow::Result<()> {
-    match out {
-        OutputMode::Human => {
-            println!("Tracing zone {}... (not yet implemented)", args.zone);
-        }
-        OutputMode::Json => {
-            println!(
-                "{}",
-                serde_json::to_string(&TracePlaceholder {
-                    ok: false,
-                    zone: &args.zone,
-                    status: "not_implemented",
-                })?
-            );
-        }
-    }
-    Ok(())
+pub async fn handle_trace(args: TraceArgs) -> anyhow::Result<()> {
+    anyhow::bail!(
+        "syscall tracing for zone {} is not yet implemented",
+        args.zone
+    )
 }
 
 pub async fn handle_top(_args: TopArgs) -> anyhow::Result<()> {
@@ -112,8 +93,7 @@ pub async fn handle_events(args: EventsArgs, out: OutputMode) -> anyhow::Result<
                 }
             },
             Err(e) => {
-                eprintln!("stream error: {e}");
-                break;
+                return Err(e.into());
             }
         }
     }
@@ -130,5 +110,19 @@ fn format_timestamp(ts: &str) -> String {
         format!("{secs:>6}.{ms:03}")
     } else {
         ts.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn unimplemented_trace_returns_an_error() {
+        assert!(handle_trace(TraceArgs {
+            zone: "test".into()
+        })
+        .await
+        .is_err());
     }
 }

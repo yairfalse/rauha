@@ -9,7 +9,7 @@ use std::os::fd::{AsFd, AsRawFd};
 use std::path::{Path, PathBuf};
 
 use aya::programs::Lsm;
-use aya::{Bpf, BpfLoader, Btf};
+use aya::{Btf, Ebpf, EbpfLoader};
 use aya_obj::btf::BtfKind;
 use rauha_common::error::{RauhaError, Result};
 use rauha_ebpf_common::offsets::{
@@ -47,7 +47,7 @@ pub struct EbpfManager {
     // raw fd integers borrowed from `bpf`. Rust drops fields in declaration
     // order, so `program_fds` (just integers, no Drop) drops before `bpf`
     // (which owns the actual fds). Do not reorder these fields.
-    bpf: Bpf,
+    bpf: Ebpf,
     pin_path: PathBuf,
     /// LSM hooks the running kernel does not expose, skipped at load time.
     /// Non-empty means enforcement is active but degraded.
@@ -58,8 +58,8 @@ pub struct EbpfManager {
     /// Note: this checks program validity, not link validity. A program
     /// can theoretically be loaded but have its LSM link detached (e.g. via
     /// bpftool). Aya 0.13 doesn't expose link fds publicly. The link is
-    /// owned internally by the Bpf object and stays attached as long as
-    /// it's not explicitly detached or the Bpf object dropped.
+    /// owned internally by the Ebpf object and stays attached as long as
+    /// it's not explicitly detached or the Ebpf object dropped.
     program_fds: HashMap<String, i32>,
 }
 
@@ -81,7 +81,7 @@ impl EbpfManager {
         let pin_path = PathBuf::from(BPF_PIN_PATH);
 
         // Remove any stale pinned maps from a previous run (crash recovery).
-        // BpfLoader::map_pin_path() reuses existing pins, which would leave
+        // EbpfLoader::map_pin_path() reuses existing pins, which would leave
         // stale zone_id entries from the old run. Since recover_zone()
         // repopulates all maps from redb, starting fresh is correct.
         if pin_path.exists() {
@@ -145,7 +145,7 @@ impl EbpfManager {
             hint: format!("check permissions on {}", ebpf_obj_path.display()),
         })?;
 
-        let mut loader = BpfLoader::new();
+        let mut loader = EbpfLoader::new();
         loader.btf(Some(&btf)).map_pin_path(&pin_path);
 
         let mut bpf = loader.load(&obj_data).map_err(|e| RauhaError::EbpfError {
@@ -291,7 +291,7 @@ impl EbpfManager {
 
     /// Take ownership of the ENFORCEMENT_EVENTS ring buffer map.
     ///
-    /// Transfers the map out of the Bpf object so it can be moved into a
+    /// Transfers the map out of the Ebpf object so it can be moved into a
     /// background task without lifetime issues. Can only be called once.
     pub fn take_event_ring_buf(&mut self) -> Result<aya::maps::RingBuf<aya::maps::MapData>> {
         let map = self
@@ -307,26 +307,21 @@ impl EbpfManager {
         })
     }
 
-    /// Get a mutable reference to the inner Bpf object for map access.
-    pub fn bpf_mut(&mut self) -> &mut Bpf {
+    /// Get a mutable reference to the inner Ebpf object for map access.
+    pub fn bpf_mut(&mut self) -> &mut Ebpf {
         &mut self.bpf
-    }
-
-    /// Get a reference to the inner Bpf object for map reads.
-    pub fn bpf(&self) -> &Bpf {
-        &self.bpf
     }
 
     /// Check that all programs are still loaded and their fds are valid.
     ///
     /// Verifies two things per program:
-    /// 1. The program exists in the Bpf handle (loaded).
+    /// 1. The program exists in the Ebpf handle (loaded).
     /// 2. The program fd is still valid (kernel hasn't reclaimed it).
     ///
     /// The program fd being valid is a necessary condition for enforcement.
     /// The LSM link (which actually hooks the program into the LSM framework)
     /// is managed internally by aya — aya 0.13 doesn't expose link fds
-    /// publicly. The link stays attached as long as the Bpf object is alive
+    /// publicly. The link stays attached as long as the Ebpf object is alive
     /// and nobody explicitly detaches it.
     pub fn health_check(&self) -> Result<Vec<ProgramStatus>> {
         let mut statuses = Vec::new();

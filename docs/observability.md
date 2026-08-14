@@ -25,6 +25,9 @@ environment = "unknown"
 [observability.drop]
 events = ["shim.__ping__"]
 
+# NOTE: sampling, rate limits, and event drops are parsed but NOT yet wired.
+# Configuring any of them logs a startup warning.
+
 # NOTE: sink routing is parsed but NOT yet wired — logs always go to stdout
 # regardless of these settings. Setting stdout=false or rotating_file logs a
 # startup warning. (Tracked for a follow-up slice.)
@@ -44,6 +47,9 @@ timeout_ms = 10000
 [observability.otlp.headers]
 authorization = "Bearer token"
 ```
+
+OTLP settings are also parsed but not yet wired; configuring an endpoint logs a
+startup warning.
 
 Environment fallbacks:
 
@@ -89,14 +95,13 @@ Evidence events reuse `rauha-evidence` names and add stable event keys such as
 
 ## OTLP
 
-The `otlp` cargo feature is the intended vendor-neutral export path. When the
-feature is disabled or no endpoint is configured, stdout JSON remains the
-source of truth and OTLP is a no-op.
+The `otlp` cargo feature reserves the intended vendor-neutral export path.
+Export is not implemented yet; stdout JSON remains the source of truth.
 
 ## Cost Controls
 
-Defaults drop shim health-check noise (`shim.__ping__`) and reserve event-name
-controls for noisy pipeline-health records such as `ringbuf.drop` and
-`pipeline.shed`. Userspace subscriber lag is converted into `pipeline.shed`.
+Sampling, rate-limit, and event-drop settings are reserved for noisy records
+such as `ringbuf.drop`, `pipeline.shed`, and `shim.__ping__`; they are not yet
+applied. Userspace subscriber lag is converted into `pipeline.shed`.
 Kernel-side full-ring-buffer drops still require a BPF-side counter before
 Rauha can report every `ringbuf.drop` loss without inference.

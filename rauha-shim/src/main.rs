@@ -1,6 +1,5 @@
 mod attach;
 mod container;
-mod io;
 mod state;
 
 use std::os::unix::net::UnixListener;

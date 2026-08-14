@@ -40,21 +40,13 @@ impl MacosBackend {
     }
 
     /// Send a request to a zone's guest agent via vsock.
-    fn send_to_guest(
-        &self,
-        zone_name: &str,
-        request: &ShimRequest,
-    ) -> Result<ShimResponse> {
+    fn send_to_guest(&self, zone_name: &str, request: &ShimRequest) -> Result<ShimResponse> {
         vsock::send_request(&self.vm_manager, zone_name, request)
     }
 
     /// Build an OCI spec JSON from a ContainerSpec for the guest agent.
     fn build_spec_json(&self, spec: &ContainerSpec) -> String {
-        let env: Vec<String> = spec
-            .env
-            .iter()
-            .map(|(k, v)| format!("{k}={v}"))
-            .collect();
+        let env: Vec<String> = spec.env.iter().map(|(k, v)| format!("{k}={v}")).collect();
         let cwd = spec.working_dir.as_deref().unwrap_or("/");
 
         // Minimal OCI runtime spec with just what fork_and_exec needs.
@@ -80,18 +72,24 @@ impl MacosBackend {
 
 impl IsolationBackend for MacosBackend {
     fn create_zone(&self, config: &ZoneConfig) -> Result<ZoneHandle> {
-        tracing::info!(zone = config.name, backend = "macos-virtualization", "creating zone");
+        tracing::info!(
+            zone = config.name,
+            backend = "macos-virtualization",
+            "creating zone"
+        );
 
         let zone_id = Uuid::new_v4();
         let zone_dir = self.zone_dir(&config.name);
-        std::fs::create_dir_all(&zone_dir).map_err(|e| RauhaError::BackendError(
-            format!("failed to create zone dir: {e}"),
-        ))?;
+        std::fs::create_dir_all(&zone_dir)
+            .map_err(|e| RauhaError::BackendError(format!("failed to create zone dir: {e}")))?;
 
         // Create pf anchor for network isolation.
         // Non-fatal: pf requires root, and we don't want to block development
         // testing when running rauhad without root.
-        if let Err(e) = self.pf_manager.create_zone_rules(&config.name, &config.policy) {
+        if let Err(e) = self
+            .pf_manager
+            .create_zone_rules(&config.name, &config.policy)
+        {
             tracing::warn!(zone = config.name, %e, "pf rules not applied — network isolation inactive (run as root for full isolation)");
         }
 
@@ -102,7 +100,7 @@ impl IsolationBackend for MacosBackend {
         Ok(ZoneHandle {
             id: zone_id,
             name: config.name.clone(),
-            platform_id: 0, // VM doesn't have a numeric platform ID
+            platform_id: 0,      // VM doesn't have a numeric platform ID
             network_state: None, // macOS VMs get IPs from Virtualization.framework's NAT
         })
     }
@@ -160,12 +158,12 @@ impl IsolationBackend for MacosBackend {
         Ok(())
     }
 
-    fn create_container(
-        &self,
-        zone: &ZoneHandle,
-        spec: &ContainerSpec,
-    ) -> Result<ContainerHandle> {
-        tracing::info!(zone = zone.name, container = spec.name, "creating container");
+    fn create_container(&self, zone: &ZoneHandle, spec: &ContainerSpec) -> Result<ContainerHandle> {
+        tracing::info!(
+            zone = zone.name,
+            container = spec.name,
+            "creating container"
+        );
 
         let container_id = Uuid::new_v4();
 
@@ -181,10 +179,8 @@ impl IsolationBackend for MacosBackend {
             self.apfs_manager
                 .clone_rootfs(base_rootfs, &container_rootfs)?;
         } else {
-            std::fs::create_dir_all(&container_rootfs).map_err(|e| {
-                RauhaError::RootfsError {
-                    message: format!("failed to create container rootfs dir: {e}"),
-                }
+            std::fs::create_dir_all(&container_rootfs).map_err(|e| RauhaError::RootfsError {
+                message: format!("failed to create container rootfs dir: {e}"),
             })?;
         }
 
@@ -319,8 +315,7 @@ impl IsolationBackend for MacosBackend {
         // Check 2: pf anchor exists.
         // pf requires root — without it, rules aren't written (by design).
         // The VM boundary is the primary isolation on macOS; pf is defense-in-depth.
-        let pf_file = Path::new("/etc/pf.anchors")
-            .join(format!("com.rauha.zone-{}", zone.name));
+        let pf_file = Path::new("/etc/pf.anchors").join(format!("com.rauha.zone-{}", zone.name));
         let pf_exists = pf_file.exists();
         let is_root = unsafe { libc::geteuid() } == 0;
         checks.push(IsolationCheck {
@@ -369,9 +364,8 @@ impl IsolationBackend for MacosBackend {
         // VMs don't survive daemon restart — we need to re-boot.
         if !self.vm_manager.is_running(&zone.name) {
             let zone_dir = self.zone_dir(&zone.name);
-            std::fs::create_dir_all(&zone_dir).map_err(|e| {
-                RauhaError::BackendError(format!("failed to create zone dir: {e}"))
-            })?;
+            std::fs::create_dir_all(&zone_dir)
+                .map_err(|e| RauhaError::BackendError(format!("failed to create zone dir: {e}")))?;
 
             let vm_config = VmConfig::from_policy(policy, zone_dir);
             self.vm_manager.boot_vm(&zone.name, &vm_config)?;
@@ -408,19 +402,11 @@ impl IsolationBackend for MacosBackend {
         "macos-virtualization"
     }
 
-    fn shim_request(
-        &self,
-        zone_name: &str,
-        request: &ShimRequest,
-    ) -> Result<ShimResponse> {
+    fn shim_request(&self, zone_name: &str, request: &ShimRequest) -> Result<ShimResponse> {
         self.send_to_guest(zone_name, request)
     }
 
-    fn connect_vsock_port(
-        &self,
-        zone_name: &str,
-        port: u32,
-    ) -> Result<std::os::fd::OwnedFd> {
+    fn connect_vsock_port(&self, zone_name: &str, port: u32) -> Result<std::os::fd::OwnedFd> {
         self.vm_manager.connect_vsock(zone_name, port)
     }
 }
@@ -433,7 +419,10 @@ impl MacosBackend {
             for entry in entries.flatten() {
                 let zone_name = entry.file_name().to_string_lossy().to_string();
                 // Container rootfs lives at {zone_dir}/containers/{id}/rootfs.
-                let container_dir = entry.path().join("containers").join(container.id.to_string());
+                let container_dir = entry
+                    .path()
+                    .join("containers")
+                    .join(container.id.to_string());
                 if container_dir.exists() {
                     return Ok(zone_name);
                 }

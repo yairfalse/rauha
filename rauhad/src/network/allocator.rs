@@ -8,7 +8,6 @@ use std::collections::HashSet;
 use std::net::Ipv4Addr;
 
 use rauha_common::error::{RauhaError, Result};
-use rauha_common::zone::Zone;
 
 pub struct IpAllocator {
     /// Network address (e.g. 10.89.0.0).
@@ -21,7 +20,10 @@ pub struct IpAllocator {
 
 impl IpAllocator {
     pub fn new(subnet: [u8; 4], prefix_len: u8) -> Self {
-        assert!(prefix_len <= 30, "prefix_len must be <= 30 to have usable host addresses");
+        assert!(
+            prefix_len <= 30,
+            "prefix_len must be <= 30 to have usable host addresses"
+        );
         let mut allocated = HashSet::new();
         // Reserve offset 0 (network address) and offset 1 (gateway).
         allocated.insert(0);
@@ -89,21 +91,8 @@ impl IpAllocator {
         }
     }
 
-    /// Rebuild allocator state from existing zones.
-    /// Called on daemon startup to reconstruct from persisted zone metadata.
-    pub fn rebuild_from_zones(&mut self, zones: &[Zone]) {
-        for zone in zones {
-            if let Some(ref net) = zone.network_state {
-                let ip = Ipv4Addr::from(net.ip);
-                let offset = self.ip_to_offset(ip);
-                if offset > 1 {
-                    self.allocated.insert(offset);
-                }
-            }
-        }
-    }
-
     /// How many addresses are currently allocated (excluding network + gateway).
+    #[cfg(test)]
     pub fn allocated_count(&self) -> usize {
         // Subtract 2 for the always-reserved network and gateway offsets.
         self.allocated.len().saturating_sub(2)
@@ -142,7 +131,6 @@ impl IpAllocator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rauha_common::zone::*;
 
     #[test]
     fn allocate_returns_sequential_ips() {
@@ -185,46 +173,13 @@ mod tests {
     }
 
     #[test]
-    fn rebuild_from_zones() {
+    fn recovered_addresses_are_not_reallocated() {
         let mut alloc = IpAllocator::default_subnet();
+        alloc.mark_allocated(Ipv4Addr::new(10, 89, 0, 2));
+        alloc.mark_allocated(Ipv4Addr::new(10, 89, 0, 5));
 
-        let zones = vec![
-            Zone {
-                id: uuid::Uuid::new_v4(),
-                name: "a".into(),
-                zone_type: ZoneType::NonGlobal,
-                state: ZoneState::Ready,
-                policy: ZonePolicy::default(),
-                created_at: chrono::Utc::now(),
-                updated_at: chrono::Utc::now(),
-                network_state: Some(ZoneNetworkState {
-                    ip: [10, 89, 0, 2],
-                    gateway: [10, 89, 0, 1],
-                    prefix_len: 16,
-                }),
-            },
-            Zone {
-                id: uuid::Uuid::new_v4(),
-                name: "b".into(),
-                zone_type: ZoneType::NonGlobal,
-                state: ZoneState::Ready,
-                policy: ZonePolicy::default(),
-                created_at: chrono::Utc::now(),
-                updated_at: chrono::Utc::now(),
-                network_state: Some(ZoneNetworkState {
-                    ip: [10, 89, 0, 5],
-                    gateway: [10, 89, 0, 1],
-                    prefix_len: 16,
-                }),
-            },
-        ];
-
-        alloc.rebuild_from_zones(&zones);
-
-        // .2 and .5 are taken, so next allocation should be .3.
         assert_eq!(alloc.allocate().unwrap(), Ipv4Addr::new(10, 89, 0, 3));
         assert_eq!(alloc.allocate().unwrap(), Ipv4Addr::new(10, 89, 0, 4));
-        // .5 is taken, so skip to .6.
         assert_eq!(alloc.allocate().unwrap(), Ipv4Addr::new(10, 89, 0, 6));
     }
 
@@ -233,8 +188,8 @@ mod tests {
         // /30 = 4 addresses: network, gateway, and 2 hosts.
         let mut alloc = IpAllocator::new([10, 0, 0, 0], 30);
         assert!(alloc.allocate().is_ok()); // .2
-        // .3 would be broadcast in a real /30, but our max_host_offset
-        // calculation gives (1<<2) - 2 = 2, so only offset 2 is available.
+                                           // .3 would be broadcast in a real /30, but our max_host_offset
+                                           // calculation gives (1<<2) - 2 = 2, so only offset 2 is available.
         assert!(alloc.allocate().is_err());
     }
 

@@ -131,11 +131,7 @@ pub fn create_veth_pair(zone_name: &str, net_state: Option<&ZoneNetworkState>) -
         );
     }
 
-    tracing::info!(
-        zone = zone_name,
-        host_if = host_if,
-        "created veth pair"
-    );
+    tracing::info!(zone = zone_name, host_if = host_if, "created veth pair");
     Ok(())
 }
 
@@ -223,18 +219,25 @@ fn run_ip_netns(ns_name: &str, args: &[&str]) -> Result<()> {
     let mut cmd_args = vec!["netns", "exec", ns_name, "ip"];
     cmd_args.extend_from_slice(args);
 
-    let output = Command::new("ip")
-        .args(&cmd_args)
-        .output()
-        .map_err(|e| RauhaError::NetworkError {
-            message: format!("failed to run `ip netns exec {ns_name} ip {}`: {e}", args.join(" ")),
-            hint: "ensure iproute2 is installed".into(),
-        })?;
+    let output =
+        Command::new("ip")
+            .args(&cmd_args)
+            .output()
+            .map_err(|e| RauhaError::NetworkError {
+                message: format!(
+                    "failed to run `ip netns exec {ns_name} ip {}`: {e}",
+                    args.join(" ")
+                ),
+                hint: "ensure iproute2 is installed".into(),
+            })?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(RauhaError::NetworkError {
-            message: format!("ip netns exec {ns_name} ip {} failed: {stderr}", args.join(" ")),
+            message: format!(
+                "ip netns exec {ns_name} ip {} failed: {stderr}",
+                args.join(" ")
+            ),
             hint: "check namespace exists".into(),
         });
     }

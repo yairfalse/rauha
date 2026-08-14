@@ -22,16 +22,12 @@ pub fn create_backend(
 }
 
 #[cfg(target_os = "macos")]
-pub fn create_backend(
-    root: &str,
-) -> rauha_common::error::Result<Box<dyn IsolationBackend>> {
+pub fn create_backend(root: &str) -> rauha_common::error::Result<Box<dyn IsolationBackend>> {
     Ok(Box::new(macos::MacosBackend::new(root)?))
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-pub fn create_backend(
-    root: &str,
-) -> rauha_common::error::Result<Box<dyn IsolationBackend>> {
+pub fn create_backend(root: &str) -> rauha_common::error::Result<Box<dyn IsolationBackend>> {
     Err(rauha_common::error::RauhaError::UnsupportedPlatform(
         std::env::consts::OS.into(),
     ))

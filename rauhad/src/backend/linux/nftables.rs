@@ -29,32 +29,70 @@ pub fn ensure_nat(subnet_cidr: &str) -> Result<()> {
 
     // Create postrouting NAT chain.
     run_nft(&[
-        "add", "chain", TABLE_FAMILY, TABLE_NAME, "postrouting",
-        "{", "type", "nat", "hook", "postrouting", "priority", "srcnat", ";", "}",
+        "add",
+        "chain",
+        TABLE_FAMILY,
+        TABLE_NAME,
+        "postrouting",
+        "{",
+        "type",
+        "nat",
+        "hook",
+        "postrouting",
+        "priority",
+        "srcnat",
+        ";",
+        "}",
     ])?;
 
     // Masquerade zone traffic going out through non-bridge interfaces.
-    let rule = format!(
-        "ip saddr {subnet_cidr} oifname != \"rauha0\" masquerade"
-    );
-    run_nft(&["add", "rule", TABLE_FAMILY, TABLE_NAME, "postrouting", &rule])?;
+    let rule = format!("ip saddr {subnet_cidr} oifname != \"rauha0\" masquerade");
+    run_nft(&[
+        "add",
+        "rule",
+        TABLE_FAMILY,
+        TABLE_NAME,
+        "postrouting",
+        &rule,
+    ])?;
 
     // Create forward chain with default drop policy.
     // Any traffic not explicitly accepted by a zone chain is dropped.
     run_nft(&[
-        "add", "chain", TABLE_FAMILY, TABLE_NAME, "forward",
-        "{", "type", "filter", "hook", "forward", "priority", "filter", ";",
-        "policy", "drop", ";", "}",
+        "add",
+        "chain",
+        TABLE_FAMILY,
+        TABLE_NAME,
+        "forward",
+        "{",
+        "type",
+        "filter",
+        "hook",
+        "forward",
+        "priority",
+        "filter",
+        ";",
+        "policy",
+        "drop",
+        ";",
+        "}",
     ])?;
 
     // Allow established/related at the top of the forward chain so return
     // traffic is never blocked.
     run_nft(&[
-        "add", "rule", TABLE_FAMILY, TABLE_NAME, "forward",
+        "add",
+        "rule",
+        TABLE_FAMILY,
+        TABLE_NAME,
+        "forward",
         "ct state established,related accept",
     ])?;
 
-    tracing::info!(subnet = subnet_cidr, "nftables NAT + forward chains created");
+    tracing::info!(
+        subnet = subnet_cidr,
+        "nftables NAT + forward chains created"
+    );
     Ok(())
 }
 
@@ -74,11 +112,7 @@ pub fn cleanup_nat() -> Result<()> {
 ///
 /// Zone names are validated by `validate_zone_name` (alphanumeric + hyphen,
 /// max 128 chars) which produces safe nftables chain identifiers.
-pub fn apply_zone_rules(
-    zone_name: &str,
-    veth_name: &str,
-    policy: &NetworkPolicy,
-) -> Result<()> {
+pub fn apply_zone_rules(zone_name: &str, veth_name: &str, policy: &NetworkPolicy) -> Result<()> {
     // First remove any existing rules for this zone.
     let _ = remove_zone_rules(zone_name);
 
@@ -87,32 +121,38 @@ pub fn apply_zone_rules(
     match policy.mode {
         NetworkMode::Isolated => {
             // Create a chain that drops everything.
-            run_nft(&[
-                "add", "chain", TABLE_FAMILY, TABLE_NAME, &chain_name,
-            ])?;
-            run_nft(&[
-                "add", "rule", TABLE_FAMILY, TABLE_NAME, &chain_name, "drop",
-            ])?;
+            run_nft(&["add", "chain", TABLE_FAMILY, TABLE_NAME, &chain_name])?;
+            run_nft(&["add", "rule", TABLE_FAMILY, TABLE_NAME, &chain_name, "drop"])?;
 
             // Jump to the zone chain for traffic from/to this veth.
             run_nft(&[
-                "add", "rule", TABLE_FAMILY, TABLE_NAME, "forward",
+                "add",
+                "rule",
+                TABLE_FAMILY,
+                TABLE_NAME,
+                "forward",
                 &format!("iifname \"{veth_name}\" jump {chain_name}"),
             ])?;
             run_nft(&[
-                "add", "rule", TABLE_FAMILY, TABLE_NAME, "forward",
+                "add",
+                "rule",
+                TABLE_FAMILY,
+                TABLE_NAME,
+                "forward",
                 &format!("oifname \"{veth_name}\" jump {chain_name}"),
             ])?;
         }
         NetworkMode::Bridged => {
             // Create zone chain.
-            run_nft(&[
-                "add", "chain", TABLE_FAMILY, TABLE_NAME, &chain_name,
-            ])?;
+            run_nft(&["add", "chain", TABLE_FAMILY, TABLE_NAME, &chain_name])?;
 
             // Allow established/related connections.
             run_nft(&[
-                "add", "rule", TABLE_FAMILY, TABLE_NAME, &chain_name,
+                "add",
+                "rule",
+                TABLE_FAMILY,
+                TABLE_NAME,
+                &chain_name,
                 "ct state established,related accept",
             ])?;
 
@@ -122,11 +162,19 @@ pub fn apply_zone_rules(
                 let peer_veth = super::network::veth_host_name_for(allowed_zone);
                 // Allow bidirectional traffic between veths.
                 run_nft(&[
-                    "add", "rule", TABLE_FAMILY, TABLE_NAME, &chain_name,
+                    "add",
+                    "rule",
+                    TABLE_FAMILY,
+                    TABLE_NAME,
+                    &chain_name,
                     &format!("iifname \"{veth_name}\" oifname \"{peer_veth}\" accept"),
                 ])?;
                 run_nft(&[
-                    "add", "rule", TABLE_FAMILY, TABLE_NAME, &chain_name,
+                    "add",
+                    "rule",
+                    TABLE_FAMILY,
+                    TABLE_NAME,
+                    &chain_name,
                     &format!("iifname \"{peer_veth}\" oifname \"{veth_name}\" accept"),
                 ])?;
 
@@ -139,18 +187,30 @@ pub fn apply_zone_rules(
 
             // Allow DNS always (before egress rules so it's never blocked).
             run_nft(&[
-                "add", "rule", TABLE_FAMILY, TABLE_NAME, &chain_name,
+                "add",
+                "rule",
+                TABLE_FAMILY,
+                TABLE_NAME,
+                &chain_name,
                 &format!("iifname \"{veth_name}\" udp dport 53 accept"),
             ])?;
             run_nft(&[
-                "add", "rule", TABLE_FAMILY, TABLE_NAME, &chain_name,
+                "add",
+                "rule",
+                TABLE_FAMILY,
+                TABLE_NAME,
+                &chain_name,
                 &format!("iifname \"{veth_name}\" tcp dport 53 accept"),
             ])?;
 
             // Allow specific egress destinations.
             for dest in &policy.allowed_egress {
                 run_nft(&[
-                    "add", "rule", TABLE_FAMILY, TABLE_NAME, &chain_name,
+                    "add",
+                    "rule",
+                    TABLE_FAMILY,
+                    TABLE_NAME,
+                    &chain_name,
                     &format!("iifname \"{veth_name}\" ip daddr {dest} accept"),
                 ])?;
             }
@@ -159,23 +219,33 @@ pub fn apply_zone_rules(
             // (internet) but NOT cross-zone traffic (which must be in allowed_zones).
             if policy.allowed_egress.is_empty() {
                 run_nft(&[
-                    "add", "rule", TABLE_FAMILY, TABLE_NAME, &chain_name,
+                    "add",
+                    "rule",
+                    TABLE_FAMILY,
+                    TABLE_NAME,
+                    &chain_name,
                     &format!("iifname \"{veth_name}\" oifname != \"veth-*\" accept"),
                 ])?;
             }
 
             // Default: drop remaining (blocks unlisted cross-zone traffic).
-            run_nft(&[
-                "add", "rule", TABLE_FAMILY, TABLE_NAME, &chain_name, "drop",
-            ])?;
+            run_nft(&["add", "rule", TABLE_FAMILY, TABLE_NAME, &chain_name, "drop"])?;
 
             // Jump to the zone chain from forward.
             run_nft(&[
-                "add", "rule", TABLE_FAMILY, TABLE_NAME, "forward",
+                "add",
+                "rule",
+                TABLE_FAMILY,
+                TABLE_NAME,
+                "forward",
                 &format!("iifname \"{veth_name}\" jump {chain_name}"),
             ])?;
             run_nft(&[
-                "add", "rule", TABLE_FAMILY, TABLE_NAME, "forward",
+                "add",
+                "rule",
+                TABLE_FAMILY,
+                TABLE_NAME,
+                "forward",
                 &format!("oifname \"{veth_name}\" jump {chain_name}"),
             ])?;
         }
@@ -225,8 +295,13 @@ fn remove_forward_chain_jumps(chain_name: &str) -> Result<()> {
                 let handle = line[idx + "# handle ".len()..].trim();
                 if !handle.is_empty() {
                     let _ = run_nft(&[
-                        "delete", "rule", TABLE_FAMILY, TABLE_NAME, "forward",
-                        "handle", handle,
+                        "delete",
+                        "rule",
+                        TABLE_FAMILY,
+                        TABLE_NAME,
+                        "forward",
+                        "handle",
+                        handle,
                     ]);
                 }
             }

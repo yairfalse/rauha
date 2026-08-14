@@ -3,8 +3,8 @@
 //! Commands that support structured output use `print()` to emit results.
 //! In human mode, the caller provides a closure that prints formatted text.
 //! In JSON mode, the value is serialized to stdout as a single JSON object
-//! per line. Streaming/interactive commands (logs, exec, attach, trace, top,
-//! events, setup) do not support `--json` and reject it at startup.
+//! per line. `events --json` emits one object per event; interactive commands
+//! (logs, exec, attach, top, setup) reject `--json` at startup.
 
 use serde::Serialize;
 
@@ -23,7 +23,10 @@ pub fn print<T: Serialize>(mode: OutputMode, value: &T, human: impl FnOnce()) {
     match mode {
         OutputMode::Human => human(),
         OutputMode::Json => {
-            println!("{}", serde_json::to_string(value).expect("serialize output"));
+            println!(
+                "{}",
+                serde_json::to_string(value).expect("serialize output")
+            );
         }
     }
 }

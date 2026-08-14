@@ -3,14 +3,13 @@
 //! Loads and attaches the same LSM programs as rauhad. Provides typed
 //! wrappers for BPF map operations (zone membership, policy, comms).
 
-use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use aya::maps::HashMap as AyaHashMap;
 use aya::maps::RingBuf;
 use aya::programs::Lsm;
-use aya::{Bpf, BpfLoader, Btf};
+use aya::{Btf, Ebpf, EbpfLoader};
 use rauha_common::zone::{capabilities_to_mask, ZonePolicy, ZoneType};
 use rauha_ebpf_common::*;
 
@@ -38,7 +37,7 @@ const MAP_NAMES: &[&str] = &[
 
 /// eBPF manager for the standalone enforce agent.
 pub struct EnforceEbpf {
-    bpf: Bpf,
+    bpf: Ebpf,
     pin_path: PathBuf,
 }
 
@@ -69,8 +68,9 @@ impl EnforceEbpf {
 
         fs::create_dir_all(&pin_path)?;
 
-        let btf = Btf::from_sys_fs()
-            .map_err(|e| anyhow::anyhow!("failed to load BTF: {e} — kernel needs CONFIG_DEBUG_INFO_BTF=y"))?;
+        let btf = Btf::from_sys_fs().map_err(|e| {
+            anyhow::anyhow!("failed to load BTF: {e} — kernel needs CONFIG_DEBUG_INFO_BTF=y")
+        })?;
 
         // Resolve kernel struct offsets via pahole.
         // Validate compiled offsets against the running kernel via pahole.
@@ -87,15 +87,16 @@ impl EnforceEbpf {
             }
         }
 
-        let obj_data = fs::read(&obj_path)
-            .map_err(|e| anyhow::anyhow!("failed to read eBPF object {}: {e}", obj_path.display()))?;
+        let obj_data = fs::read(&obj_path).map_err(|e| {
+            anyhow::anyhow!("failed to read eBPF object {}: {e}", obj_path.display())
+        })?;
 
-        let mut loader = BpfLoader::new();
+        let mut loader = EbpfLoader::new();
         loader.btf(Some(&btf)).map_pin_path(&pin_path);
 
-        let mut bpf = loader
-            .load(&obj_data)
-            .map_err(|e| anyhow::anyhow!("failed to load eBPF: {e} — check CONFIG_BPF_LSM=y and lsm=bpf"))?;
+        let mut bpf = loader.load(&obj_data).map_err(|e| {
+            anyhow::anyhow!("failed to load eBPF: {e} — check CONFIG_BPF_LSM=y and lsm=bpf")
+        })?;
 
         // Attach all LSM programs.
         for &(prog_name, hook_name) in LSM_PROGRAMS {
@@ -105,7 +106,11 @@ impl EnforceEbpf {
                 .try_into()?;
             prog.load(hook_name, &btf)?;
             prog.attach()?;
-            tracing::info!(program = prog_name, hook = hook_name, "attached LSM program");
+            tracing::info!(
+                program = prog_name,
+                hook = hook_name,
+                "attached LSM program"
+            );
         }
 
         tracing::info!(programs = LSM_PROGRAMS.len(), "eBPF programs loaded");
@@ -136,7 +141,8 @@ impl EnforceEbpf {
         let info = ZoneInfoKernel { zone_id, flags };
 
         let mut map: AyaHashMap<_, u64, ZoneInfoKernel> = AyaHashMap::try_from(
-            self.bpf.map_mut("ZONE_MEMBERSHIP")
+            self.bpf
+                .map_mut("ZONE_MEMBERSHIP")
                 .ok_or_else(|| anyhow::anyhow!("ZONE_MEMBERSHIP map not found"))?,
         )?;
 
@@ -147,7 +153,8 @@ impl EnforceEbpf {
     /// Remove a cgroup from zone membership.
     pub fn remove_zone_member(&mut self, cgroup_id: u64) -> anyhow::Result<()> {
         let mut map: AyaHashMap<_, u64, ZoneInfoKernel> = AyaHashMap::try_from(
-            self.bpf.map_mut("ZONE_MEMBERSHIP")
+            self.bpf
+                .map_mut("ZONE_MEMBERSHIP")
                 .ok_or_else(|| anyhow::anyhow!("ZONE_MEMBERSHIP map not found"))?,
         )?;
         let _ = map.remove(&cgroup_id);
@@ -159,7 +166,8 @@ impl EnforceEbpf {
         let kernel_policy = policy_to_kernel(policy)?;
 
         let mut map: AyaHashMap<_, u32, ZonePolicyKernel> = AyaHashMap::try_from(
-            self.bpf.map_mut("ZONE_POLICY")
+            self.bpf
+                .map_mut("ZONE_POLICY")
                 .ok_or_else(|| anyhow::anyhow!("ZONE_POLICY map not found"))?,
         )?;
 
@@ -172,14 +180,19 @@ impl EnforceEbpf {
         use aya::maps::PerCpuArray;
 
         let map = PerCpuArray::<_, EnforcementCounters>::try_from(
-            self.bpf.map("ENFORCEMENT_COUNTERS")
+            self.bpf
+                .map("ENFORCEMENT_COUNTERS")
                 .ok_or_else(|| anyhow::anyhow!("ENFORCEMENT_COUNTERS map not found"))?,
         )?;
 
         let mut results = Vec::new();
         for (idx, &(prog_name, _)) in LSM_PROGRAMS.iter().enumerate() {
             let per_cpu = map.get(&(idx as u32), 0)?;
-            let mut total = EnforcementCounters { allow: 0, deny: 0, error: 0 };
+            let mut total = EnforcementCounters {
+                allow: 0,
+                deny: 0,
+                error: 0,
+            };
             for cpu_val in per_cpu.iter() {
                 total.allow += cpu_val.allow;
                 total.deny += cpu_val.deny;
@@ -225,9 +238,7 @@ fn find_ebpf_object() -> anyhow::Result<PathBuf> {
         }
     }
 
-    anyhow::bail!(
-        "eBPF object not found — run `cargo xtask build-ebpf` or pass --ebpf-obj"
-    )
+    anyhow::bail!("eBPF object not found — run `cargo xtask build-ebpf` or pass --ebpf-obj")
 }
 
 fn policy_to_kernel(policy: &ZonePolicy) -> anyhow::Result<ZonePolicyKernel> {
@@ -267,7 +278,7 @@ fn resolve_offsets() -> Vec<(String, u64)> {
     let pahole = ["/usr/bin/pahole", "/usr/local/bin/pahole"]
         .iter()
         .find(|p| Path::new(p).exists())
-        .map(|p| PathBuf::from(p));
+        .map(PathBuf::from);
 
     let pahole = match pahole {
         Some(p) => p,
@@ -286,13 +297,20 @@ fn resolve_offsets() -> Vec<(String, u64)> {
             let offset = pahole_field_offset(&pahole, type_name, field_name)
                 .map(|v| v as u64)
                 .unwrap_or_else(|_| {
-                    tracing::debug!(r#type = type_name, field = field_name, "using default offset");
+                    tracing::debug!(
+                        r#type = type_name,
+                        field = field_name,
+                        "using default offset"
+                    );
                     default
                 });
 
             if offset != default {
                 tracing::info!(
-                    r#type = type_name, field = field_name, default, resolved = offset,
+                    r#type = type_name,
+                    field = field_name,
+                    default,
+                    resolved = offset,
                     "kernel offset differs — using resolved value"
                 );
             }
@@ -309,7 +327,10 @@ fn pahole_field_offset(pahole: &Path, type_name: &str, field_name: &str) -> Resu
         .map_err(|e| format!("failed to run pahole: {e}"))?;
 
     if !output.status.success() {
-        return Err(format!("pahole failed: {}", String::from_utf8_lossy(&output.stderr).trim()));
+        return Err(format!(
+            "pahole failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -335,5 +356,7 @@ fn pahole_field_offset(pahole: &Path, type_name: &str, field_name: &str) -> Resu
         }
     }
 
-    Err(format!("field '{field_name}' not found in pahole output for '{type_name}'"))
+    Err(format!(
+        "field '{field_name}' not found in pahole output for '{type_name}'"
+    ))
 }

@@ -53,22 +53,13 @@ pub enum RauhaError {
     },
 
     #[error("cgroup error: {message}")]
-    CgroupError {
-        message: String,
-        hint: String,
-    },
+    CgroupError { message: String, hint: String },
 
     #[error("namespace error: {message}")]
-    NamespaceError {
-        message: String,
-        hint: String,
-    },
+    NamespaceError { message: String, hint: String },
 
     #[error("network error: {message}")]
-    NetworkError {
-        message: String,
-        hint: String,
-    },
+    NetworkError { message: String, hint: String },
 
     #[error("image pull error: {reference}: {message}")]
     ImagePullError { reference: String, message: String },
@@ -86,10 +77,7 @@ pub enum RauhaError {
     ContainerExecError { container: String, message: String },
 
     #[error("kernel too old: requires {required}, found {found}")]
-    KernelTooOld {
-        required: String,
-        found: String,
-    },
+    KernelTooOld { required: String, found: String },
 
     #[error(transparent)]
     Io(#[from] std::io::Error),

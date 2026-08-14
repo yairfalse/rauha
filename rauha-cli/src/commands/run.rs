@@ -106,22 +106,29 @@ pub async fn handle_ps(args: PsArgs, out: OutputMode) -> anyhow::Result<()> {
         })
         .collect();
 
-    output::print(out, &output::ContainerList { ok: true, containers }, || {
-        if resp.containers.is_empty() {
-            println!("No containers running.");
-        } else {
-            println!(
-                "{:<40} {:<15} {:<20} {:<12} {:<8}",
-                "ID", "NAME", "IMAGE", "STATE", "PID"
-            );
-            for c in &resp.containers {
+    output::print(
+        out,
+        &output::ContainerList {
+            ok: true,
+            containers,
+        },
+        || {
+            if resp.containers.is_empty() {
+                println!("No containers running.");
+            } else {
                 println!(
                     "{:<40} {:<15} {:<20} {:<12} {:<8}",
-                    c.id, c.name, c.image, c.state, c.pid
+                    "ID", "NAME", "IMAGE", "STATE", "PID"
                 );
+                for c in &resp.containers {
+                    println!(
+                        "{:<40} {:<15} {:<20} {:<12} {:<8}",
+                        c.id, c.name, c.image, c.state, c.pid
+                    );
+                }
             }
-        }
-    });
+        },
+    );
 
     Ok(())
 }

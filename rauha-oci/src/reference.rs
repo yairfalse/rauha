@@ -56,10 +56,7 @@ impl ImageReference {
                 (first_part.to_string(), name[slash_pos + 1..].to_string())
             } else {
                 // Docker Hub with explicit user/org.
-                (
-                    "registry-1.docker.io".to_string(),
-                    name.to_string(),
-                )
+                ("registry-1.docker.io".to_string(), name.to_string())
             }
         } else {
             // Bare name like "nginx" → docker.io/library/nginx.

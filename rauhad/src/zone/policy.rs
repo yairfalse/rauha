@@ -131,9 +131,9 @@ deny = [{deny_syscalls}]
 }
 
 fn format_memory_size(bytes: u64) -> String {
-    if bytes % (1024 * 1024 * 1024) == 0 {
+    if bytes.is_multiple_of(1024 * 1024 * 1024) {
         format!("{}Gi", bytes / (1024 * 1024 * 1024))
-    } else if bytes % (1024 * 1024) == 0 {
+    } else if bytes.is_multiple_of(1024 * 1024) {
         format!("{}Mi", bytes / (1024 * 1024))
     } else {
         bytes.to_string()

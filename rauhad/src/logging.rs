@@ -64,6 +64,17 @@ pub fn init(config: &ObservabilityConfig) -> anyhow::Result<()> {
              stdout regardless of [observability.sinks] (stdout=false / rotating_file ignored)"
         );
     }
+    if !config.sampling.keep_ratio.is_empty()
+        || !config.sampling.rate_limit_per_second.is_empty()
+        || !config.drop.events.is_empty()
+    {
+        tracing::warn!(
+            "observability sampling, rate limits, and event drops are not yet implemented; configured cost controls are ignored"
+        );
+    }
+    if config.otlp.endpoint.is_some() {
+        tracing::warn!("OTLP export is not yet implemented; configured endpoint is ignored");
+    }
     Ok(())
 }
 
@@ -187,10 +198,25 @@ impl<'a> JsonVisitor<'a> {
         }
         self.map.insert(key.to_string(), value);
     }
+
+    fn merge_event_payload(&mut self, payload: &str) -> bool {
+        let Ok(Value::Object(fields)) = serde_json::from_str(payload) else {
+            return false;
+        };
+        for (key, value) in fields {
+            if key != "timestamp" && key != "level" {
+                self.put(&key, value);
+            }
+        }
+        true
+    }
 }
 
 impl Visit for JsonVisitor<'_> {
     fn record_str(&mut self, field: &Field, value: &str) {
+        if field.name() == "event.payload" && self.merge_event_payload(value) {
+            return;
+        }
         self.put(field.name(), Value::String(value.to_string()));
     }
 
@@ -262,5 +288,22 @@ mod tests {
         let mut v = JsonVisitor::with_skip_empty(&mut map);
         v.put("correlation_id", json!("xyz"));
         assert_eq!(map.get("correlation_id"), Some(&json!("xyz")));
+    }
+
+    #[test]
+    fn evidence_payload_is_merged_without_duplicate_timestamp_or_level() {
+        let mut map = Map::new();
+        map.insert("timestamp".into(), json!("log-time"));
+        map.insert("log.level".into(), json!("INFO"));
+        let mut visitor = JsonVisitor::with_skip_empty(&mut map);
+        assert!(visitor.merge_event_payload(
+            r#"{"timestamp":"event-time","level":"WARN","duration_ms":7,"fields":{"exit_code":0}}"#
+        ));
+        assert_eq!(map["timestamp"], "log-time");
+        assert_eq!(map["log.level"], "INFO");
+        assert_eq!(map["duration_ms"], 7);
+        assert_eq!(map["fields"]["exit_code"], 0);
+        assert!(map.get("event.payload").is_none());
+        assert!(map.get("level").is_none());
     }
 }

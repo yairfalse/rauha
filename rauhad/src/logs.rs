@@ -187,7 +187,7 @@ fn read_tail_lines(path: &PathBuf, tail: u32) -> Vec<String> {
         // Return all non-empty lines.
         return reader
             .lines()
-            .filter_map(|l| l.ok())
+            .map_while(Result::ok)
             .filter(|l| !l.is_empty())
             .collect();
     }
@@ -197,7 +197,7 @@ fn read_tail_lines(path: &PathBuf, tail: u32) -> Vec<String> {
     let mut ring = std::collections::VecDeque::with_capacity(cap);
     for line in reader
         .lines()
-        .filter_map(|l| l.ok())
+        .map_while(Result::ok)
         .filter(|l| !l.is_empty())
     {
         if ring.len() == cap {

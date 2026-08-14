@@ -295,11 +295,9 @@ impl Task for RauhaShim {
             .map_err(|e| Error::Other(format!("container start failed: {e}")))?;
 
         let pid = std::process::id();
-        self.containers
-            .lock()
-            .await
-            .get_mut(&req.id)
-            .map(|s| s.pid = pid);
+        if let Some(state) = self.containers.lock().await.get_mut(&req.id) {
+            state.pid = pid;
+        }
 
         info!("started container {}", req.id);
         Ok(api::StartResponse {
@@ -308,11 +306,7 @@ impl Task for RauhaShim {
         })
     }
 
-    async fn kill(
-        &self,
-        _ctx: &TtrpcContext,
-        req: api::KillRequest,
-    ) -> TtrpcResult<api::Empty> {
+    async fn kill(&self, _ctx: &TtrpcContext, req: api::KillRequest) -> TtrpcResult<api::Empty> {
         let containers = self.containers.lock().await;
         let state = containers
             .get(&req.id)
@@ -441,11 +435,11 @@ impl Task for RauhaShim {
                         {
                             if let Some(c) = resp.into_inner().container {
                                 if c.state == "exited" || c.state == "stopped" {
-                                    self.containers
-                                        .lock()
-                                        .await
-                                        .get_mut(&req.id)
-                                        .map(|s| s.exit_code = Some(0));
+                                    if let Some(state) =
+                                        self.containers.lock().await.get_mut(&req.id)
+                                    {
+                                        state.exit_code = Some(0);
+                                    }
                                     return Ok(api::WaitResponse {
                                         exit_status: 0,
                                         ..Default::default()

@@ -62,7 +62,7 @@ pub enum ZoneState {
 }
 
 /// Declarative policy defining what a zone can do.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ZonePolicy {
     pub capabilities: CapabilityPolicy,
     pub resources: ResourcePolicy,
@@ -70,19 +70,6 @@ pub struct ZonePolicy {
     pub filesystem: FilesystemPolicy,
     pub devices: DevicePolicy,
     pub syscalls: SyscallPolicy,
-}
-
-impl Default for ZonePolicy {
-    fn default() -> Self {
-        Self {
-            capabilities: CapabilityPolicy::default(),
-            resources: ResourcePolicy::default(),
-            network: NetworkPolicy::default(),
-            filesystem: FilesystemPolicy::default(),
-            devices: DevicePolicy::default(),
-            syscalls: SyscallPolicy::default(),
-        }
-    }
 }
 
 /// Allow-list only. Nothing not listed here is permitted.
@@ -386,9 +373,7 @@ impl ZonePolicy {
     /// translate it into their own kernel/control-plane state, so this keeps
     /// Rauha policy semantics from leaking across the boundary. Errors only
     /// arise from unknown capability names.
-    pub fn to_enforcement(
-        &self,
-    ) -> crate::error::Result<rauha_enforcer_api::ZoneEnforcement> {
+    pub fn to_enforcement(&self) -> crate::error::Result<rauha_enforcer_api::ZoneEnforcement> {
         let caps_mask = capabilities_to_mask(&self.capabilities.allowed)?;
 
         // ptrace is gated on the SYS_PTRACE capability being granted, accepting
@@ -603,15 +588,19 @@ mod tests {
 
     #[test]
     fn to_enforcement_ptrace_flag_from_capability() {
-        assert!(policy_with_caps(&["CAP_SYS_PTRACE"])
-            .to_enforcement()
-            .unwrap()
-            .allow_ptrace);
+        assert!(
+            policy_with_caps(&["CAP_SYS_PTRACE"])
+                .to_enforcement()
+                .unwrap()
+                .allow_ptrace
+        );
         // Short spelling, case-insensitive.
-        assert!(policy_with_caps(&["sys_ptrace"])
-            .to_enforcement()
-            .unwrap()
-            .allow_ptrace);
+        assert!(
+            policy_with_caps(&["sys_ptrace"])
+                .to_enforcement()
+                .unwrap()
+                .allow_ptrace
+        );
     }
 
     #[test]

@@ -90,14 +90,24 @@ pub fn generate_spec(
             .destination("/sys")
             .typ("sysfs")
             .source("sysfs")
-            .options(vec!["nosuid".into(), "noexec".into(), "nodev".into(), "ro".into()])
+            .options(vec![
+                "nosuid".into(),
+                "noexec".into(),
+                "nodev".into(),
+                "ro".into(),
+            ])
             .build()
             .unwrap(),
         MountBuilder::default()
             .destination("/dev")
             .typ("tmpfs")
             .source("tmpfs")
-            .options(vec!["nosuid".into(), "strictatime".into(), "mode=755".into(), "size=65536k".into()])
+            .options(vec![
+                "nosuid".into(),
+                "strictatime".into(),
+                "mode=755".into(),
+                "size=65536k".into(),
+            ])
             .build()
             .unwrap(),
         MountBuilder::default()
@@ -117,7 +127,13 @@ pub fn generate_spec(
             .destination("/dev/shm")
             .typ("tmpfs")
             .source("shm")
-            .options(vec!["nosuid".into(), "noexec".into(), "nodev".into(), "mode=1777".into(), "size=65536k".into()])
+            .options(vec![
+                "nosuid".into(),
+                "noexec".into(),
+                "nodev".into(),
+                "mode=1777".into(),
+                "size=65536k".into(),
+            ])
             .build()
             .unwrap(),
     ];
@@ -132,12 +148,7 @@ pub fn generate_spec(
     ];
     let namespaces: Vec<_> = ns_types
         .into_iter()
-        .map(|typ| {
-            LinuxNamespaceBuilder::default()
-                .typ(typ)
-                .build()
-                .unwrap()
-        })
+        .map(|typ| LinuxNamespaceBuilder::default().typ(typ).build().unwrap())
         .collect();
 
     let linux = LinuxBuilder::default()
@@ -257,7 +268,12 @@ mod tests {
             Some(vec!["FOO=from_image", "BAR=keep_me"]),
             None,
         );
-        let spec = make_container_spec("test", vec![], vec![("FOO", "overridden"), ("NEW", "added")], None);
+        let spec = make_container_spec(
+            "test",
+            vec![],
+            vec![("FOO", "overridden"), ("NEW", "added")],
+            None,
+        );
         let policy = ZonePolicy::default();
 
         let result = generate_spec(&img, &spec, &policy, "/rootfs").unwrap();

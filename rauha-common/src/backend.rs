@@ -1,7 +1,9 @@
 use crate::container::{ContainerHandle, ContainerSpec};
 use crate::error::Result;
 use crate::shim::{ShimRequest, ShimResponse};
-use crate::zone::{IsolationModel, IsolationReport, ZoneConfig, ZoneHandle, ZonePolicy, ZoneStats, ZoneType};
+use crate::zone::{
+    IsolationModel, IsolationReport, ZoneConfig, ZoneHandle, ZonePolicy, ZoneStats, ZoneType,
+};
 
 /// The core abstraction for platform-specific isolation.
 ///
@@ -44,7 +46,12 @@ pub trait IsolationBackend: Send + Sync {
     /// kernel state (BPF maps, cgroups, netns) that may be stale or missing
     /// after a crash. Implementations should be idempotent — calling this
     /// on an already-consistent zone should be a no-op.
-    fn recover_zone(&self, zone: &ZoneHandle, zone_type: ZoneType, policy: &ZonePolicy) -> Result<()>;
+    fn recover_zone(
+        &self,
+        zone: &ZoneHandle,
+        zone_type: ZoneType,
+        policy: &ZonePolicy,
+    ) -> Result<()>;
 
     /// Clean up orphaned kernel state not associated with any known zone.
     ///
@@ -95,11 +102,7 @@ pub trait IsolationBackend: Send + Sync {
     ///
     /// Returns a raw fd for bidirectional streaming. Only implemented by the
     /// macOS backend — Linux exec uses Unix sockets instead.
-    fn connect_vsock_port(
-        &self,
-        _zone_name: &str,
-        _port: u32,
-    ) -> Result<std::os::fd::OwnedFd> {
+    fn connect_vsock_port(&self, _zone_name: &str, _port: u32) -> Result<std::os::fd::OwnedFd> {
         Err(crate::error::RauhaError::BackendError(
             "vsock not available on this backend".into(),
         ))
