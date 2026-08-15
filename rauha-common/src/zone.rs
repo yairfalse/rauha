@@ -64,12 +64,23 @@ pub enum ZoneState {
 /// Declarative policy defining what a zone can do.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ZonePolicy {
+    #[serde(default)]
+    pub admission: PolicyAdmission,
     pub capabilities: CapabilityPolicy,
     pub resources: ResourcePolicy,
     pub network: NetworkPolicy,
     pub filesystem: FilesystemPolicy,
     pub devices: DevicePolicy,
     pub syscalls: SyscallPolicy,
+}
+
+/// Whether a backend must reject controls it cannot enforce.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PolicyAdmission {
+    #[default]
+    Strict,
+    Audit,
 }
 
 /// Allow-list only. Nothing not listed here is permitted.
@@ -135,7 +146,9 @@ impl Default for FilesystemPolicy {
         Self {
             root: String::new(),
             shared_layers: true,
-            writable_paths: vec!["/tmp".into(), "/var/log".into()],
+            // Empty means no path allow-list was requested. Backends must not
+            // pretend a non-empty allow-list is enforced when it is not.
+            writable_paths: Vec::new(),
         }
     }
 }
@@ -227,12 +240,19 @@ pub struct IsolationCheck {
 #[serde(deny_unknown_fields)]
 pub struct PolicyFile {
     pub zone: PolicyFileZone,
+    pub admission: Option<PolicyFileAdmission>,
     pub capabilities: Option<PolicyFileCapabilities>,
     pub resources: Option<PolicyFileResources>,
     pub network: Option<PolicyFileNetwork>,
     pub filesystem: Option<PolicyFileFilesystem>,
     pub devices: Option<PolicyFileDevices>,
     pub syscalls: Option<PolicyFileSyscalls>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PolicyFileAdmission {
+    pub mode: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -335,7 +355,7 @@ const LINUX_CAPABILITIES: &[&str] = &[
     "CAP_CHECKPOINT_RESTORE",
 ];
 
-fn canonical_capability_name(capability: &str) -> String {
+pub fn canonical_linux_capability_name(capability: &str) -> String {
     let upper = capability.to_uppercase();
     if upper.starts_with("CAP_") {
         upper
@@ -345,7 +365,7 @@ fn canonical_capability_name(capability: &str) -> String {
 }
 
 pub fn linux_capability_bit(capability: &str) -> Option<u8> {
-    let name = canonical_capability_name(capability);
+    let name = canonical_linux_capability_name(capability);
     LINUX_CAPABILITIES
         .iter()
         .position(|&known| known == name)
@@ -414,6 +434,16 @@ impl PolicyFile {
 
         let _ = zone_type; // used by caller for zone creation
 
+        let admission = match self.admission.as_ref().map(|a| a.mode.as_str()) {
+            None | Some("strict") => PolicyAdmission::Strict,
+            Some("audit") => PolicyAdmission::Audit,
+            Some(other) => {
+                return Err(crate::error::RauhaError::InvalidPolicy(format!(
+                    "unknown admission mode: {other}"
+                )))
+            }
+        };
+
         let capabilities = self
             .capabilities
             .as_ref()
@@ -477,10 +507,7 @@ impl PolicyFile {
                     .clone()
                     .unwrap_or_else(|| format!("{base_root}/zones/{}", self.zone.name)),
                 shared_layers: f.shared_layers.unwrap_or(true),
-                writable_paths: f
-                    .writable_paths
-                    .clone()
-                    .unwrap_or_else(|| vec!["/tmp".into(), "/var/log".into()]),
+                writable_paths: f.writable_paths.clone().unwrap_or_default(),
             })
             .unwrap_or_else(|| FilesystemPolicy {
                 root: format!("{base_root}/zones/{}", self.zone.name),
@@ -504,6 +531,7 @@ impl PolicyFile {
             .unwrap_or_default();
 
         Ok(ZonePolicy {
+            admission,
             capabilities,
             resources,
             network,

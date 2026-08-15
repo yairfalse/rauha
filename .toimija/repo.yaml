@@ -1,0 +1,53 @@
+repo:
+  name: rauha
+  role: agent sandbox runtime owning zone lifecycle, policy, evidence, and backend selection
+  not:
+  - Linux kernel enforcement implementation owned by Syva
+  - CI/work-graph evaluator owned by Sykli
+  - image registry, secret store, or general-purpose container runtime
+composition:
+  work: teko
+  default_worker: null
+  require_work: false
+context:
+  default_budget: 8000
+  important_docs:
+  - README.md
+  read_first: []
+  safe_to_ignore: []
+validation:
+  replace_inferred: false
+  fast: []
+  strict: []
+  full: []
+  privileged: []
+gates:
+  rust-format:
+    description: Rust formatting check
+    program: cargo
+    args: [fmt, --all, --check]
+    timeout_seconds: 60
+  rust-unit:
+    description: Portable unit tests for the policy, shim, and daemon security path
+    program: cargo
+    args: [test, -p, rauha-common, -p, rauha-shim, -p, rauhad, --locked]
+    timeout_seconds: 900
+  sykli-security:
+    description: Locked Sykli graph on the current Linux host or the sole running Lima VM
+    program: tests/security/run.sh
+    args: []
+    timeout_seconds: 3600
+gate_groups:
+  security-full:
+    gates: [rust-format, rust-unit, sykli-security]
+stewardship:
+  auto_sweep: true
+  sessions_retention_days: 7
+  runs_retention_days: 14
+  history_max_records: 500
+boundaries:
+- Rauha owns zone semantics, cross-zone policy, task APIs, evidence, receipts, backend selection, and macOS VM lifecycle.
+- Linux container construction delegates to a mature OCI executor; the custom bootstrap is temporary.
+- Strict admission fails closed when any requested primitive is unavailable; degraded execution requires explicit audit mode.
+- Sykli remains an external Rust binary; this repository owns only sykli.json, sykli.lock, and its invocation.
+- Repository configuration never contains credentials or secret material.

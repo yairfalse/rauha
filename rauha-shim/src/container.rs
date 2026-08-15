@@ -89,6 +89,37 @@ pub fn fork_and_exec(
     let cwd_cstr = CString::new(cwd.as_str())?;
 
     let hostname = spec.hostname().clone();
+    let mut unshare_flags = nix::sched::CloneFlags::CLONE_NEWNS;
+    let mut netns = None;
+    if let Some(linux) = spec.linux().as_ref() {
+        if let Some(namespaces) = linux.namespaces().as_ref() {
+            for namespace in namespaces {
+                match namespace.typ() {
+                    oci_spec::runtime::LinuxNamespaceType::Uts => {
+                        unshare_flags |= nix::sched::CloneFlags::CLONE_NEWUTS;
+                    }
+                    oci_spec::runtime::LinuxNamespaceType::Ipc => {
+                        unshare_flags |= nix::sched::CloneFlags::CLONE_NEWIPC;
+                    }
+                    oci_spec::runtime::LinuxNamespaceType::Network => {
+                        let path = namespace.path().as_ref().ok_or_else(|| {
+                            anyhow::anyhow!("network namespace requires an existing path")
+                        })?;
+                        netns = Some(std::fs::File::open(path)?);
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    if hostname.is_some() && !unshare_flags.contains(nix::sched::CloneFlags::CLONE_NEWUTS) {
+        anyhow::bail!("hostname requires a private UTS namespace");
+    }
+    let process_security = ProcessSecurity::from_process(process)?;
+    let cap_last_cap = std::fs::read_to_string("/proc/sys/kernel/cap_last_cap")?
+        .trim()
+        .parse::<u32>()?
+        .min(63);
 
     // Pre-allocate log file paths as CStrings for signal-safe use after fork.
     let stdout_log =
@@ -140,9 +171,20 @@ pub fn fork_and_exec(
             // Error reporting in the child must be async-signal-safe: static
             // byte messages + libc::write, never format!/alloc. The specific
             // errno is dropped; the failing operation is still identifiable.
-            if nix::sched::unshare(nix::sched::CloneFlags::CLONE_NEWNS).is_err() {
+            if let Some(netns) = netns.as_ref() {
+                if nix::sched::setns(netns, nix::sched::CloneFlags::CLONE_NEWNET).is_err() {
+                    unsafe {
+                        let msg = b"rauha-shim: setns(CLONE_NEWNET) failed\n";
+                        let _ = libc::write(2, msg.as_ptr() as _, msg.len());
+                        libc::_exit(1);
+                    }
+                }
+            }
+            drop(netns);
+
+            if nix::sched::unshare(unshare_flags).is_err() {
                 unsafe {
-                    let msg = b"rauha-shim: unshare(CLONE_NEWNS) failed\n";
+                    let msg = b"rauha-shim: namespace unshare failed\n";
                     let _ = libc::write(2, msg.as_ptr() as _, msg.len());
                     libc::_exit(1);
                 }
@@ -175,6 +217,17 @@ pub fn fork_and_exec(
             // Set hostname.
             if let Some(ref h) = hostname {
                 let _ = nix::unistd::sethostname(h);
+            }
+
+            // Drop privilege while still outside the zone cgroup. This is the
+            // final trusted bootstrap step; after enrollment the BPF capable()
+            // allow-list applies and must not be needed to remove privileges.
+            if apply_process_security(process_security, cap_last_cap).is_err() {
+                unsafe {
+                    let msg = b"rauha-shim: failed to apply process security\n";
+                    let _ = libc::write(2, msg.as_ptr() as _, msg.len());
+                    libc::_exit(1);
+                }
             }
 
             // Signal the parent that privileged setup is complete and it is
@@ -279,6 +332,135 @@ pub fn fork_and_exec(
 }
 
 #[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ProcessSecurity {
+    bounding: u64,
+    effective: u64,
+    inheritable: u64,
+    permitted: u64,
+    ambient: u64,
+    no_new_privileges: bool,
+}
+
+#[cfg(target_os = "linux")]
+impl ProcessSecurity {
+    pub(crate) fn from_process(process: &oci_spec::runtime::Process) -> anyhow::Result<Self> {
+        let capabilities = process
+            .capabilities()
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("process.capabilities is required"))?;
+
+        Ok(Self {
+            bounding: capability_mask(capabilities.bounding().as_ref())?,
+            effective: capability_mask(capabilities.effective().as_ref())?,
+            inheritable: capability_mask(capabilities.inheritable().as_ref())?,
+            permitted: capability_mask(capabilities.permitted().as_ref())?,
+            ambient: capability_mask(capabilities.ambient().as_ref())?,
+            no_new_privileges: process.no_new_privileges().unwrap_or(false),
+        })
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn capability_mask(capabilities: Option<&oci_spec::runtime::Capabilities>) -> anyhow::Result<u64> {
+    capabilities
+        .into_iter()
+        .flatten()
+        .try_fold(0u64, |mask, capability| {
+            let name = capability.to_string();
+            let bit = rauha_common::zone::linux_capability_bit(&name)
+                .ok_or_else(|| anyhow::anyhow!("unsupported OCI capability: {name}"))?;
+            Ok(mask | (1u64 << bit))
+        })
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn apply_process_security(
+    security: ProcessSecurity,
+    cap_last_cap: u32,
+) -> anyhow::Result<()> {
+    #[repr(C)]
+    struct UserCapHeader {
+        version: u32,
+        pid: i32,
+    }
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct UserCapData {
+        effective: u32,
+        permitted: u32,
+        inheritable: u32,
+    }
+
+    for capability in 0..=cap_last_cap {
+        if security.bounding & (1u64 << capability) == 0 {
+            let rc = unsafe { libc::prctl(libc::PR_CAPBSET_DROP, capability, 0, 0, 0) };
+            if rc != 0 {
+                return Err(std::io::Error::last_os_error().into());
+            }
+        }
+    }
+
+    let header = UserCapHeader {
+        version: 0x2008_0522, // _LINUX_CAPABILITY_VERSION_3
+        pid: 0,
+    };
+    let data = [
+        UserCapData {
+            effective: security.effective as u32,
+            permitted: security.permitted as u32,
+            inheritable: security.inheritable as u32,
+        },
+        UserCapData {
+            effective: (security.effective >> 32) as u32,
+            permitted: (security.permitted >> 32) as u32,
+            inheritable: (security.inheritable >> 32) as u32,
+        },
+    ];
+    let rc = unsafe { libc::syscall(libc::SYS_capset, &header, data.as_ptr()) };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+
+    let rc = unsafe {
+        libc::prctl(
+            libc::PR_CAP_AMBIENT,
+            libc::PR_CAP_AMBIENT_CLEAR_ALL,
+            0,
+            0,
+            0,
+        )
+    };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    for capability in 0..=cap_last_cap {
+        if security.ambient & (1u64 << capability) != 0 {
+            let rc = unsafe {
+                libc::prctl(
+                    libc::PR_CAP_AMBIENT,
+                    libc::PR_CAP_AMBIENT_RAISE,
+                    capability,
+                    0,
+                    0,
+                )
+            };
+            if rc != 0 {
+                return Err(std::io::Error::last_os_error().into());
+            }
+        }
+    }
+
+    if security.no_new_privileges {
+        let rc = unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) };
+        if rc != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
 fn cstring_vec(values: &[String], field: &str) -> anyhow::Result<Vec<std::ffi::CString>> {
     values
         .iter()
@@ -292,7 +474,8 @@ fn cstring_vec(values: &[String], field: &str) -> anyhow::Result<Vec<std::ffi::C
 
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
-    use super::cstring_vec;
+    use super::{cstring_vec, ProcessSecurity};
+    use oci_spec::runtime::{Capabilities, LinuxCapabilitiesBuilder, ProcessBuilder};
 
     #[test]
     fn rejects_interior_nul_in_process_args() {
@@ -300,6 +483,31 @@ mod tests {
             .expect_err("interior NUL must be rejected");
 
         assert!(err.to_string().contains("process.args[0]"));
+    }
+
+    #[test]
+    fn empty_oci_capabilities_mean_zero_process_capabilities() {
+        let capabilities = LinuxCapabilitiesBuilder::default()
+            .bounding(Capabilities::default())
+            .effective(Capabilities::default())
+            .inheritable(Capabilities::default())
+            .permitted(Capabilities::default())
+            .ambient(Capabilities::default())
+            .build()
+            .unwrap();
+        let process = ProcessBuilder::default()
+            .capabilities(capabilities)
+            .no_new_privileges(true)
+            .build()
+            .unwrap();
+
+        assert_eq!(
+            ProcessSecurity::from_process(&process).unwrap(),
+            ProcessSecurity {
+                no_new_privileges: true,
+                ..Default::default()
+            }
+        );
     }
 }
 

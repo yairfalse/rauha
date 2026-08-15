@@ -215,20 +215,8 @@ pub fn apply_zone_rules(zone_name: &str, veth_name: &str, policy: &NetworkPolicy
                 ])?;
             }
 
-            // If no egress rules specified, allow outbound to non-zone interfaces
-            // (internet) but NOT cross-zone traffic (which must be in allowed_zones).
-            if policy.allowed_egress.is_empty() {
-                run_nft(&[
-                    "add",
-                    "rule",
-                    TABLE_FAMILY,
-                    TABLE_NAME,
-                    &chain_name,
-                    &format!("iifname \"{veth_name}\" oifname != \"veth-*\" accept"),
-                ])?;
-            }
-
-            // Default: drop remaining (blocks unlisted cross-zone traffic).
+            // Empty egress is deny-all. Default-drop also covers IPv6, while
+            // explicit IPv4 destinations above use `ip daddr`.
             run_nft(&["add", "rule", TABLE_FAMILY, TABLE_NAME, &chain_name, "drop"])?;
 
             // Jump to the zone chain from forward.

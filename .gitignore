@@ -4,3 +4,4 @@ target/
 .teko/
 .toimija/current.*
 .toimija/sessions/
+.toimija/runs/

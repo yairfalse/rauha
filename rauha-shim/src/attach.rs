@@ -209,6 +209,7 @@ pub fn fork_and_exec_pty(
     container_id: &str,
     command: &[String],
     env: &[String],
+    spec_json: &str,
     rootfs_root: &Path,
 ) -> anyhow::Result<(i32, u32)> {
     use nix::pty::openpty;
@@ -242,21 +243,31 @@ pub fn fork_and_exec_pty(
 
     let c_env = cstring_vec(env, "exec.env")?;
     let term = CString::new("TERM=xterm-256color")?;
+    let spec: oci_spec::runtime::Spec = serde_json::from_str(spec_json)?;
+    let process = spec
+        .process()
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("spec missing process"))?;
+    let process_security = crate::container::ProcessSecurity::from_process(process)?;
+    let cap_last_cap = std::fs::read_to_string("/proc/sys/kernel/cap_last_cap")?
+        .trim()
+        .parse::<u32>()?
+        .min(63);
 
-    // Sync pipe for cgroup enrollment.
-    let (pipe_rd, pipe_wr) = nix::unistd::pipe()?;
-    let rd_raw = pipe_rd.as_raw_fd();
-    let wr_raw = pipe_wr.as_raw_fd();
+    // Two-phase handshake: trusted chroot and privilege drop happen before
+    // enrollment; image code starts only after enrollment succeeds.
+    let (setup_rd, setup_wr) = nix::unistd::pipe()?;
+    let (go_rd, go_wr) = nix::unistd::pipe()?;
+    let setup_rd_raw = setup_rd.as_raw_fd();
+    let setup_wr_raw = setup_wr.as_raw_fd();
+    let go_rd_raw = go_rd.as_raw_fd();
+    let go_wr_raw = go_wr.as_raw_fd();
 
     match unsafe { unistd::fork() }? {
         ForkResult::Child => {
-            drop(pipe_wr);
+            drop(setup_rd);
+            drop(go_wr);
             drop(pty.master);
-
-            // Wait for cgroup enrollment.
-            let mut buf = [0u8; 1];
-            let _ = nix::unistd::read(rd_raw, &mut buf);
-            drop(pipe_rd);
 
             // New session + set controlling terminal.
             let _ = nix::unistd::setsid();
@@ -273,14 +284,36 @@ pub fn fork_and_exec_pty(
             unsafe { libc::ioctl(0, libc::TIOCSCTTY, 0) };
 
             // Chroot into container rootfs.
-            if let Err(e) = nix::unistd::chroot(&rootfs) {
-                let msg = format!("chroot failed: {e}\n");
+            if nix::unistd::chroot(&rootfs).is_err() {
                 unsafe {
+                    let msg = b"rauha-shim: exec chroot failed\n";
                     let _ = libc::write(2, msg.as_ptr() as _, msg.len());
                     libc::_exit(1);
                 }
             }
             let _ = nix::unistd::chdir("/");
+
+            if crate::container::apply_process_security(process_security, cap_last_cap).is_err() {
+                unsafe {
+                    let msg = b"rauha-shim: exec process security failed\n";
+                    let _ = libc::write(2, msg.as_ptr() as _, msg.len());
+                    libc::_exit(1);
+                }
+            }
+
+            let _ = nix::unistd::write(unsafe { BorrowedFd::borrow_raw(setup_wr_raw) }, &[1u8]);
+            drop(setup_wr);
+
+            let mut buf = [0u8; 1];
+            let enrolled = matches!(nix::unistd::read(go_rd_raw, &mut buf), Ok(1));
+            drop(go_rd);
+            if !enrolled {
+                unsafe {
+                    let msg = b"rauha-shim: exec cgroup enrollment failed\n";
+                    let _ = libc::write(2, msg.as_ptr() as _, msg.len());
+                    libc::_exit(125);
+                }
+            }
 
             // Set environment using libc directly — Rust's std::env functions
             // are NOT async-signal-safe (they hold a global mutex that may be
@@ -294,28 +327,45 @@ pub fn fork_and_exec_pty(
                 libc::putenv(term.as_ptr() as *mut libc::c_char);
             }
 
-            let err = nix::unistd::execvp(&c_args[0], &c_args);
-            let msg = format!("execvp failed: {err:?}\n");
+            let _ = nix::unistd::execvp(&c_args[0], &c_args);
             unsafe {
+                let msg = b"rauha-shim: execvp failed\n";
                 let _ = libc::write(2, msg.as_ptr() as _, msg.len());
                 libc::_exit(127);
             }
         }
         ForkResult::Parent { child } => {
-            drop(pipe_rd);
+            drop(setup_wr);
+            drop(go_rd);
             drop(pty.slave);
 
             let child_pid = child.as_raw() as u32;
 
+            let mut buf = [0u8; 1];
+            let setup_ok = matches!(nix::unistd::read(setup_rd_raw, &mut buf), Ok(1));
+            drop(setup_rd);
+            if !setup_ok {
+                drop(go_wr);
+                let _ = nix::sys::wait::waitpid(child, None);
+                anyhow::bail!("exec child failed during trusted setup");
+            }
+
             // Enroll child in zone cgroup.
             let cgroup_path = format!("/sys/fs/cgroup/rauha.slice/zone-{zone_name}/cgroup.procs");
             if let Err(e) = std::fs::write(&cgroup_path, child_pid.to_string()) {
-                tracing::warn!(%e, cgroup = cgroup_path, "failed to enroll exec child in cgroup");
+                let _ = nix::sys::signal::kill(child, nix::sys::signal::Signal::SIGKILL);
+                let _ = nix::sys::wait::waitpid(child, None);
+                drop(go_wr);
+                anyhow::bail!("failed to enroll exec child in zone cgroup {cgroup_path}: {e}");
             }
 
             // Signal child to proceed.
-            let _ = nix::unistd::write(unsafe { BorrowedFd::borrow_raw(wr_raw) }, &[1u8]);
-            drop(pipe_wr);
+            let signaled = nix::unistd::write(unsafe { BorrowedFd::borrow_raw(go_wr_raw) }, &[1u8]);
+            drop(go_wr);
+            if !matches!(signaled, Ok(1)) {
+                let _ = nix::sys::wait::waitpid(child, None);
+                anyhow::bail!("exec child exited before workload start");
+            }
 
             // Prevent Rust from closing master_fd when pty.master drops —
             // the relay thread owns the fd and closes it via libc::close()
@@ -379,6 +429,7 @@ pub fn fork_and_exec_pty(
     _container_id: &str,
     _command: &[String],
     _env: &[String],
+    _spec_json: &str,
     _rootfs_root: &Path,
 ) -> anyhow::Result<(i32, u32)> {
     anyhow::bail!("PTY exec is only supported on Linux")

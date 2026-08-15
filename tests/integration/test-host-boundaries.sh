@@ -8,6 +8,7 @@ ZONE="test-host-boundaries-$$"
 NAME="boundary-$$"
 IMAGE=${TEST_IMAGE:-alpine:latest}
 HOSTNAME_BEFORE=$(hostname)
+POLICY_FILE=$(mktemp /tmp/rauha-host-boundaries-XXXXXX.toml)
 CONTAINER_ID=""
 SENTINEL_PID=""
 FAILURES=0
@@ -27,6 +28,7 @@ cleanup() {
         $RAUHA delete "$CONTAINER_ID" --force 2>/dev/null || true
     fi
     $RAUHA zone delete "$ZONE" --force 2>/dev/null || true
+    rm -f "$POLICY_FILE"
     if [ "$(hostname)" != "$HOSTNAME_BEFORE" ]; then
         hostname "$HOSTNAME_BEFORE"
     fi
@@ -35,7 +37,41 @@ trap cleanup EXIT
 
 echo "=== Test: strict host boundaries ==="
 $RAUHA image pull "$IMAGE" >/dev/null
-$RAUHA zone create --name "$ZONE" --policy "$ROOT/policies/strict.toml"
+
+if STRICT_ERROR=$($RAUHA zone create --name "$ZONE-full" --policy "$ROOT/policies/strict.toml" 2>&1); then
+    fail "full strict policy was admitted despite unsupported controls"
+    $RAUHA zone delete "$ZONE-full" --force 2>/dev/null || true
+elif ! grep -q "strict policy requests unsupported Linux controls" <<<"$STRICT_ERROR"; then
+    fail "full strict policy failed without an unsupported-control admission result: $STRICT_ERROR"
+else
+    echo "PASS: unsupported full strict policy rejected"
+fi
+
+cat >"$POLICY_FILE" <<TOML
+[zone]
+name = "host-boundaries"
+type = "non-global"
+
+[admission]
+mode = "strict"
+
+[capabilities]
+allowed = []
+
+[resources]
+cpu_shares = 512
+memory_limit = "1Gi"
+io_weight = 50
+pids_max = 128
+
+[network]
+mode = "isolated"
+allowed_zones = []
+allowed_egress = []
+allowed_ingress = []
+TOML
+
+$RAUHA zone create --name "$ZONE" --policy "$POLICY_FILE"
 CONTAINER_ID=$($RAUHA run --zone "$ZONE" --name "$NAME" "$IMAGE" /bin/sleep 120)
 
 PID=""
@@ -72,10 +108,8 @@ WORKLOAD_PIDNS=$(stat -Lc '%d:%i' "/proc/$PID/ns/pid")
 
 CAPEFF=$(awk '/^CapEff:/ { print $2 }' "/proc/$PID/status")
 NO_NEW_PRIVS=$(awk '/^NoNewPrivs:/ { print $2 }' "/proc/$PID/status")
-SECCOMP=$(awk '/^Seccomp:/ { print $2 }' "/proc/$PID/status")
 [ "$CAPEFF" = 0000000000000000 ] || fail "strict policy has effective capabilities $CAPEFF"
 [ "$NO_NEW_PRIVS" = 1 ] || fail "NoNewPrivs is $NO_NEW_PRIVS, expected 1"
-[ "$SECCOMP" = 2 ] || fail "Seccomp is $SECCOMP, expected filter mode (2)"
 
 sleep 120 &
 SENTINEL_PID=$!

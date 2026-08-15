@@ -294,6 +294,13 @@ impl ZoneRegistry {
             .zone_name(name)
             .error("policy_apply_failed", "backend", e.to_string())
             .emit();
+            if let Err(cleanup_error) = self.backend.destroy_zone(&handle) {
+                tracing::error!(
+                    zone = name,
+                    %cleanup_error,
+                    "failed to roll back zone after policy rejection"
+                );
+            }
             return Err(e);
         }
 

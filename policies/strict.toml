@@ -2,6 +2,9 @@
 name = "strict"
 type = "non-global"
 
+[admission]
+mode = "strict"
+
 [capabilities]
 allowed = []
 

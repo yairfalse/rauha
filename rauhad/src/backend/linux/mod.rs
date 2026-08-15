@@ -106,6 +106,9 @@ pub struct LinuxBackend {
     /// Registered inodes per zone, for correct cleanup without re-walking.
     /// Key is zone name, value is the inode list registered in INODE_ZONE_MAP.
     registered_inodes: Mutex<HashMap<String, Vec<u64>>>,
+    /// Last admitted policy per zone. Container construction must use the same
+    /// capability allow-list that was installed in the kernel policy map.
+    zone_policies: Mutex<HashMap<String, ZonePolicy>>,
     /// IP address allocator for zone networking.
     ip_allocator: Mutex<IpAllocator>,
 }
@@ -147,6 +150,7 @@ impl LinuxBackend {
             zone_name_map: Mutex::new(HashMap::new()),
             shim_connections: Mutex::new(HashMap::new()),
             registered_inodes: Mutex::new(HashMap::new()),
+            zone_policies: Mutex::new(HashMap::new()),
             ip_allocator: Mutex::new(ip_allocator),
         })
     }
@@ -267,11 +271,14 @@ impl LinuxBackend {
     }
 
     /// Apply nftables forward rules for a zone based on its network policy.
-    fn apply_nftables_for_zone(&self, zone: &ZoneHandle, net_policy: &NetworkPolicy) -> Result<()> {
+    fn apply_nftables_for_zone(&self, zone: &ZoneHandle, policy: &ZonePolicy) -> Result<()> {
         let veth_name = network::veth_host_name_for(&zone.name);
 
-        if let Err(e) = nftables::apply_zone_rules(&zone.name, &veth_name, net_policy) {
-            tracing::warn!(%e, zone = zone.name, "failed to apply nftables rules — network filtering inactive");
+        if let Err(e) = nftables::apply_zone_rules(&zone.name, &veth_name, &policy.network) {
+            if policy.admission == PolicyAdmission::Strict {
+                return Err(e);
+            }
+            tracing::warn!(%e, zone = zone.name, admission = "audit", status = "unsupported", "network filtering inactive");
         }
         Ok(())
     }
@@ -326,6 +333,66 @@ impl LinuxBackend {
     }
 }
 
+fn admit_linux_policy(policy: &ZonePolicy) -> Result<()> {
+    let mut unsupported = Vec::new();
+    if !policy.filesystem.writable_paths.is_empty() {
+        unsupported.push("filesystem.writable_paths");
+    }
+    if !policy.devices.allowed.is_empty() {
+        unsupported.push("devices.allowed");
+    }
+    if !policy.syscalls.deny.is_empty() {
+        unsupported.push("syscalls.deny");
+    }
+    if !policy.network.allowed_ingress.is_empty() {
+        unsupported.push("network.allowed_ingress");
+    }
+
+    if unsupported.is_empty() {
+        return Ok(());
+    }
+
+    let controls = unsupported.join(", ");
+    match policy.admission {
+        PolicyAdmission::Strict => Err(RauhaError::InvalidPolicy(format!(
+            "strict policy requests unsupported Linux controls: {controls}"
+        ))),
+        PolicyAdmission::Audit => {
+            tracing::warn!(
+                admission = "audit",
+                status = "unsupported",
+                controls,
+                "admitting policy with unsupported controls"
+            );
+            Ok(())
+        }
+    }
+}
+
+fn oci_capabilities(policy: &ZonePolicy) -> Result<oci_spec::runtime::LinuxCapabilities> {
+    use oci_spec::runtime::{Capabilities, Capability, LinuxCapabilitiesBuilder};
+
+    let capabilities = policy
+        .capabilities
+        .allowed
+        .iter()
+        .map(|name| {
+            rauha_common::zone::canonical_linux_capability_name(name)
+                .parse::<Capability>()
+                .map_err(|_| RauhaError::InvalidPolicy(format!("unknown capability: {name}")))
+        })
+        .collect::<Result<Capabilities>>()?;
+
+    LinuxCapabilitiesBuilder::default()
+        .bounding(capabilities.clone())
+        .effective(capabilities.clone())
+        .inheritable(capabilities.clone())
+        .permitted(capabilities.clone())
+        .ambient(capabilities)
+        .build()
+        .map_err(|e| RauhaError::BackendError(format!("failed to build OCI capabilities: {e}")))
+}
+
 /// Find the rauha-shim binary.
 fn find_shim_binary() -> Result<PathBuf> {
     let project_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -365,6 +432,7 @@ impl IsolationBackend for LinuxBackend {
         zone_type: ZoneType,
         policy: &ZonePolicy,
     ) -> Result<()> {
+        admit_linux_policy(policy)?;
         tracing::info!(zone = zone.name, "recovering zone state from metadata");
 
         // Allocate a compact zone_id (these are ephemeral, not persisted).
@@ -406,6 +474,8 @@ impl IsolationBackend for LinuxBackend {
         self.enforcer.set_zone_policy(zone_id, policy)?;
         self.enforcer
             .add_zone_member(cgroup_id, zone_id, zone_type)?;
+        lock_backend(&self.zone_policies, "zone_policies")?
+            .insert(zone.name.clone(), policy.clone());
 
         tracing::info!(zone = zone.name, zone_id, cgroup_id, "zone recovered");
         Ok(())
@@ -453,6 +523,7 @@ impl IsolationBackend for LinuxBackend {
     }
 
     fn create_zone(&self, config: &ZoneConfig) -> Result<ZoneHandle> {
+        admit_linux_policy(&config.policy)?;
         tracing::info!(zone = config.name, backend = "linux-ebpf", "creating zone");
 
         let zone_uuid = Uuid::new_v4();
@@ -621,6 +692,7 @@ impl IsolationBackend for LinuxBackend {
         self.cgroup.destroy_zone_cgroup(&zone.name)?;
 
         lock_backend(&self.zone_name_map, "zone_name_map")?.remove(&zone.name);
+        lock_backend(&self.zone_policies, "zone_policies")?.remove(&zone.name);
 
         // Clean up shim socket.
         let socket_path = Self::shim_socket_path(&zone.name);
@@ -631,6 +703,7 @@ impl IsolationBackend for LinuxBackend {
     }
 
     fn enforce_policy(&self, zone: &ZoneHandle, policy: &ZonePolicy) -> Result<()> {
+        admit_linux_policy(policy)?;
         tracing::info!(zone = zone.name, "enforcing policy");
 
         // Update BPF policy map. Route through the enforcement seam's neutral
@@ -645,15 +718,19 @@ impl IsolationBackend for LinuxBackend {
         }
 
         // Apply nftables forward rules for this zone.
-        self.apply_nftables_for_zone(zone, &policy.network)?;
+        self.apply_nftables_for_zone(zone, policy)?;
 
         // Update cgroup resource limits.
         self.cgroup.apply_resources(&zone.name, &policy.resources)?;
+
+        lock_backend(&self.zone_policies, "zone_policies")?
+            .insert(zone.name.clone(), policy.clone());
 
         Ok(())
     }
 
     fn hot_reload_policy(&self, zone: &ZoneHandle, policy: &ZonePolicy) -> Result<()> {
+        admit_linux_policy(policy)?;
         tracing::info!(zone = zone.name, "hot-reloading policy");
 
         // BPF HashMap insert is atomic — kernel sees old or new, never partial.
@@ -665,10 +742,13 @@ impl IsolationBackend for LinuxBackend {
         }
 
         // Re-apply nftables rules.
-        self.apply_nftables_for_zone(zone, &policy.network)?;
+        self.apply_nftables_for_zone(zone, policy)?;
 
         // Update cgroup limits.
         self.cgroup.apply_resources(&zone.name, &policy.resources)?;
+
+        lock_backend(&self.zone_policies, "zone_policies")?
+            .insert(zone.name.clone(), policy.clone());
 
         Ok(())
     }
@@ -684,6 +764,16 @@ impl IsolationBackend for LinuxBackend {
         self.ensure_shim(&zone.name)?;
 
         let container_id = Uuid::new_v4();
+        let policy = lock_backend(&self.zone_policies, "zone_policies")?
+            .get(&zone.name)
+            .cloned()
+            .ok_or_else(|| {
+                RauhaError::BackendError(format!(
+                    "zone {} has no admitted policy; refusing container creation",
+                    zone.name
+                ))
+            })?;
+        let capabilities = oci_capabilities(&policy)?;
 
         // Prepare rootfs for this container.
         // If overlay_layers is available, mount overlayfs (O(1) creation).
@@ -722,6 +812,36 @@ impl IsolationBackend for LinuxBackend {
         }
 
         // Generate OCI runtime spec.
+        use oci_spec::runtime::{LinuxBuilder, LinuxNamespaceBuilder, LinuxNamespaceType};
+        let mut namespaces = vec![
+            LinuxNamespaceBuilder::default()
+                .typ(LinuxNamespaceType::Mount)
+                .build()
+                .unwrap(),
+            LinuxNamespaceBuilder::default()
+                .typ(LinuxNamespaceType::Uts)
+                .build()
+                .unwrap(),
+            LinuxNamespaceBuilder::default()
+                .typ(LinuxNamespaceType::Ipc)
+                .build()
+                .unwrap(),
+        ];
+        if policy.network.mode != NetworkMode::Host {
+            namespaces.push(
+                LinuxNamespaceBuilder::default()
+                    .typ(LinuxNamespaceType::Network)
+                    .path(format!("/var/run/netns/rauha-{}", zone.name))
+                    .build()
+                    .unwrap(),
+            );
+        }
+        let linux = LinuxBuilder::default()
+            .namespaces(namespaces)
+            .build()
+            .map_err(|e| {
+                RauhaError::BackendError(format!("failed to build OCI Linux spec: {e}"))
+            })?;
         let spec_json = serde_json::to_string(
             &oci_spec::runtime::SpecBuilder::default()
                 .version("1.0.2")
@@ -750,9 +870,12 @@ impl IsolationBackend for LinuxBackend {
                         )
                         .cwd(spec.working_dir.as_deref().unwrap_or("/"))
                         .terminal(false)
+                        .capabilities(capabilities)
+                        .no_new_privileges(true)
                         .build()
                         .unwrap(),
                 )
+                .linux(linux)
                 .hostname(spec.name.clone())
                 .build()
                 .unwrap(),
@@ -1100,7 +1223,8 @@ fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> Result<()
 
 #[cfg(test)]
 mod tests {
-    use super::lock_backend;
+    use super::{admit_linux_policy, lock_backend, oci_capabilities};
+    use rauha_common::zone::{PolicyAdmission, ZonePolicy};
     use std::sync::{Arc, Mutex};
 
     #[test]
@@ -1116,5 +1240,27 @@ mod tests {
 
         let err = lock_backend(&mutex, "test_state").expect_err("poisoned lock must fail closed");
         assert!(err.to_string().contains("test_state"));
+    }
+
+    #[test]
+    fn strict_admission_rejects_unsupported_controls() {
+        let mut policy = ZonePolicy::default();
+        policy.filesystem.writable_paths = vec!["/tmp".into()];
+
+        let err = admit_linux_policy(&policy).expect_err("strict policy must fail closed");
+        assert!(err.to_string().contains("filesystem.writable_paths"));
+
+        policy.admission = PolicyAdmission::Audit;
+        admit_linux_policy(&policy).expect("audit mode explicitly accepts degraded admission");
+    }
+
+    #[test]
+    fn empty_policy_builds_empty_oci_capability_sets() {
+        let capabilities = oci_capabilities(&ZonePolicy::default()).unwrap();
+        assert!(capabilities.bounding().as_ref().unwrap().is_empty());
+        assert!(capabilities.effective().as_ref().unwrap().is_empty());
+        assert!(capabilities.inheritable().as_ref().unwrap().is_empty());
+        assert!(capabilities.permitted().as_ref().unwrap().is_empty());
+        assert!(capabilities.ambient().as_ref().unwrap().is_empty());
     }
 }
