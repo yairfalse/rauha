@@ -183,6 +183,17 @@ impl LinuxEnforcer {
         })
     }
 
+    pub(super) fn inodes_match(&self, inodes: &[u64], zone_id: u32) -> Result<bool> {
+        self.with_bpf("rootfs inode verification", |bpf| {
+            for &inode in inodes {
+                if MapManager::inode_zone(bpf, inode)? != Some(zone_id) {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        })
+    }
+
     pub(super) fn allow_zone_comm(&self, src_zone: u32, dst_zone: u32) -> Result<()> {
         self.with_bpf("allowed zone communication", |bpf| {
             MapManager::allow_zone_comm(bpf, src_zone, dst_zone)

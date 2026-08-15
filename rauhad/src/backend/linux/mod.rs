@@ -303,6 +303,26 @@ impl LinuxBackend {
         Ok(())
     }
 
+    fn restore_rootfs_inodes(&self, zone_name: &str, zone_id: u32) -> Result<()> {
+        let expected = collect_zone_rootfs_inodes(&self.root, zone_name)?;
+        if expected.is_empty() && self.cgroup.zone_has_processes(zone_name)? {
+            return Err(RauhaError::BackendError(
+                "live recovered zone has no discoverable rootfs inodes".into(),
+            ));
+        }
+        let inserted = self.enforcer.insert_inodes(&expected, zone_id)?;
+        lock_backend(&self.registered_inodes, "registered_inodes")?
+            .insert(zone_name.to_string(), inserted.clone());
+        if inserted.len() != expected.len() {
+            return Err(RauhaError::BackendError(format!(
+                "rootfs inode recovery incomplete: registered {} of {}",
+                inserted.len(),
+                expected.len()
+            )));
+        }
+        Ok(())
+    }
+
     /// Sync the ZONE_ALLOWED_COMMS BPF map for defense-in-depth.
     ///
     /// Revokes any previously allowed comms for this zone that are no longer
@@ -413,6 +433,48 @@ fn oci_capabilities(policy: &ZonePolicy) -> Result<oci_spec::runtime::LinuxCapab
         .map_err(|e| RauhaError::BackendError(format!("failed to build OCI capabilities: {e}")))
 }
 
+fn collect_zone_rootfs_inodes(root: &str, zone_name: &str) -> Result<Vec<u64>> {
+    let containers = PathBuf::from(root)
+        .join("zones")
+        .join(zone_name)
+        .join("containers");
+    if !containers.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut inodes = BTreeSet::new();
+    let entries = std::fs::read_dir(&containers).map_err(|e| RauhaError::RootfsError {
+        message: format!("failed to enumerate {}: {e}", containers.display()),
+    })?;
+    for entry in entries {
+        let container = entry
+            .map_err(|e| RauhaError::RootfsError {
+                message: format!("failed to enumerate {}: {e}", containers.display()),
+            })?
+            .path();
+        let merged = container.join("merged");
+        let legacy = container.join("rootfs");
+        let rootfs = if merged.is_dir() {
+            merged
+        } else if legacy.is_dir() {
+            legacy
+        } else {
+            continue;
+        };
+        let remaining = rauha_ebpf_common::MAX_INODES.saturating_sub(inodes.len() as u32);
+        if remaining == 0 {
+            return Err(RauhaError::RootfsError {
+                message: format!(
+                    "zone rootfs inode count exceeds enforcement capacity of {}",
+                    rauha_ebpf_common::MAX_INODES
+                ),
+            });
+        }
+        inodes.extend(maps::collect_rootfs_inodes(&rootfs, remaining)?);
+    }
+    Ok(inodes.into_iter().collect())
+}
+
 /// Find the rauha-shim binary.
 fn find_shim_binary() -> Result<PathBuf> {
     let project_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -505,6 +567,14 @@ impl IsolationBackend for LinuxBackend {
             self.enforcer
                 .add_zone_member(cgroup_id, zone_id, zone_type)?;
             membership_installed = true;
+            match self.restore_rootfs_inodes(&zone.name, zone_id) {
+                Ok(()) => {}
+                Err(e) if policy.admission == PolicyAdmission::Strict => return Err(e),
+                Err(e) => {
+                    self.record_degradation(&zone.name, "filesystem:inode_ownership")?;
+                    tracing::warn!(%e, zone = zone.name, admission = "audit", "rootfs inode recovery incomplete");
+                }
+            }
             self.sync_bpf_allowed_comms(zone_id, &policy.network)?;
             self.apply_nftables_for_zone(zone, policy)?;
             lock_backend(&self.zone_policies, "zone_policies")?
@@ -514,11 +584,21 @@ impl IsolationBackend for LinuxBackend {
 
         if let Err(e) = recovery {
             if membership_installed && self.cgroup.zone_has_processes(&zone.name).unwrap_or(true) {
-                tracing::error!(zone = zone.name, %e, "recovery failed after kernel enrollment — retaining fail-closed membership");
-                return Err(e);
+                if let Err(drain_error) = self.cgroup.drain_zone(&zone.name) {
+                    tracing::error!(zone = zone.name, %e, %drain_error, "recovery failed and live workloads could not be drained — retaining fail-closed membership");
+                    return Err(RauhaError::BackendError(format!(
+                        "zone recovery failed: {e}; fail-closed drain failed: {drain_error}"
+                    )));
+                }
+                tracing::warn!(zone = zone.name, %e, "recovery failed; drained live workloads before rolling back enforcement");
             }
             if let Some(cgroup_id) = recovered_cgroup_id {
                 let _ = self.enforcer.remove_zone_member(cgroup_id);
+            }
+            if let Ok(mut registered) = lock_backend(&self.registered_inodes, "registered_inodes") {
+                if let Some(inodes) = registered.remove(&zone.name) {
+                    let _ = self.enforcer.remove_inodes(&inodes);
+                }
             }
             let _ = self.sync_bpf_allowed_comms(zone_id, &NetworkPolicy::default());
             let _ = self.enforcer.remove_zone_policy(zone_id);
@@ -740,7 +820,13 @@ impl IsolationBackend for LinuxBackend {
             }
         }
 
-        // Remove from BPF maps first.
+        // A failed teardown must leave live workloads enforced. Drain and
+        // remove the cgroup before deleting any BPF membership or policy.
+        self.cgroup.drain_zone(&zone.name)?;
+        self.cgroup.destroy_zone_cgroup(&zone.name)?;
+
+        // The cgroup is now gone, so stale cleanup state cannot make a live
+        // workload fail open.
         let zone_id = self.remove_zone_id(&zone.id)?;
         // Remove stored inodes from BPF map (uses stored list, no re-walk).
         let stored_inodes = self
@@ -781,9 +867,6 @@ impl IsolationBackend for LinuxBackend {
         // Tear down network.
         let _ = network::destroy_veth_pair(&zone.name);
         let _ = namespace::destroy_netns(&zone.name);
-
-        // Destroy cgroup last (must be empty).
-        self.cgroup.destroy_zone_cgroup(&zone.name)?;
 
         lock_backend(&self.zone_name_map, "zone_name_map")?.remove(&zone.name);
         lock_backend(&self.zone_policies, "zone_policies")?.remove(&zone.name);
@@ -1040,8 +1123,6 @@ impl IsolationBackend for LinuxBackend {
                         }
                         self.record_degradation(&zone.name, "filesystem:inode_ownership")?;
                         tracing::warn!(%error, zone = zone.name, container = %container_id, admission = "audit", "file isolation incomplete");
-                    } else {
-                        self.clear_degradation(&zone.name, "filesystem:inode_ownership")?;
                     }
                     tracing::info!(
                         zone = zone.name,
@@ -1288,6 +1369,60 @@ impl IsolationBackend for LinuxBackend {
             detail: membership_detail,
         });
 
+        let (inode_ok, inode_detail) = match self.get_zone_id(&zone.id)? {
+            Some(zone_id) => match collect_zone_rootfs_inodes(&self.root, &zone.name) {
+                Ok(expected)
+                    if expected.is_empty()
+                        && self.cgroup.zone_has_processes(&zone.name).unwrap_or(true) =>
+                {
+                    (
+                        false,
+                        "live zone has no discoverable rootfs inode ownership".into(),
+                    )
+                }
+                Ok(expected) => {
+                    let mut recorded = lock_backend(&self.registered_inodes, "registered_inodes")?
+                        .get(&zone.name)
+                        .cloned()
+                        .unwrap_or_default();
+                    let mut expected_sorted = expected;
+                    recorded.sort_unstable();
+                    recorded.dedup();
+                    expected_sorted.sort_unstable();
+                    expected_sorted.dedup();
+                    if recorded != expected_sorted {
+                        (
+                            false,
+                            format!(
+                                "userspace inode ownership differs from rootfs: recorded {}, expected {}",
+                                recorded.len(),
+                                expected_sorted.len()
+                            ),
+                        )
+                    } else {
+                        match self.enforcer.inodes_match(&expected_sorted, zone_id) {
+                            Ok(true) => (
+                                true,
+                                format!("{} rootfs inodes registered", expected_sorted.len()),
+                            ),
+                            Ok(false) => (
+                                false,
+                                "kernel inode ownership map is incomplete or mismatched".into(),
+                            ),
+                            Err(e) => (false, format!("failed to verify inode ownership map: {e}")),
+                        }
+                    }
+                }
+                Err(e) => (false, format!("failed to enumerate zone rootfs: {e}")),
+            },
+            None => (false, "zone has no userspace kernel identifier".into()),
+        };
+        checks.push(IsolationCheck {
+            name: "filesystem:inode_ownership".into(),
+            passed: inode_ok,
+            detail: inode_detail,
+        });
+
         // Check 4: requested network isolation and its filtering rules.
         let network_mode = admitted_policy
             .as_ref()
@@ -1319,7 +1454,12 @@ impl IsolationBackend for LinuxBackend {
             },
         });
         let veth_name = network::veth_host_name_for(&zone.name);
-        let nft_ok = nftables::zone_rules_exist(&zone.name, &veth_name, network_mode);
+        let fallback_policy = NetworkPolicy::default();
+        let network_policy = admitted_policy
+            .as_ref()
+            .map(|policy| &policy.network)
+            .unwrap_or(&fallback_policy);
+        let nft_ok = nftables::zone_rules_exist(&zone.name, &veth_name, network_policy);
         checks.push(IsolationCheck {
             name: "network:nftables".into(),
             passed: nft_ok,
@@ -1357,6 +1497,7 @@ impl IsolationBackend for LinuxBackend {
             && cgroup_ok
             && ebpf_ok
             && membership_ok
+            && inode_ok
             && netns_ok
             && veth_ok
             && nft_ok;
@@ -1454,8 +1595,12 @@ fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> Result<()
 
 #[cfg(test)]
 mod tests {
-    use super::{admit_linux_policy, lock_backend, oci_capabilities, unsupported_linux_controls};
+    use super::{
+        admit_linux_policy, collect_zone_rootfs_inodes, lock_backend, oci_capabilities,
+        unsupported_linux_controls,
+    };
     use rauha_common::zone::{PolicyAdmission, ZonePolicy};
+    use std::os::unix::fs::MetadataExt;
     use std::sync::{Arc, Mutex};
 
     #[test]
@@ -1513,5 +1658,23 @@ mod tests {
         assert!(capabilities.inheritable().as_ref().unwrap().is_empty());
         assert!(capabilities.permitted().as_ref().unwrap().is_empty());
         assert!(capabilities.ambient().as_ref().unwrap().is_empty());
+    }
+
+    #[test]
+    fn recovery_collects_every_container_rootfs() {
+        let root = tempfile::tempdir().unwrap();
+        let containers = root.path().join("zones/test/containers");
+        let first = containers.join("one/merged");
+        let second = containers.join("two/rootfs");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        let first_file = first.join("first");
+        let second_file = second.join("second");
+        std::fs::write(&first_file, b"one").unwrap();
+        std::fs::write(&second_file, b"two").unwrap();
+
+        let inodes = collect_zone_rootfs_inodes(root.path().to_str().unwrap(), "test").unwrap();
+        assert!(inodes.contains(&first_file.metadata().unwrap().ino()));
+        assert!(inodes.contains(&second_file.metadata().unwrap().ino()));
     }
 }

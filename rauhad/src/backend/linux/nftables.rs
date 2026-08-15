@@ -68,103 +68,30 @@ pub fn apply_zone_rules(zone_name: &str, veth_name: &str, policy: &NetworkPolicy
 
     let chain_name = zone_chain_name(zone_name);
 
-    match policy.mode {
-        NetworkMode::Isolated => {
-            // Create a chain that drops everything.
-            run_nft(&["add", "chain", TABLE_FAMILY, TABLE_NAME, &chain_name])?;
-            run_nft(&["add", "rule", TABLE_FAMILY, TABLE_NAME, &chain_name, "drop"])?;
-
-            // Jump to the zone chain for traffic from/to this veth.
-            run_nft(&[
-                "add",
-                "rule",
-                TABLE_FAMILY,
-                TABLE_NAME,
-                "forward",
-                &format!("iifname \"{veth_name}\" jump {chain_name}"),
-            ])?;
-            run_nft(&[
-                "add",
-                "rule",
-                TABLE_FAMILY,
-                TABLE_NAME,
-                "forward",
-                &format!("oifname \"{veth_name}\" jump {chain_name}"),
-            ])?;
+    if policy.mode != NetworkMode::Host {
+        run_nft(&["add", "chain", TABLE_FAMILY, TABLE_NAME, &chain_name])?;
+        for rule in zone_chain_rules(veth_name, policy) {
+            run_nft(&["add", "rule", TABLE_FAMILY, TABLE_NAME, &chain_name, &rule])?;
         }
-        NetworkMode::Bridged => {
-            // Create zone chain.
-            run_nft(&["add", "chain", TABLE_FAMILY, TABLE_NAME, &chain_name])?;
-
-            // Allow established/related connections.
-            run_nft(&[
-                "add",
-                "rule",
-                TABLE_FAMILY,
-                TABLE_NAME,
-                &chain_name,
-                "ct state established,related accept",
-            ])?;
-
-            // Allow cross-zone traffic to specific zones.
-            // Uses veth interface names — no IP lookup needed.
-            for allowed_zone in &policy.allowed_zones {
-                let peer_veth = super::network::veth_host_name_for(allowed_zone);
-                // Allow bidirectional traffic between veths.
-                run_nft(&[
-                    "add",
-                    "rule",
-                    TABLE_FAMILY,
-                    TABLE_NAME,
-                    &chain_name,
-                    &format!("iifname \"{veth_name}\" oifname \"{peer_veth}\" accept"),
-                ])?;
-                run_nft(&[
-                    "add",
-                    "rule",
-                    TABLE_FAMILY,
-                    TABLE_NAME,
-                    &chain_name,
-                    &format!("iifname \"{peer_veth}\" oifname \"{veth_name}\" accept"),
-                ])?;
-
-                tracing::debug!(
-                    zone = zone_name,
-                    peer = allowed_zone.as_str(),
-                    "allowed cross-zone traffic"
-                );
-            }
-
-            // Allow specific egress destinations.
-            for rule in egress_rules(veth_name, &policy.allowed_egress) {
-                run_nft(&["add", "rule", TABLE_FAMILY, TABLE_NAME, &chain_name, &rule])?;
-            }
-
-            // Empty egress is deny-all. Default-drop also covers IPv6, while
-            // explicit IPv4 destinations above use `ip daddr`.
-            run_nft(&["add", "rule", TABLE_FAMILY, TABLE_NAME, &chain_name, "drop"])?;
-
-            // Jump to the zone chain from forward.
-            run_nft(&[
-                "add",
-                "rule",
-                TABLE_FAMILY,
-                TABLE_NAME,
-                "forward",
-                &format!("iifname \"{veth_name}\" jump {chain_name}"),
-            ])?;
-            run_nft(&[
-                "add",
-                "rule",
-                TABLE_FAMILY,
-                TABLE_NAME,
-                "forward",
-                &format!("oifname \"{veth_name}\" jump {chain_name}"),
-            ])?;
-        }
-        NetworkMode::Host => {
-            // Host mode: no filtering rules.
-        }
+        // Check both endpoints. Zone chains return instead of dropping, so an
+        // allow declared by either endpoint wins regardless of creation order;
+        // the base chain remains the final default deny.
+        run_nft(&[
+            "add",
+            "rule",
+            TABLE_FAMILY,
+            TABLE_NAME,
+            "forward",
+            &format!("iifname \"{veth_name}\" jump {chain_name}"),
+        ])?;
+        run_nft(&[
+            "add",
+            "rule",
+            TABLE_FAMILY,
+            TABLE_NAME,
+            "forward",
+            &format!("oifname \"{veth_name}\" jump {chain_name}"),
+        ])?;
     }
 
     tracing::info!(zone = zone_name, mode = ?policy.mode, "nftables rules applied");
@@ -185,27 +112,73 @@ pub fn remove_zone_rules(zone_name: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn zone_rules_exist(zone_name: &str, veth_name: &str, mode: NetworkMode) -> bool {
-    if mode == NetworkMode::Host {
+pub fn zone_rules_exist(zone_name: &str, veth_name: &str, policy: &NetworkPolicy) -> bool {
+    if policy.mode == NetworkMode::Host {
         return true;
     }
     let chain_name = zone_chain_name(zone_name);
-    let chain_ok = Command::new("nft")
+    let chain = Command::new("nft")
         .args(["list", "chain", TABLE_FAMILY, TABLE_NAME, &chain_name])
-        .output()
-        .is_ok_and(|output| output.status.success());
+        .output();
     let forward = Command::new("nft")
         .args(["list", "chain", TABLE_FAMILY, TABLE_NAME, "forward"])
         .output();
-    chain_ok
-        && forward.is_ok_and(|output| {
-            if !output.status.success() {
-                return false;
+    chain.is_ok_and(|output| {
+        output.status.success()
+            && nft_chain_rules(&output.stdout, &chain_name) == zone_chain_rules(veth_name, policy)
+    }) && forward.is_ok_and(|output| {
+        if !output.status.success() {
+            return false;
+        }
+        let rules = String::from_utf8_lossy(&output.stdout);
+        rules.contains(&format!("iifname \"{veth_name}\" jump {chain_name}"))
+            && rules.contains(&format!("oifname \"{veth_name}\" jump {chain_name}"))
+    })
+}
+
+fn zone_chain_rules(veth_name: &str, policy: &NetworkPolicy) -> Vec<String> {
+    if policy.mode == NetworkMode::Isolated {
+        return vec!["return".into()];
+    }
+    if policy.mode == NetworkMode::Host {
+        return Vec::new();
+    }
+
+    let mut rules = vec!["ct state established,related accept".into()];
+    for zone in &policy.allowed_zones {
+        let peer = super::network::veth_host_name_for(zone);
+        rules.push(format!(
+            "iifname \"{veth_name}\" oifname \"{}\" accept",
+            peer
+        ));
+        rules.push(format!("iifname \"{peer}\" oifname \"{veth_name}\" accept"));
+    }
+    rules.extend(egress_rules(veth_name, &policy.allowed_egress));
+    rules.push("return".into());
+    rules
+}
+
+fn nft_chain_rules(output: &[u8], chain_name: &str) -> Vec<String> {
+    let mut in_chain = false;
+    String::from_utf8_lossy(output)
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            if line == format!("chain {chain_name} {{") {
+                in_chain = true;
+                return None;
             }
-            let rules = String::from_utf8_lossy(&output.stdout);
-            rules.contains(&format!("iifname \"{veth_name}\" jump {chain_name}"))
-                && rules.contains(&format!("oifname \"{veth_name}\" jump {chain_name}"))
+            if !in_chain {
+                return None;
+            }
+            if line == "}" {
+                in_chain = false;
+                return None;
+            }
+            let rule = line.split("# handle ").next().unwrap_or(line).trim();
+            (!rule.is_empty()).then(|| rule.split_whitespace().collect::<Vec<_>>().join(" "))
         })
+        .collect()
 }
 
 /// Remove rules in the forward chain that jump to the given zone chain.
@@ -356,5 +329,34 @@ mod tests {
         assert!(rules.starts_with("delete table inet rauha\nadd table inet rauha"));
         assert!(rules.contains("policy drop"));
         assert!(rules.contains("ip saddr 10.89.0.0/16"));
+    }
+
+    #[test]
+    fn bridged_rules_are_bidirectional_and_fall_through_to_default_deny() {
+        let policy = NetworkPolicy {
+            mode: NetworkMode::Bridged,
+            allowed_zones: vec!["peer".into()],
+            allowed_egress: vec![],
+            allowed_ingress: vec![],
+        };
+        let rules = zone_chain_rules("veth-source", &policy);
+        let peer_veth = super::super::network::veth_host_name_for("peer");
+
+        assert_eq!(rules.last().unwrap(), "return");
+        assert!(rules.contains(&format!(
+            "iifname \"veth-source\" oifname \"{peer_veth}\" accept"
+        )));
+        assert!(rules.contains(&format!(
+            "iifname \"{peer_veth}\" oifname \"veth-source\" accept"
+        )));
+    }
+
+    #[test]
+    fn chain_verification_rejects_extra_accept_rule() {
+        let output = b"table inet rauha {\n\tchain zone-test {\n\t\treturn # handle 4\n\t}\n}\n";
+        assert_eq!(nft_chain_rules(output, "zone-test"), vec!["return"]);
+
+        let tampered = b"table inet rauha {\n\tchain zone-test {\n\t\taccept # handle 3\n\t\treturn # handle 4\n\t}\n}\n";
+        assert_ne!(nft_chain_rules(tampered, "zone-test"), vec!["return"]);
     }
 }

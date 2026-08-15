@@ -175,6 +175,54 @@ impl CgroupManager {
         Ok(!processes.trim().is_empty())
     }
 
+    /// Kill every process in a zone and wait until the cgroup is empty.
+    /// Enforcement must stay installed until this succeeds.
+    pub fn drain_zone(&self, zone_name: &str) -> Result<()> {
+        let path = self.zone_path(zone_name);
+        if !path.exists() || !self.zone_has_processes(zone_name)? {
+            return Ok(());
+        }
+
+        let kill_path = path.join("cgroup.kill");
+        let native_kill = kill_path.exists();
+        if native_kill {
+            fs::write(&kill_path, "1").map_err(|e| RauhaError::CgroupError {
+                message: format!(
+                    "failed to kill processes through {}: {e}",
+                    kill_path.display()
+                ),
+                hint: "retain zone enforcement and retry teardown".into(),
+            })?;
+        }
+
+        for _ in 0..100 {
+            if !self.zone_has_processes(zone_name)? {
+                return Ok(());
+            }
+            if !native_kill {
+                // cgroup.kill arrived in Linux 5.14. Re-read while draining so
+                // children forked during teardown cannot escape the snapshot.
+                let procs_path = path.join("cgroup.procs");
+                let procs =
+                    fs::read_to_string(&procs_path).map_err(|e| RauhaError::CgroupError {
+                        message: format!("failed to read {}: {e}", procs_path.display()),
+                        hint: "retain zone enforcement and retry teardown".into(),
+                    })?;
+                for pid in procs.lines().filter_map(|pid| pid.parse::<i32>().ok()) {
+                    unsafe {
+                        libc::kill(pid, libc::SIGKILL);
+                    }
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        Err(RauhaError::CgroupError {
+            message: format!("zone {zone_name} cgroup still contains live processes"),
+            hint: "enforcement was retained; inspect cgroup.procs and retry teardown".into(),
+        })
+    }
+
     fn zone_path(&self, zone_name: &str) -> PathBuf {
         self.slice_path.join(format!("zone-{zone_name}"))
     }

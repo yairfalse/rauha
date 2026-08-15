@@ -79,12 +79,30 @@ $RAUHA stop "$CONTAINER_ID" || echo "   (may already be exited)"
 echo "10. Deleting container..."
 $RAUHA delete "$CONTAINER_ID" --force || echo "   (may already be deleted)"
 
-echo "11. Deleting zone..."
+echo "11. Starting a live workload for force-delete drain coverage..."
+LIVE_CONTAINER_ID=$($RAUHA run --zone "$ZONE_NAME" "$IMAGE" /bin/sleep 120)
+sleep 1
+LIVE_PID=$(head -n 1 "$CGROUP_PROCS")
+if [ -z "$LIVE_CONTAINER_ID" ] || [ -z "$LIVE_PID" ]; then
+    echo "FAIL: live workload was not enrolled in the zone cgroup"
+    exit 1
+fi
+LIVE_START=$(awk '{print $22}' "/proc/$LIVE_PID/stat")
+
+echo "12. Force-deleting zone with a live workload..."
 $RAUHA zone delete "$ZONE_NAME" --force
 
-echo "12. Verifying zone removed..."
+echo "13. Verifying zone and live workload were removed..."
 if $RAUHA zone list 2>/dev/null | grep -q "$ZONE_NAME"; then
     echo "FAIL: zone still exists after deletion"
+    exit 1
+fi
+if [ -e "$CGROUP_PROCS" ]; then
+    echo "FAIL: force-delete left a cgroup or live workload behind"
+    exit 1
+fi
+if [ -r "/proc/$LIVE_PID/stat" ] && [ "$(awk '{print $22}' "/proc/$LIVE_PID/stat")" = "$LIVE_START" ]; then
+    echo "FAIL: force-delete left the live workload behind"
     exit 1
 fi
 
