@@ -1,5 +1,5 @@
 use rauha_common::error::Result;
-use rauha_common::zone::{PolicyFile, ZonePolicy, ZoneType};
+use rauha_common::zone::{PolicyAdmission, PolicyFile, ZonePolicy, ZoneType};
 
 /// Parse a TOML policy string into a ZonePolicy and ZoneType.
 pub fn parse_policy(toml_str: &str, base_root: &str) -> Result<(ZoneType, ZonePolicy)> {
@@ -33,6 +33,11 @@ pub fn policy_to_toml(name: &str, zone_type: ZoneType, policy: &ZonePolicy) -> S
         rauha_common::zone::NetworkMode::Isolated => "isolated",
         rauha_common::zone::NetworkMode::Bridged => "bridged",
         rauha_common::zone::NetworkMode::Host => "host",
+    };
+
+    let admission_mode = match policy.admission {
+        PolicyAdmission::Strict => "strict",
+        PolicyAdmission::Audit => "audit",
     };
 
     let caps = policy
@@ -71,6 +76,9 @@ pub fn policy_to_toml(name: &str, zone_type: ZoneType, policy: &ZonePolicy) -> S
         r#"[zone]
 name = "{name}"
 type = "{type_str}"
+
+[admission]
+mode = "{admission_mode}"
 
 [capabilities]
 allowed = [
@@ -186,11 +194,9 @@ deny = ["mount", "umount2"]
     }
 
     #[test]
-    fn missing_capabilities_section_means_unrestricted() {
-        // An omitted [capabilities] section parses to an empty allow list, which
-        // compiles to caps_mask == 0. The capable() LSM hook treats caps_mask == 0
-        // as "no capability restriction" (allow), NOT "deny every capability" —
-        // see rauha-ebpf/src/capable_guard.rs. Restriction is opt-in.
+    fn missing_capabilities_section_means_allow_none() {
+        // Capability policy is an allow-list. Omitted and explicitly empty
+        // both mean the workload receives no capabilities.
         let toml = r#"
 [zone]
 name = "minimal"
@@ -199,6 +205,32 @@ type = "non-global"
 
         let (_zone_type, policy) = parse_policy(toml, "/var/lib/rauha").unwrap();
         assert!(policy.capabilities.allowed.is_empty());
+    }
+
+    #[test]
+    fn admission_defaults_to_strict_and_accepts_explicit_audit() {
+        let strict = r#"
+[zone]
+name = "strict"
+type = "non-global"
+"#;
+        let audit = r#"
+[zone]
+name = "audit"
+type = "non-global"
+
+[admission]
+mode = "audit"
+"#;
+
+        assert_eq!(
+            parse_policy(strict, "/var/lib/rauha").unwrap().1.admission,
+            PolicyAdmission::Strict
+        );
+        assert_eq!(
+            parse_policy(audit, "/var/lib/rauha").unwrap().1.admission,
+            PolicyAdmission::Audit
+        );
     }
 
     #[test]

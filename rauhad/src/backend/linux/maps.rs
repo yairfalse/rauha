@@ -3,7 +3,7 @@
 //! Translates domain concepts (zones, policies, inodes) into BPF map
 //! key/value pairs. All BPF map access goes through MapManager.
 
-use aya::maps::HashMap as AyaHashMap;
+use aya::maps::{HashMap as AyaHashMap, MapError};
 use aya::Ebpf;
 
 use rauha_common::error::{RauhaError, Result};
@@ -11,9 +11,42 @@ use rauha_common::zone::{ZonePolicy, ZoneType};
 use rauha_ebpf_common::*;
 use rauha_enforcer_api::ZoneEnforcement;
 
+fn map_key_missing(error: &MapError) -> bool {
+    matches!(error, MapError::KeyNotFound | MapError::ElementNotFound)
+        || matches!(
+            error,
+            MapError::SyscallError(error)
+                if error.io_error.raw_os_error() == Some(libc::ENOENT)
+        )
+}
+
 pub struct MapManager;
 
 impl MapManager {
+    /// Read a cgroup's kernel membership entry.
+    pub fn zone_member(bpf: &Ebpf, cgroup_id: u64) -> Result<Option<ZoneInfoKernel>> {
+        let map: AyaHashMap<_, u64, ZoneInfoKernel> =
+            AyaHashMap::try_from(bpf.map("ZONE_MEMBERSHIP").ok_or_else(|| {
+                RauhaError::EbpfError {
+                    message: "ZONE_MEMBERSHIP map not found".into(),
+                    hint: "eBPF programs may not be loaded".into(),
+                }
+            })?)
+            .map_err(|e| RauhaError::EbpfError {
+                message: format!("failed to open ZONE_MEMBERSHIP map: {e}"),
+                hint: "check eBPF object was built correctly".into(),
+            })?;
+
+        match map.get(&cgroup_id, 0) {
+            Ok(member) => Ok(Some(member)),
+            Err(MapError::KeyNotFound) => Ok(None),
+            Err(e) => Err(RauhaError::EbpfError {
+                message: format!("failed to read zone membership: {e}"),
+                hint: "check BPF map health".into(),
+            }),
+        }
+    }
+
     /// Register a cgroup as belonging to a zone.
     pub fn add_zone_member(
         bpf: &mut Ebpf,
@@ -71,11 +104,14 @@ impl MapManager {
 
         match map.remove(&cgroup_id) {
             Ok(()) => Ok(()),
-            Err(e) => {
-                // NotFound during cleanup is fine — entry may already be gone.
-                tracing::debug!(cgroup_id, %e, "zone membership entry not found (already removed)");
+            Err(e) if map_key_missing(&e) => {
+                tracing::debug!(cgroup_id, "zone membership entry already removed");
                 Ok(())
             }
+            Err(e) => Err(RauhaError::EbpfError {
+                message: format!("failed to remove zone membership: {e}"),
+                hint: "check BPF map health".into(),
+            }),
         }
     }
 
@@ -140,10 +176,14 @@ impl MapManager {
 
         match map.remove(&zone_id) {
             Ok(()) => Ok(()),
-            Err(e) => {
-                tracing::debug!(zone_id, %e, "zone policy not found in BPF map (already removed)");
+            Err(e) if map_key_missing(&e) => {
+                tracing::debug!(zone_id, "zone policy already removed");
                 Ok(())
             }
+            Err(e) => Err(RauhaError::EbpfError {
+                message: format!("failed to remove zone policy: {e}"),
+                hint: "check BPF map health".into(),
+            }),
         }
     }
 
@@ -170,6 +210,29 @@ impl MapManager {
         Ok(())
     }
 
+    pub fn inode_zone(bpf: &Ebpf, inode: u64) -> Result<Option<u32>> {
+        let map: AyaHashMap<_, u64, u32> =
+            AyaHashMap::try_from(bpf.map("INODE_ZONE_MAP").ok_or_else(|| {
+                RauhaError::EbpfError {
+                    message: "INODE_ZONE_MAP map not found".into(),
+                    hint: "eBPF programs may not be loaded".into(),
+                }
+            })?)
+            .map_err(|e| RauhaError::EbpfError {
+                message: format!("failed to open INODE_ZONE_MAP map: {e}"),
+                hint: "check eBPF object was built correctly".into(),
+            })?;
+
+        match map.get(&inode, 0) {
+            Ok(zone_id) => Ok(Some(zone_id)),
+            Err(MapError::KeyNotFound) => Ok(None),
+            Err(e) => Err(RauhaError::EbpfError {
+                message: format!("failed to read inode ownership: {e}"),
+                hint: "check BPF map health".into(),
+            }),
+        }
+    }
+
     /// Remove an inode from zone tracking.
     pub fn remove_inode_zone(bpf: &mut Ebpf, inode: u64) -> Result<()> {
         let mut map: AyaHashMap<_, u64, u32> =
@@ -186,11 +249,14 @@ impl MapManager {
 
         match map.remove(&inode) {
             Ok(()) => Ok(()),
-            Err(e) => {
-                // Not found is fine — idempotent cleanup.
-                tracing::debug!(inode, %e, "inode not in INODE_ZONE_MAP (already removed)");
+            Err(e) if map_key_missing(&e) => {
+                tracing::debug!(inode, "inode ownership entry already removed");
                 Ok(())
             }
+            Err(e) => Err(RauhaError::EbpfError {
+                message: format!("failed to remove inode ownership: {e}"),
+                hint: "check BPF map health".into(),
+            }),
         }
     }
 
@@ -224,10 +290,7 @@ impl MapManager {
     pub fn remove_inodes(bpf: &mut Ebpf, inodes: &[u64]) -> Result<u32> {
         let mut count = 0u32;
         for &ino in inodes {
-            if let Err(e) = Self::remove_inode_zone(bpf, ino) {
-                tracing::debug!(ino, %e, "failed to unregister inode");
-                continue;
-            }
+            Self::remove_inode_zone(bpf, ino)?;
             count += 1;
         }
         tracing::debug!(count, total = inodes.len(), "removed inodes from BPF map");
@@ -279,10 +342,14 @@ impl MapManager {
 
         match map.remove(&key) {
             Ok(()) => Ok(()),
-            Err(e) => {
-                tracing::debug!(src_zone, dst_zone, %e, "zone comm entry not found (already denied)");
+            Err(e) if map_key_missing(&e) => {
+                tracing::debug!(src_zone, dst_zone, "zone communication already denied");
                 Ok(())
             }
+            Err(e) => Err(RauhaError::EbpfError {
+                message: format!("failed to deny zone comm {src_zone} -> {dst_zone}: {e}"),
+                hint: "check BPF map health".into(),
+            }),
         }
     }
 
@@ -318,7 +385,7 @@ impl MapManager {
 /// eBPF is defense-in-depth.
 ///
 /// Returns the collected inodes (capped at `max_inodes`).
-pub fn collect_rootfs_inodes(rootfs_path: &std::path::Path, max_inodes: u32) -> Vec<u64> {
+pub fn collect_rootfs_inodes(rootfs_path: &std::path::Path, max_inodes: u32) -> Result<Vec<u64>> {
     use std::collections::HashSet;
     use std::os::unix::fs::MetadataExt;
 
@@ -327,33 +394,30 @@ pub fn collect_rootfs_inodes(rootfs_path: &std::path::Path, max_inodes: u32) -> 
     let mut stack = vec![rootfs_path.to_path_buf()];
 
     while let Some(dir) = stack.pop() {
-        let entries = match std::fs::read_dir(&dir) {
-            Ok(e) => e,
-            Err(e) => {
-                tracing::debug!(dir = %dir.display(), %e, "skipping unreadable directory during inode collection");
-                continue;
-            }
-        };
+        let entries = std::fs::read_dir(&dir).map_err(|e| RauhaError::RootfsError {
+            message: format!("failed to read rootfs directory {}: {e}", dir.display()),
+        })?;
 
         for entry in entries {
             if inodes.len() as u32 >= max_inodes {
-                tracing::warn!(
-                    count = inodes.len(),
-                    max_inodes,
-                    "inode collection hit cap — some files won't be tracked"
-                );
-                return inodes;
+                return Err(RauhaError::RootfsError {
+                    message: format!(
+                        "rootfs inode count exceeds enforcement capacity of {max_inodes}"
+                    ),
+                });
             }
 
-            let entry = match entry {
-                Ok(e) => e,
-                Err(_) => continue,
-            };
+            let entry = entry.map_err(|e| RauhaError::RootfsError {
+                message: format!("failed to enumerate rootfs {}: {e}", dir.display()),
+            })?;
 
-            let meta = match std::fs::symlink_metadata(entry.path()) {
-                Ok(m) => m,
-                Err(_) => continue,
-            };
+            let meta =
+                std::fs::symlink_metadata(entry.path()).map_err(|e| RauhaError::RootfsError {
+                    message: format!(
+                        "failed to inspect rootfs entry {}: {e}",
+                        entry.path().display()
+                    ),
+                })?;
 
             inodes.push(meta.ino());
 
@@ -364,7 +428,7 @@ pub fn collect_rootfs_inodes(rootfs_path: &std::path::Path, max_inodes: u32) -> 
     }
 
     tracing::debug!(count = inodes.len(), path = %rootfs_path.display(), "collected rootfs inodes");
-    inodes
+    Ok(inodes)
 }
 
 /// Convert userspace ZonePolicy to kernel-side ZonePolicyKernel.
@@ -471,5 +535,16 @@ mod tests {
     #[test]
     fn policy_to_kernel_unknown_cap_rejected() {
         assert!(policy_to_kernel(&default_policy_with_caps(vec!["CAP_NONEXISTENT"])).is_err());
+    }
+
+    #[test]
+    fn inode_collection_fails_instead_of_truncating() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("one"), b"1").unwrap();
+        std::fs::write(root.path().join("two"), b"2").unwrap();
+
+        let err = collect_rootfs_inodes(root.path(), 1)
+            .expect_err("an incomplete ownership set must not look successful");
+        assert!(err.to_string().contains("enforcement capacity"));
     }
 }

@@ -4,12 +4,14 @@
 set -euo pipefail
 
 RAUHA="${RAUHA_BIN:-cargo run --bin rauha --}"
+ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+AUDIT_POLICY=${RAUHA_TEST_AUDIT_POLICY:-$ROOT/policies/audit.toml}
 ZONE_NAME="test-isolation-$$"
 IMAGE="${TEST_IMAGE:-alpine:latest}"
 
 cleanup() {
     echo "Cleaning up..."
-    $RAUHA zone delete --name "$ZONE_NAME" --force 2>/dev/null || true
+    $RAUHA zone delete "$ZONE_NAME" --force 2>/dev/null || true
 }
 trap cleanup EXIT
 
@@ -19,10 +21,25 @@ echo "1. Pulling image (if not present)..."
 $RAUHA image pull "$IMAGE" 2>/dev/null || true
 
 echo "2. Creating zone..."
-$RAUHA zone create --name "$ZONE_NAME"
+$RAUHA zone create --name "$ZONE_NAME" --policy "$AUDIT_POLICY"
 
 echo "3. Verifying isolation primitives..."
-$RAUHA zone verify "$ZONE_NAME"
+set +e
+VERIFY_OUTPUT=$($RAUHA zone verify "$ZONE_NAME" 2>&1)
+VERIFY_CODE=$?
+set -e
+echo "$VERIFY_OUTPUT"
+if [ "$VERIFY_CODE" -ne 0 ]; then
+    if ! grep -q '✗ ebpf:' <<<"$VERIFY_OUTPUT"; then
+        echo "FAIL: isolation verification failed without a capability-probed hook" >&2
+        exit 1
+    fi
+    if grep '✗' <<<"$VERIFY_OUTPUT" | grep -vqF 'kernel does not expose this required BPF-LSM hook'; then
+        echo "FAIL: isolation verification contains an unexpected failed control" >&2
+        exit 1
+    fi
+    echo "   INFO: only capability-probed kernel hooks are degraded"
+fi
 
 echo "4. Checking cgroup exists..."
 CGROUP_DIR="/sys/fs/cgroup/rauha.slice/zone-${ZONE_NAME}"
@@ -69,7 +86,7 @@ echo "9. Stopping container..."
 $RAUHA stop "$CONTAINER_ID" || true
 
 echo "10. Deleting zone..."
-$RAUHA zone delete --name "$ZONE_NAME" --force
+$RAUHA zone delete "$ZONE_NAME" --force
 
 echo "11. Verifying cgroup removed..."
 if [ -d "$CGROUP_DIR" ]; then

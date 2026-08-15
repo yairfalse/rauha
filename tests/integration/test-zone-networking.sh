@@ -16,6 +16,9 @@ cat > "$POLICY_FILE" <<TOML
 name = "placeholder"
 type = "non-global"
 
+[admission]
+mode = "audit"
+
 [network]
 mode = "bridged"
 allowed_zones = ["$ZONE_A", "$ZONE_B"]
@@ -24,8 +27,8 @@ TOML
 
 cleanup() {
     echo "Cleaning up..."
-    $RAUHA zone delete --name "$ZONE_A" --force 2>/dev/null || true
-    $RAUHA zone delete --name "$ZONE_B" --force 2>/dev/null || true
+    $RAUHA zone delete "$ZONE_A" --force 2>/dev/null || true
+    $RAUHA zone delete "$ZONE_B" --force 2>/dev/null || true
     rm -f "$POLICY_FILE"
 }
 trap cleanup EXIT

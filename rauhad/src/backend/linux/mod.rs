@@ -28,7 +28,7 @@ pub fn cleanup_network() {
     }
 }
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::process::Command;
@@ -106,6 +106,11 @@ pub struct LinuxBackend {
     /// Registered inodes per zone, for correct cleanup without re-walking.
     /// Key is zone name, value is the inode list registered in INODE_ZONE_MAP.
     registered_inodes: Mutex<HashMap<String, Vec<u64>>>,
+    /// Last admitted policy per zone. Container construction must use the same
+    /// capability allow-list that was installed in the kernel policy map.
+    zone_policies: Mutex<HashMap<String, ZonePolicy>>,
+    /// Runtime controls that audit admission allowed to degrade.
+    zone_degradations: Mutex<HashMap<String, BTreeSet<String>>>,
     /// IP address allocator for zone networking.
     ip_allocator: Mutex<IpAllocator>,
 }
@@ -134,9 +139,7 @@ impl LinuxBackend {
                 ip_allocator.prefix_len()
             )
         };
-        if let Err(e) = nftables::ensure_nat(&subnet_cidr) {
-            tracing::warn!(%e, "failed to set up NAT — zones won't have internet access");
-        }
+        nftables::ensure_nat(&subnet_cidr)?;
 
         Ok(Self {
             root: root.into(),
@@ -147,6 +150,8 @@ impl LinuxBackend {
             zone_name_map: Mutex::new(HashMap::new()),
             shim_connections: Mutex::new(HashMap::new()),
             registered_inodes: Mutex::new(HashMap::new()),
+            zone_policies: Mutex::new(HashMap::new()),
+            zone_degradations: Mutex::new(HashMap::new()),
             ip_allocator: Mutex::new(ip_allocator),
         })
     }
@@ -267,11 +272,53 @@ impl LinuxBackend {
     }
 
     /// Apply nftables forward rules for a zone based on its network policy.
-    fn apply_nftables_for_zone(&self, zone: &ZoneHandle, net_policy: &NetworkPolicy) -> Result<()> {
+    fn apply_nftables_for_zone(&self, zone: &ZoneHandle, policy: &ZonePolicy) -> Result<()> {
         let veth_name = network::veth_host_name_for(&zone.name);
 
-        if let Err(e) = nftables::apply_zone_rules(&zone.name, &veth_name, net_policy) {
-            tracing::warn!(%e, zone = zone.name, "failed to apply nftables rules — network filtering inactive");
+        match nftables::apply_zone_rules(&zone.name, &veth_name, &policy.network) {
+            Ok(()) => self.clear_degradation(&zone.name, "network:nftables")?,
+            Err(e) if policy.admission == PolicyAdmission::Strict => return Err(e),
+            Err(e) => {
+                self.record_degradation(&zone.name, "network:nftables")?;
+                tracing::warn!(%e, zone = zone.name, admission = "audit", status = "unsupported", "network filtering inactive");
+            }
+        }
+        Ok(())
+    }
+
+    fn record_degradation(&self, zone_name: &str, control: &str) -> Result<()> {
+        lock_backend(&self.zone_degradations, "zone_degradations")?
+            .entry(zone_name.to_string())
+            .or_default()
+            .insert(control.to_string());
+        Ok(())
+    }
+
+    fn clear_degradation(&self, zone_name: &str, control: &str) -> Result<()> {
+        if let Some(controls) =
+            lock_backend(&self.zone_degradations, "zone_degradations")?.get_mut(zone_name)
+        {
+            controls.remove(control);
+        }
+        Ok(())
+    }
+
+    fn restore_rootfs_inodes(&self, zone_name: &str, zone_id: u32) -> Result<()> {
+        let expected = collect_zone_rootfs_inodes(&self.root, zone_name)?;
+        if expected.is_empty() && self.cgroup.zone_has_processes(zone_name)? {
+            return Err(RauhaError::BackendError(
+                "live recovered zone has no discoverable rootfs inodes".into(),
+            ));
+        }
+        let inserted = self.enforcer.insert_inodes(&expected, zone_id)?;
+        lock_backend(&self.registered_inodes, "registered_inodes")?
+            .insert(zone_name.to_string(), inserted.clone());
+        if inserted.len() != expected.len() {
+            return Err(RauhaError::BackendError(format!(
+                "rootfs inode recovery incomplete: registered {} of {}",
+                inserted.len(),
+                expected.len()
+            )));
         }
         Ok(())
     }
@@ -303,27 +350,129 @@ impl LinuxBackend {
                 continue;
             }
             if !allowed_peer_ids.contains(&peer_zone_id) {
-                if let Err(e) = self.enforcer.deny_zone_comm(zone_id, peer_zone_id) {
-                    tracing::warn!(%e, zone_id, peer_zone_id, "failed to revoke zone comm");
-                }
-                if let Err(e) = self.enforcer.deny_zone_comm(peer_zone_id, zone_id) {
-                    tracing::warn!(%e, zone_id, peer_zone_id, "failed to revoke reverse zone comm");
-                }
+                self.enforcer.deny_zone_comm(zone_id, peer_zone_id)?;
+                self.enforcer.deny_zone_comm(peer_zone_id, zone_id)?;
             }
         }
 
         // Add the currently allowed comms.
         for &peer_zone_id in &allowed_peer_ids {
-            if let Err(e) = self.enforcer.allow_zone_comm(zone_id, peer_zone_id) {
-                tracing::warn!(%e, zone_id, peer_zone_id, "failed to allow zone comm in BPF map");
-            }
-            if let Err(e) = self.enforcer.allow_zone_comm(peer_zone_id, zone_id) {
-                tracing::warn!(%e, zone_id, peer_zone_id, "failed to allow reverse zone comm in BPF map");
-            }
+            self.enforcer.allow_zone_comm(zone_id, peer_zone_id)?;
+            self.enforcer.allow_zone_comm(peer_zone_id, zone_id)?;
         }
 
         Ok(())
     }
+}
+
+fn unsupported_linux_controls(policy: &ZonePolicy) -> Vec<String> {
+    let mut unsupported = Vec::new();
+    if !policy.filesystem.writable_paths.is_empty() {
+        unsupported.push("filesystem.writable_paths".to_string());
+    }
+    if !policy.devices.allowed.is_empty() {
+        unsupported.push("devices.allowed".to_string());
+    }
+    if !policy.syscalls.deny.is_empty() {
+        unsupported.push("syscalls.deny".to_string());
+    }
+    if !policy.network.allowed_ingress.is_empty() {
+        unsupported.push("network.allowed_ingress".to_string());
+    }
+    unsupported
+}
+
+fn admit_linux_policy(policy: &ZonePolicy, skipped_hooks: &[String]) -> Result<()> {
+    let mut unsupported = unsupported_linux_controls(policy);
+    for hook in skipped_hooks {
+        unsupported.push(format!("lsm.{hook}"));
+    }
+
+    if unsupported.is_empty() {
+        return Ok(());
+    }
+
+    let controls = unsupported.join(", ");
+    match policy.admission {
+        PolicyAdmission::Strict => Err(RauhaError::InvalidPolicy(format!(
+            "strict policy requests unsupported or unavailable Linux controls: {controls}"
+        ))),
+        PolicyAdmission::Audit => {
+            tracing::warn!(
+                admission = "audit",
+                status = "unsupported",
+                controls,
+                "admitting policy with unsupported controls"
+            );
+            Ok(())
+        }
+    }
+}
+
+fn oci_capabilities(policy: &ZonePolicy) -> Result<oci_spec::runtime::LinuxCapabilities> {
+    use oci_spec::runtime::{Capabilities, Capability, LinuxCapabilitiesBuilder};
+
+    let capabilities = policy
+        .capabilities
+        .allowed
+        .iter()
+        .map(|name| {
+            rauha_common::zone::canonical_linux_capability_name(name)
+                .parse::<Capability>()
+                .map_err(|_| RauhaError::InvalidPolicy(format!("unknown capability: {name}")))
+        })
+        .collect::<Result<Capabilities>>()?;
+
+    LinuxCapabilitiesBuilder::default()
+        .bounding(capabilities.clone())
+        .effective(capabilities.clone())
+        .inheritable(capabilities.clone())
+        .permitted(capabilities.clone())
+        .ambient(capabilities)
+        .build()
+        .map_err(|e| RauhaError::BackendError(format!("failed to build OCI capabilities: {e}")))
+}
+
+fn collect_zone_rootfs_inodes(root: &str, zone_name: &str) -> Result<Vec<u64>> {
+    let containers = PathBuf::from(root)
+        .join("zones")
+        .join(zone_name)
+        .join("containers");
+    if !containers.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut inodes = BTreeSet::new();
+    let entries = std::fs::read_dir(&containers).map_err(|e| RauhaError::RootfsError {
+        message: format!("failed to enumerate {}: {e}", containers.display()),
+    })?;
+    for entry in entries {
+        let container = entry
+            .map_err(|e| RauhaError::RootfsError {
+                message: format!("failed to enumerate {}: {e}", containers.display()),
+            })?
+            .path();
+        let merged = container.join("merged");
+        let legacy = container.join("rootfs");
+        let rootfs = if merged.is_dir() {
+            merged
+        } else if legacy.is_dir() {
+            legacy
+        } else {
+            continue;
+        };
+        let remaining = rauha_ebpf_common::MAX_INODES.saturating_sub(inodes.len() as u32);
+        if remaining == 0 {
+            return Err(RauhaError::RootfsError {
+                message: format!(
+                    "zone rootfs inode count exceeds enforcement capacity of {}",
+                    rauha_ebpf_common::MAX_INODES
+                ),
+            });
+        }
+        inodes.extend(maps::collect_rootfs_inodes(&rootfs, remaining)?);
+    }
+    Ok(inodes.into_iter().collect())
 }
 
 /// Find the rauha-shim binary.
@@ -365,47 +514,116 @@ impl IsolationBackend for LinuxBackend {
         zone_type: ZoneType,
         policy: &ZonePolicy,
     ) -> Result<()> {
+        admit_linux_policy(policy, &self.enforcer.skipped_hooks())?;
         tracing::info!(zone = zone.name, "recovering zone state from metadata");
 
         // Allocate a compact zone_id (these are ephemeral, not persisted).
         let zone_id = self.allocate_zone_id(zone.id)?;
-        lock_backend(&self.zone_name_map, "zone_name_map")?.insert(zone.name.clone(), zone.id);
+        let mut recovered_cgroup_id = None;
+        let mut ip_marked = false;
+        let mut membership_installed = false;
+        let recovery = (|| -> Result<()> {
+            lock_backend(&self.zone_name_map, "zone_name_map")?.insert(zone.name.clone(), zone.id);
 
-        // Re-create cgroup if missing (idempotent).
-        let cgroup_id = if self.cgroup.zone_cgroup_exists(&zone.name) {
-            self.cgroup.cgroup_id_for_zone(&zone.name)?
-        } else {
-            self.cgroup.create_zone_cgroup(&zone.name)?
-        };
+            let cgroup_id = if self.cgroup.zone_cgroup_exists(&zone.name) {
+                self.cgroup.cgroup_id_for_zone(&zone.name)?
+            } else {
+                self.cgroup.create_zone_cgroup(&zone.name)?
+            };
+            recovered_cgroup_id = Some(cgroup_id);
+            self.cgroup.apply_resources(&zone.name, &policy.resources)?;
 
-        // Re-apply resource limits. Recovery must fail closed if hard limits
-        // cannot be restored.
-        self.cgroup.apply_resources(&zone.name, &policy.resources)?;
+            if let Some(ref net_state) = zone.network_state {
+                lock_backend(&self.ip_allocator, "ip_allocator")?.mark_allocated(net_state.ip());
+                ip_marked = true;
+            }
 
-        // Re-register IP in allocator if zone has network state.
-        if let Some(ref net_state) = zone.network_state {
-            lock_backend(&self.ip_allocator, "ip_allocator")?.mark_allocated(net_state.ip());
+            if policy.network.mode != NetworkMode::Host {
+                if !namespace::netns_exists(&zone.name) {
+                    match namespace::create_netns(&zone.name) {
+                        Ok(()) => self.clear_degradation(&zone.name, "netns")?,
+                        Err(e) if policy.admission == PolicyAdmission::Strict => return Err(e),
+                        Err(e) => {
+                            self.record_degradation(&zone.name, "netns")?;
+                            tracing::warn!(%e, zone = zone.name, admission = "audit", status = "unsupported", "failed to re-create netns during recovery");
+                        }
+                    }
+                }
+                if namespace::netns_exists(&zone.name) && !network::veth_exists(&zone.name) {
+                    match network::create_veth_pair(&zone.name, zone.network_state.as_ref()) {
+                        Ok(()) => self.clear_degradation(&zone.name, "network:veth")?,
+                        Err(e) if policy.admission == PolicyAdmission::Strict => return Err(e),
+                        Err(e) => {
+                            self.record_degradation(&zone.name, "network:veth")?;
+                            tracing::warn!(%e, zone = zone.name, admission = "audit", status = "unsupported", "failed to re-create veth pair during recovery");
+                        }
+                    }
+                }
+            }
+
+            // Policy before membership: a recovered cgroup may already hold
+            // processes, so it must never resolve without a policy.
+            self.enforcer.set_zone_policy(zone_id, policy)?;
+            self.enforcer
+                .add_zone_member(cgroup_id, zone_id, zone_type)?;
+            membership_installed = true;
+            match self.restore_rootfs_inodes(&zone.name, zone_id) {
+                Ok(()) => {}
+                Err(e) if policy.admission == PolicyAdmission::Strict => return Err(e),
+                Err(e) => {
+                    self.record_degradation(&zone.name, "filesystem:inode_ownership")?;
+                    tracing::warn!(%e, zone = zone.name, admission = "audit", "rootfs inode recovery incomplete");
+                }
+            }
+            self.sync_bpf_allowed_comms(zone_id, &policy.network)?;
+            self.apply_nftables_for_zone(zone, policy)?;
+            lock_backend(&self.zone_policies, "zone_policies")?
+                .insert(zone.name.clone(), policy.clone());
+            Ok(())
+        })();
+
+        if let Err(e) = recovery {
+            if membership_installed && self.cgroup.zone_has_processes(&zone.name).unwrap_or(true) {
+                if let Err(drain_error) = self.cgroup.drain_zone(&zone.name) {
+                    tracing::error!(zone = zone.name, %e, %drain_error, "recovery failed and live workloads could not be drained — retaining fail-closed membership");
+                    return Err(RauhaError::BackendError(format!(
+                        "zone recovery failed: {e}; fail-closed drain failed: {drain_error}"
+                    )));
+                }
+                tracing::warn!(zone = zone.name, %e, "recovery failed; drained live workloads before rolling back enforcement");
+            }
+            if let Some(cgroup_id) = recovered_cgroup_id {
+                let _ = self.enforcer.remove_zone_member(cgroup_id);
+            }
+            if let Ok(mut registered) = lock_backend(&self.registered_inodes, "registered_inodes") {
+                if let Some(inodes) = registered.remove(&zone.name) {
+                    let _ = self.enforcer.remove_inodes(&inodes);
+                }
+            }
+            let _ = self.sync_bpf_allowed_comms(zone_id, &NetworkPolicy::default());
+            let _ = self.enforcer.remove_zone_policy(zone_id);
+            let _ = nftables::remove_zone_rules(&zone.name);
+            if ip_marked {
+                if let Some(ref net_state) = zone.network_state {
+                    if let Ok(mut allocator) = lock_backend(&self.ip_allocator, "ip_allocator") {
+                        allocator.release(net_state.ip());
+                    }
+                }
+            }
+            let _ = self.remove_zone_id(&zone.id);
+            if let Ok(mut names) = lock_backend(&self.zone_name_map, "zone_name_map") {
+                names.remove(&zone.name);
+            }
+            if let Ok(mut policies) = lock_backend(&self.zone_policies, "zone_policies") {
+                policies.remove(&zone.name);
+            }
+            if let Ok(mut degraded) = lock_backend(&self.zone_degradations, "zone_degradations") {
+                degraded.remove(&zone.name);
+            }
+            return Err(e);
         }
 
-        // Re-create netns if missing (idempotent).
-        if !namespace::netns_exists(&zone.name) {
-            if let Err(e) = namespace::create_netns(&zone.name) {
-                tracing::warn!(%e, zone = zone.name, "failed to re-create netns during recovery");
-            }
-            // Re-create veth pair with IP if we had to recreate the namespace.
-            if let Err(e) = network::create_veth_pair(&zone.name, zone.network_state.as_ref()) {
-                tracing::warn!(%e, zone = zone.name, "failed to re-create veth pair during recovery");
-            }
-        }
-
-        // Re-populate BPF maps. A recovered zone without BPF enforcement must
-        // not be treated as recovered.
-        // Policy before membership — a recovered cgroup may already hold
-        // running processes, so its ZONE_POLICY must exist before any of them
-        // can resolve as a zone member (else capable() fails closed).
-        self.enforcer.set_zone_policy(zone_id, policy)?;
-        self.enforcer
-            .add_zone_member(cgroup_id, zone_id, zone_type)?;
+        let cgroup_id = recovered_cgroup_id.expect("successful recovery resolved a cgroup");
 
         tracing::info!(zone = zone.name, zone_id, cgroup_id, "zone recovered");
         Ok(())
@@ -414,6 +632,7 @@ impl IsolationBackend for LinuxBackend {
     fn cleanup_orphans(&self, known_zones: &[ZoneHandle]) -> Result<()> {
         let known_names: std::collections::HashSet<&str> =
             known_zones.iter().map(|z| z.name.as_str()).collect();
+        let mut live_orphans = std::collections::HashSet::new();
 
         // Clean up orphaned cgroups under rauha.slice/.
         let slice_path = std::path::Path::new("/sys/fs/cgroup/rauha.slice");
@@ -424,7 +643,15 @@ impl IsolationBackend for LinuxBackend {
                     let name_str = name.to_string_lossy();
                     if let Some(zone_name) = name_str.strip_prefix("zone-") {
                         if !known_names.contains(zone_name) {
+                            if self.cgroup.zone_has_processes(zone_name).unwrap_or(true) {
+                                live_orphans.insert(zone_name.to_string());
+                                tracing::error!(cgroup = %name_str, "retaining live orphan cgroup and its fail-closed membership");
+                                continue;
+                            }
                             tracing::warn!(cgroup = %name_str, "cleaning up orphaned cgroup");
+                            if let Ok(cgroup_id) = self.cgroup.cgroup_id_for_zone(zone_name) {
+                                let _ = self.enforcer.remove_zone_member(cgroup_id);
+                            }
                             let _ = self.cgroup.destroy_zone_cgroup(zone_name);
                         }
                     }
@@ -440,7 +667,7 @@ impl IsolationBackend for LinuxBackend {
                     let name = entry.file_name();
                     let name_str = name.to_string_lossy();
                     if let Some(zone_name) = name_str.strip_prefix("rauha-") {
-                        if !known_names.contains(zone_name) {
+                        if !known_names.contains(zone_name) && !live_orphans.contains(zone_name) {
                             tracing::warn!(netns = %name_str, "cleaning up orphaned netns");
                             let _ = namespace::destroy_netns(zone_name);
                         }
@@ -453,6 +680,7 @@ impl IsolationBackend for LinuxBackend {
     }
 
     fn create_zone(&self, config: &ZoneConfig) -> Result<ZoneHandle> {
+        admit_linux_policy(&config.policy, &self.enforcer.skipped_hooks())?;
         tracing::info!(zone = config.name, backend = "linux-ebpf", "creating zone");
 
         let zone_uuid = Uuid::new_v4();
@@ -470,42 +698,13 @@ impl IsolationBackend for LinuxBackend {
             }
         };
 
-        // Step 2: Create network namespace + veth with IP assignment.
-        let net_state = if config.policy.network.mode != NetworkMode::Host {
-            // Allocate an IP for this zone.
-            let ip_state = {
-                let mut alloc = lock_backend(&self.ip_allocator, "ip_allocator")?;
-                let ip = alloc.allocate()?;
-                ZoneNetworkState {
-                    ip: ip.octets(),
-                    gateway: alloc.gateway().octets(),
-                    prefix_len: alloc.prefix_len(),
-                }
-            };
-
-            namespace::create_netns(&config.name).map_err(|e| {
-                tracing::error!(%e, zone = config.name, "failed to create netns for bridged zone");
-                e
-            })?;
-            if let Err(e) = network::create_veth_pair(&config.name, Some(&ip_state)) {
-                tracing::warn!(%e, zone = config.name, "failed to create veth pair — zone will have limited networking");
-            }
-
-            Some(ip_state)
-        } else {
-            // Host mode: zone shares the host's network stack.
-            // No network namespace or veth pair — the zone's processes use
-            // the host interfaces directly.
-            None
-        };
-
-        let rollback_zone = |reason: &str| {
+        let rollback_zone = |reason: &str, net_state: Option<&ZoneNetworkState>| {
             tracing::warn!(
                 zone = config.name,
                 reason,
                 "rolling back failed zone creation"
             );
-            if let Some(ref net_state) = net_state {
+            if let Some(net_state) = net_state {
                 match lock_backend(&self.ip_allocator, "ip_allocator") {
                     Ok(mut alloc) => alloc.release(net_state.ip()),
                     Err(e) => tracing::error!(%e, "failed to release zone IP during rollback"),
@@ -521,6 +720,52 @@ impl IsolationBackend for LinuxBackend {
                 }
                 Err(e) => tracing::error!(%e, "failed to remove zone name during rollback"),
             }
+            if let Ok(mut degraded) = lock_backend(&self.zone_degradations, "zone_degradations") {
+                degraded.remove(&config.name);
+            }
+        };
+
+        // Step 2: Create network namespace + veth with IP assignment.
+        let net_state = if config.policy.network.mode != NetworkMode::Host {
+            // Allocate an IP for this zone.
+            let ip_state = match (|| -> Result<ZoneNetworkState> {
+                let mut alloc = lock_backend(&self.ip_allocator, "ip_allocator")?;
+                let ip = alloc.allocate()?;
+                Ok(ZoneNetworkState {
+                    ip: ip.octets(),
+                    gateway: alloc.gateway().octets(),
+                    prefix_len: alloc.prefix_len(),
+                })
+            })() {
+                Ok(state) => state,
+                Err(e) => {
+                    rollback_zone("ip-allocation", None);
+                    return Err(e);
+                }
+            };
+
+            if let Err(e) = namespace::create_netns(&config.name) {
+                rollback_zone("network-namespace", Some(&ip_state));
+                return Err(e);
+            }
+            if let Err(e) = network::create_veth_pair(&config.name, Some(&ip_state)) {
+                if config.policy.admission == PolicyAdmission::Strict {
+                    rollback_zone("network-veth", Some(&ip_state));
+                    return Err(e);
+                }
+                if let Err(state_error) = self.record_degradation(&config.name, "network:veth") {
+                    rollback_zone("degradation-state", Some(&ip_state));
+                    return Err(state_error);
+                }
+                tracing::warn!(%e, zone = config.name, admission = "audit", status = "unsupported", "failed to create veth pair — zone networking is degraded");
+            }
+
+            Some(ip_state)
+        } else {
+            // Host mode: zone shares the host's network stack.
+            // No network namespace or veth pair — the zone's processes use
+            // the host interfaces directly.
+            None
         };
 
         // Step 3: Populate BPF maps. Missing enforcement is fatal.
@@ -528,7 +773,7 @@ impl IsolationBackend for LinuxBackend {
         // zone via ZONE_MEMBERSHIP, its ZONE_POLICY must already exist, or
         // the fail-closed capable() hook would deny it in the gap.
         if let Err(e) = self.enforcer.set_zone_policy(zone_id, &config.policy) {
-            rollback_zone("bpf-policy");
+            rollback_zone("bpf-policy", net_state.as_ref());
             return Err(e);
         }
 
@@ -537,7 +782,7 @@ impl IsolationBackend for LinuxBackend {
             .add_zone_member(cgroup_id, zone_id, config.zone_type)
         {
             let _ = self.enforcer.remove_zone_policy(zone_id);
-            rollback_zone("bpf-membership");
+            rollback_zone("bpf-membership", net_state.as_ref());
             return Err(e);
         }
 
@@ -550,7 +795,7 @@ impl IsolationBackend for LinuxBackend {
                 let _ = self.enforcer.remove_zone_member(cgroup_id);
                 let _ = self.enforcer.remove_zone_policy(zone_id);
             }
-            rollback_zone("resource-limits");
+            rollback_zone("resource-limits", net_state.as_ref());
             return Err(e);
         }
 
@@ -575,7 +820,13 @@ impl IsolationBackend for LinuxBackend {
             }
         }
 
-        // Remove from BPF maps first.
+        // A failed teardown must leave live workloads enforced. Drain and
+        // remove the cgroup before deleting any BPF membership or policy.
+        self.cgroup.drain_zone(&zone.name)?;
+        self.cgroup.destroy_zone_cgroup(&zone.name)?;
+
+        // The cgroup is now gone, so stale cleanup state cannot make a live
+        // workload fail open.
         let zone_id = self.remove_zone_id(&zone.id)?;
         // Remove stored inodes from BPF map (uses stored list, no re-walk).
         let stored_inodes = self
@@ -617,10 +868,9 @@ impl IsolationBackend for LinuxBackend {
         let _ = network::destroy_veth_pair(&zone.name);
         let _ = namespace::destroy_netns(&zone.name);
 
-        // Destroy cgroup last (must be empty).
-        self.cgroup.destroy_zone_cgroup(&zone.name)?;
-
         lock_backend(&self.zone_name_map, "zone_name_map")?.remove(&zone.name);
+        lock_backend(&self.zone_policies, "zone_policies")?.remove(&zone.name);
+        lock_backend(&self.zone_degradations, "zone_degradations")?.remove(&zone.name);
 
         // Clean up shim socket.
         let socket_path = Self::shim_socket_path(&zone.name);
@@ -631,44 +881,72 @@ impl IsolationBackend for LinuxBackend {
     }
 
     fn enforce_policy(&self, zone: &ZoneHandle, policy: &ZonePolicy) -> Result<()> {
+        admit_linux_policy(policy, &self.enforcer.skipped_hooks())?;
         tracing::info!(zone = zone.name, "enforcing policy");
 
         // Update BPF policy map. Route through the enforcement seam's neutral
         // `ZoneEnforcement` vocabulary so the policy that reaches the kernel is
         // exactly what crosses the Rauha/enforcer boundary.
-        if let Some(zone_id) = self.get_zone_id(&zone.id)? {
-            self.enforcer
-                .apply_zone_enforcement(zone_id, &policy.to_enforcement()?)?;
+        let zone_id = self.get_zone_id(&zone.id)?.ok_or_else(|| {
+            RauhaError::BackendError(format!("zone {} has no kernel identifier", zone.name))
+        })?;
+        self.enforcer
+            .apply_zone_enforcement(zone_id, &policy.to_enforcement()?)?;
 
-            // Wire up ZONE_ALLOWED_COMMS BPF map for defense-in-depth.
-            self.sync_bpf_allowed_comms(zone_id, &policy.network)?;
-        }
+        // Wire up ZONE_ALLOWED_COMMS BPF map for defense-in-depth.
+        self.sync_bpf_allowed_comms(zone_id, &policy.network)?;
 
         // Apply nftables forward rules for this zone.
-        self.apply_nftables_for_zone(zone, &policy.network)?;
+        self.apply_nftables_for_zone(zone, policy)?;
 
         // Update cgroup resource limits.
         self.cgroup.apply_resources(&zone.name, &policy.resources)?;
+
+        lock_backend(&self.zone_policies, "zone_policies")?
+            .insert(zone.name.clone(), policy.clone());
 
         Ok(())
     }
 
     fn hot_reload_policy(&self, zone: &ZoneHandle, policy: &ZonePolicy) -> Result<()> {
+        admit_linux_policy(policy, &self.enforcer.skipped_hooks())?;
         tracing::info!(zone = zone.name, "hot-reloading policy");
 
-        // BPF HashMap insert is atomic — kernel sees old or new, never partial.
-        if let Some(zone_id) = self.get_zone_id(&zone.id)? {
-            self.enforcer.hot_reload_policy(zone_id, policy)?;
+        let previous = lock_backend(&self.zone_policies, "zone_policies")?
+            .get(&zone.name)
+            .cloned()
+            .ok_or_else(|| {
+                RauhaError::BackendError(format!("zone {} has no policy to reload", zone.name))
+            })?;
+        let zone_id = self.get_zone_id(&zone.id)?.ok_or_else(|| {
+            RauhaError::BackendError(format!("zone {} has no kernel identifier", zone.name))
+        })?;
 
-            // Re-sync allowed comms on hot reload.
+        let update = (|| -> Result<()> {
+            self.enforcer.hot_reload_policy(zone_id, policy)?;
             self.sync_bpf_allowed_comms(zone_id, &policy.network)?;
+            self.apply_nftables_for_zone(zone, policy)?;
+            self.cgroup.apply_resources(&zone.name, &policy.resources)?;
+            Ok(())
+        })();
+        if let Err(error) = update {
+            if let Err(e) = self.enforcer.hot_reload_policy(zone_id, &previous) {
+                tracing::error!(%e, zone = zone.name, "failed to restore BPF policy after rejected reload");
+            }
+            if let Err(e) = self.sync_bpf_allowed_comms(zone_id, &previous.network) {
+                tracing::error!(%e, zone = zone.name, "failed to restore cross-zone permissions after rejected reload");
+            }
+            if let Err(e) = self.apply_nftables_for_zone(zone, &previous) {
+                tracing::error!(%e, zone = zone.name, "failed to restore network policy after rejected reload");
+            }
+            if let Err(e) = self.cgroup.apply_resources(&zone.name, &previous.resources) {
+                tracing::error!(%e, zone = zone.name, "failed to restore resources after rejected reload");
+            }
+            return Err(error);
         }
 
-        // Re-apply nftables rules.
-        self.apply_nftables_for_zone(zone, &policy.network)?;
-
-        // Update cgroup limits.
-        self.cgroup.apply_resources(&zone.name, &policy.resources)?;
+        lock_backend(&self.zone_policies, "zone_policies")?
+            .insert(zone.name.clone(), policy.clone());
 
         Ok(())
     }
@@ -684,6 +962,16 @@ impl IsolationBackend for LinuxBackend {
         self.ensure_shim(&zone.name)?;
 
         let container_id = Uuid::new_v4();
+        let policy = lock_backend(&self.zone_policies, "zone_policies")?
+            .get(&zone.name)
+            .cloned()
+            .ok_or_else(|| {
+                RauhaError::BackendError(format!(
+                    "zone {} has no admitted policy; refusing container creation",
+                    zone.name
+                ))
+            })?;
+        let capabilities = oci_capabilities(&policy)?;
 
         // Prepare rootfs for this container.
         // If overlay_layers is available, mount overlayfs (O(1) creation).
@@ -722,13 +1010,50 @@ impl IsolationBackend for LinuxBackend {
         }
 
         // Generate OCI runtime spec.
+        use oci_spec::runtime::{LinuxBuilder, LinuxNamespaceBuilder, LinuxNamespaceType};
+        let mut namespaces = vec![
+            LinuxNamespaceBuilder::default()
+                .typ(LinuxNamespaceType::Mount)
+                .build()
+                .unwrap(),
+            LinuxNamespaceBuilder::default()
+                .typ(LinuxNamespaceType::Uts)
+                .build()
+                .unwrap(),
+            LinuxNamespaceBuilder::default()
+                .typ(LinuxNamespaceType::Ipc)
+                .build()
+                .unwrap(),
+            LinuxNamespaceBuilder::default()
+                .typ(LinuxNamespaceType::Pid)
+                .build()
+                .unwrap(),
+        ];
+        if policy.network.mode != NetworkMode::Host {
+            namespaces.push(
+                LinuxNamespaceBuilder::default()
+                    .typ(LinuxNamespaceType::Network)
+                    .path(format!("/var/run/netns/rauha-{}", zone.name))
+                    .build()
+                    .unwrap(),
+            );
+        }
+        let linux = LinuxBuilder::default()
+            .namespaces(namespaces)
+            .build()
+            .map_err(|e| {
+                RauhaError::BackendError(format!("failed to build OCI Linux spec: {e}"))
+            })?;
         let spec_json = serde_json::to_string(
             &oci_spec::runtime::SpecBuilder::default()
                 .version("1.0.2")
                 .root(
                     oci_spec::runtime::RootBuilder::default()
                         .path(rootfs_dir.to_string_lossy().as_ref())
-                        .readonly(false)
+                        // An empty writable-path allow-list means allow no
+                        // writes. The shim remounts this root read-only before
+                        // releasing the workload.
+                        .readonly(policy.filesystem.writable_paths.is_empty())
                         .build()
                         .unwrap(),
                 )
@@ -750,9 +1075,12 @@ impl IsolationBackend for LinuxBackend {
                         )
                         .cwd(spec.working_dir.as_deref().unwrap_or("/"))
                         .terminal(false)
+                        .capabilities(capabilities)
+                        .no_new_privileges(true)
                         .build()
                         .unwrap(),
                 )
+                .linux(linux)
                 .hostname(spec.name.clone())
                 .build()
                 .unwrap(),
@@ -771,35 +1099,56 @@ impl IsolationBackend for LinuxBackend {
                 "collecting rootfs inodes for BPF file isolation"
             );
 
-            let inodes = maps::collect_rootfs_inodes(&rootfs_dir, rauha_ebpf_common::MAX_INODES);
+            let registration = (|| -> Result<(Vec<u64>, usize)> {
+                let inodes =
+                    maps::collect_rootfs_inodes(&rootfs_dir, rauha_ebpf_common::MAX_INODES)?;
+                let collected = inodes.len();
+                let inserted = self.enforcer.insert_inodes(&inodes, zone_id)?;
+                Ok((inserted, collected))
+            })();
 
-            if !inodes.is_empty() {
-                match self.enforcer.insert_inodes(&inodes, zone_id) {
-                    Ok(inserted) => {
-                        // Store only successfully inserted inodes for cleanup.
-                        // This prevents removing entries that were never in the map.
-                        lock_backend(&self.registered_inodes, "registered_inodes")?
-                            .entry(zone.name.clone())
-                            .or_default()
-                            .extend_from_slice(&inserted);
-                        tracing::info!(
-                            zone = zone.name,
-                            container = %container_id,
-                            count = inserted.len(),
-                            collected = inodes.len(),
-                            "registered container rootfs inodes in BPF map"
-                        );
+            match registration {
+                Ok((inserted, collected)) => {
+                    lock_backend(&self.registered_inodes, "registered_inodes")?
+                        .entry(zone.name.clone())
+                        .or_default()
+                        .extend_from_slice(&inserted);
+                    if inserted.len() != collected {
+                        let error = RauhaError::BackendError(format!(
+                            "rootfs inode enforcement incomplete: registered {} of {collected}",
+                            inserted.len()
+                        ));
+                        if policy.admission == PolicyAdmission::Strict {
+                            return Err(error);
+                        }
+                        self.record_degradation(&zone.name, "filesystem:inode_ownership")?;
+                        tracing::warn!(%error, zone = zone.name, container = %container_id, admission = "audit", "file isolation incomplete");
                     }
-                    Err(e) => {
-                        tracing::warn!(
-                            %e,
-                            zone = zone.name,
-                            container = %container_id,
-                            "failed to register rootfs inodes — file isolation incomplete"
-                        );
-                    }
+                    tracing::info!(
+                        zone = zone.name,
+                        container = %container_id,
+                        count = inserted.len(),
+                        collected,
+                        "registered container rootfs inodes in BPF map"
+                    );
+                }
+                Err(e) if policy.admission == PolicyAdmission::Strict => return Err(e),
+                Err(e) => {
+                    self.record_degradation(&zone.name, "filesystem:inode_ownership")?;
+                    tracing::warn!(
+                        %e,
+                        zone = zone.name,
+                        container = %container_id,
+                        admission = "audit",
+                        "failed to register rootfs inodes — file isolation incomplete"
+                    );
                 }
             }
+        } else {
+            return Err(RauhaError::BackendError(format!(
+                "zone {} has no kernel identifier; refusing container creation",
+                zone.name
+            )));
         }
 
         // Send CreateContainer to shim.
@@ -915,6 +1264,38 @@ impl IsolationBackend for LinuxBackend {
 
     fn verify_isolation(&self, zone: &ZoneHandle) -> Result<IsolationReport> {
         let mut checks = Vec::new();
+        let admitted_policy = lock_backend(&self.zone_policies, "zone_policies")?
+            .get(&zone.name)
+            .cloned();
+        let mut policy_controls_ok = admitted_policy.is_some();
+        if admitted_policy.is_none() {
+            checks.push(IsolationCheck {
+                name: "policy:admitted".into(),
+                passed: false,
+                detail: "zone has no admitted backend policy".into(),
+            });
+        }
+        if let Some(policy) = admitted_policy.as_ref() {
+            for control in unsupported_linux_controls(policy) {
+                policy_controls_ok = false;
+                checks.push(IsolationCheck {
+                    name: format!("policy:{control}"),
+                    passed: false,
+                    detail: "requested control is unsupported by the Linux backend".into(),
+                });
+            }
+        }
+        let degradations = lock_backend(&self.zone_degradations, "zone_degradations")?
+            .get(&zone.name)
+            .cloned()
+            .unwrap_or_default();
+        for control in &degradations {
+            checks.push(IsolationCheck {
+                name: control.clone(),
+                passed: false,
+                detail: "control degraded during runtime setup".into(),
+            });
+        }
 
         // Check 1: cgroup exists.
         let cgroup_ok = self.cgroup.zone_cgroup_exists(&zone.name);
@@ -931,7 +1312,8 @@ impl IsolationBackend for LinuxBackend {
         // Check 2: eBPF programs loaded.
         let ebpf_ok = match self.enforcer.health_check() {
             Ok(statuses) => {
-                let all_ok = statuses.iter().all(|s| s.loaded && s.attached);
+                let skipped = self.enforcer.skipped_hooks();
+                let all_ok = statuses.iter().all(|s| s.loaded && s.attached) && skipped.is_empty();
                 for status in &statuses {
                     let passed = status.loaded && status.attached;
                     let detail = if status.loaded && status.attached {
@@ -947,6 +1329,13 @@ impl IsolationBackend for LinuxBackend {
                         detail,
                     });
                 }
+                for hook in skipped {
+                    checks.push(IsolationCheck {
+                        name: format!("ebpf:{hook}"),
+                        passed: false,
+                        detail: "kernel does not expose this required BPF-LSM hook".into(),
+                    });
+                }
                 all_ok
             }
             Err(e) => {
@@ -960,26 +1349,124 @@ impl IsolationBackend for LinuxBackend {
         };
 
         // Check 3: zone membership in BPF map.
-        let membership_ok = self.get_zone_id(&zone.id)?.is_some();
+        let (membership_ok, membership_detail) = match self.get_zone_id(&zone.id)? {
+            Some(zone_id) => match self.enforcer.zone_member_matches(zone.platform_id, zone_id) {
+                Ok(true) => (
+                    true,
+                    "zone cgroup is registered in the BPF membership map".into(),
+                ),
+                Ok(false) => (
+                    false,
+                    "zone cgroup is missing or mismatched in the BPF membership map".into(),
+                ),
+                Err(e) => (false, format!("failed to read BPF membership map: {e}")),
+            },
+            None => (false, "zone has no userspace kernel identifier".into()),
+        };
         checks.push(IsolationCheck {
             name: "bpf_membership".into(),
             passed: membership_ok,
-            detail: if membership_ok {
-                "zone registered in BPF membership map".into()
-            } else {
-                "zone not in BPF map — kernel cannot identify zone processes".into()
-            },
+            detail: membership_detail,
         });
 
-        // Check 4: network namespace.
-        let netns_ok = namespace::netns_exists(&zone.name);
+        let (inode_ok, inode_detail) = match self.get_zone_id(&zone.id)? {
+            Some(zone_id) => match collect_zone_rootfs_inodes(&self.root, &zone.name) {
+                Ok(expected)
+                    if expected.is_empty()
+                        && self.cgroup.zone_has_processes(&zone.name).unwrap_or(true) =>
+                {
+                    (
+                        false,
+                        "live zone has no discoverable rootfs inode ownership".into(),
+                    )
+                }
+                Ok(expected) => {
+                    let mut recorded = lock_backend(&self.registered_inodes, "registered_inodes")?
+                        .get(&zone.name)
+                        .cloned()
+                        .unwrap_or_default();
+                    let mut expected_sorted = expected;
+                    recorded.sort_unstable();
+                    recorded.dedup();
+                    expected_sorted.sort_unstable();
+                    expected_sorted.dedup();
+                    if recorded != expected_sorted {
+                        (
+                            false,
+                            format!(
+                                "userspace inode ownership differs from rootfs: recorded {}, expected {}",
+                                recorded.len(),
+                                expected_sorted.len()
+                            ),
+                        )
+                    } else {
+                        match self.enforcer.inodes_match(&expected_sorted, zone_id) {
+                            Ok(true) => (
+                                true,
+                                format!("{} rootfs inodes registered", expected_sorted.len()),
+                            ),
+                            Ok(false) => (
+                                false,
+                                "kernel inode ownership map is incomplete or mismatched".into(),
+                            ),
+                            Err(e) => (false, format!("failed to verify inode ownership map: {e}")),
+                        }
+                    }
+                }
+                Err(e) => (false, format!("failed to enumerate zone rootfs: {e}")),
+            },
+            None => (false, "zone has no userspace kernel identifier".into()),
+        };
+        checks.push(IsolationCheck {
+            name: "filesystem:inode_ownership".into(),
+            passed: inode_ok,
+            detail: inode_detail,
+        });
+
+        // Check 4: requested network isolation and its filtering rules.
+        let network_mode = admitted_policy
+            .as_ref()
+            .map(|policy| policy.network.mode)
+            .unwrap_or(NetworkMode::Isolated);
+        let requires_netns = network_mode != NetworkMode::Host;
+        let netns_ok = !requires_netns || namespace::netns_exists(&zone.name);
         checks.push(IsolationCheck {
             name: "netns".into(),
             passed: netns_ok,
-            detail: if netns_ok {
+            detail: if !requires_netns {
+                "host network mode intentionally shares the host namespace".into()
+            } else if netns_ok {
                 "network namespace exists".into()
             } else {
                 "network namespace missing — network not isolated".into()
+            },
+        });
+        let veth_ok = !requires_netns || network::veth_exists(&zone.name);
+        checks.push(IsolationCheck {
+            name: "network:veth".into(),
+            passed: veth_ok,
+            detail: if !requires_netns {
+                "host network mode does not require a veth".into()
+            } else if veth_ok {
+                "zone veth exists".into()
+            } else {
+                "zone veth missing — network namespace is disconnected".into()
+            },
+        });
+        let veth_name = network::veth_host_name_for(&zone.name);
+        let fallback_policy = NetworkPolicy::default();
+        let network_policy = admitted_policy
+            .as_ref()
+            .map(|policy| &policy.network)
+            .unwrap_or(&fallback_policy);
+        let nft_ok = nftables::zone_rules_exist(&zone.name, &veth_name, network_policy);
+        checks.push(IsolationCheck {
+            name: "network:nftables".into(),
+            passed: nft_ok,
+            detail: if nft_ok {
+                "zone network policy rules are installed".into()
+            } else {
+                "zone nftables rules missing — network policy is not enforced".into()
             },
         });
 
@@ -1005,7 +1492,15 @@ impl IsolationBackend for LinuxBackend {
             }
         }
 
-        let is_isolated = cgroup_ok && ebpf_ok && membership_ok && netns_ok;
+        let is_isolated = policy_controls_ok
+            && degradations.is_empty()
+            && cgroup_ok
+            && ebpf_ok
+            && membership_ok
+            && inode_ok
+            && netns_ok
+            && veth_ok
+            && nft_ok;
 
         Ok(IsolationReport {
             zone_id: zone.id,
@@ -1100,7 +1595,12 @@ fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> Result<()
 
 #[cfg(test)]
 mod tests {
-    use super::lock_backend;
+    use super::{
+        admit_linux_policy, collect_zone_rootfs_inodes, lock_backend, oci_capabilities,
+        unsupported_linux_controls,
+    };
+    use rauha_common::zone::{PolicyAdmission, ZonePolicy};
+    use std::os::unix::fs::MetadataExt;
     use std::sync::{Arc, Mutex};
 
     #[test]
@@ -1116,5 +1616,65 @@ mod tests {
 
         let err = lock_backend(&mutex, "test_state").expect_err("poisoned lock must fail closed");
         assert!(err.to_string().contains("test_state"));
+    }
+
+    #[test]
+    fn strict_admission_rejects_unsupported_controls() {
+        let mut policy = ZonePolicy::default();
+        policy.filesystem.writable_paths = vec!["/tmp".into()];
+        policy.devices.allowed = vec!["/dev/null".into()];
+        policy.syscalls.deny = vec!["mount".into()];
+        policy.network.allowed_ingress = vec!["tcp:8080".into()];
+
+        assert_eq!(
+            unsupported_linux_controls(&policy),
+            vec![
+                "filesystem.writable_paths",
+                "devices.allowed",
+                "syscalls.deny",
+                "network.allowed_ingress",
+            ]
+        );
+
+        let err = admit_linux_policy(&policy, &[]).expect_err("strict policy must fail closed");
+        assert!(err.to_string().contains("filesystem.writable_paths"));
+
+        policy.admission = PolicyAdmission::Audit;
+        admit_linux_policy(&policy, &[]).expect("audit mode explicitly accepts degraded admission");
+    }
+
+    #[test]
+    fn strict_admission_rejects_missing_kernel_hooks() {
+        let err = admit_linux_policy(&ZonePolicy::default(), &["cgroup_attach_task".into()])
+            .expect_err("strict policy must reject degraded kernel enforcement");
+        assert!(err.to_string().contains("lsm.cgroup_attach_task"));
+    }
+
+    #[test]
+    fn empty_policy_builds_empty_oci_capability_sets() {
+        let capabilities = oci_capabilities(&ZonePolicy::default()).unwrap();
+        assert!(capabilities.bounding().as_ref().unwrap().is_empty());
+        assert!(capabilities.effective().as_ref().unwrap().is_empty());
+        assert!(capabilities.inheritable().as_ref().unwrap().is_empty());
+        assert!(capabilities.permitted().as_ref().unwrap().is_empty());
+        assert!(capabilities.ambient().as_ref().unwrap().is_empty());
+    }
+
+    #[test]
+    fn recovery_collects_every_container_rootfs() {
+        let root = tempfile::tempdir().unwrap();
+        let containers = root.path().join("zones/test/containers");
+        let first = containers.join("one/merged");
+        let second = containers.join("two/rootfs");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        let first_file = first.join("first");
+        let second_file = second.join("second");
+        std::fs::write(&first_file, b"one").unwrap();
+        std::fs::write(&second_file, b"two").unwrap();
+
+        let inodes = collect_zone_rootfs_inodes(root.path().to_str().unwrap(), "test").unwrap();
+        assert!(inodes.contains(&first_file.metadata().unwrap().ino()));
+        assert!(inodes.contains(&second_file.metadata().unwrap().ino()));
     }
 }

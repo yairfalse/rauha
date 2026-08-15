@@ -204,6 +204,8 @@ pub struct SandboxRun {
     pub stdout: String,
     pub stderr: String,
     pub duration_ms: u64,
+    pub admission: String,
+    pub unavailable_controls: Vec<String>,
     pub events: Vec<SandboxEvent>,
     pub enforcement_events: Vec<SandboxEnforcementEvent>,
 }

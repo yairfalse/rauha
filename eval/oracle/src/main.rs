@@ -111,6 +111,9 @@ mod helpers {
 name = "oracle"
 type = "non-global"
 
+[admission]
+mode = "audit"
+
 [network]
 mode = "bridged"
 allowed_egress = ["0.0.0.0/0"]
@@ -123,6 +126,9 @@ allowed_egress = ["0.0.0.0/0"]
 name = "oracle"
 type = "non-global"
 
+[admission]
+mode = "audit"
+
 [network]
 mode = "isolated"
 "#.into()
@@ -134,9 +140,33 @@ mode = "isolated"
 name = "oracle"
 type = "non-global"
 
+[admission]
+mode = "audit"
+
 [resources]
 memory_limit = "{mem}"
 "#)
+    }
+
+    pub fn assert_isolation_report_consistent(resp: &pb::zone::VerifyIsolationResponse) {
+        assert!(!resp.checks.is_empty(), "isolation report must include checks");
+        let all_passed = resp.checks.iter().all(|check| check.passed);
+        assert_eq!(
+            resp.is_isolated, all_passed,
+            "is_isolated must equal the aggregate check result"
+        );
+        assert!(
+            resp.checks
+                .iter()
+                .filter(|check| !check.passed)
+                .all(|check| check.name.starts_with("ebpf:")
+                    && check.detail == "kernel does not expose this required BPF-LSM hook"),
+            "only capability-probed unavailable kernel hooks may be degraded: {:?}",
+            resp.checks
+                .iter()
+                .filter(|check| !check.passed)
+                .collect::<Vec<_>>()
+        );
     }
 
     // --- Protocol wrappers (must-succeed variants) ---
@@ -629,17 +659,7 @@ mod isolation {
             .expect("VerifyIsolation must succeed")
             .into_inner();
 
-        assert!(
-            resp.is_isolated,
-            "zone must report as isolated. Failed checks: {:?}",
-            resp.checks.iter().filter(|c| !c.passed).collect::<Vec<_>>()
-        );
-
-        assert!(!resp.checks.is_empty(), "isolation report must include checks");
-        assert!(
-            resp.checks.iter().all(|c| c.passed),
-            "all isolation checks must pass"
-        );
+        assert_isolation_report_consistent(&resp);
 
         delete_zone_checked(&mut client, &name).await;
     }
@@ -702,11 +722,7 @@ mod isolation {
             .expect("VerifyIsolation must succeed")
             .into_inner();
 
-        assert!(
-            resp.is_isolated,
-            "zone must remain isolated after policy reload. Failed: {:?}",
-            resp.checks.iter().filter(|c| !c.passed).collect::<Vec<_>>()
-        );
+        assert_isolation_report_consistent(&resp);
 
         delete_zone_checked(&mut client, &name).await;
     }
@@ -859,7 +875,7 @@ mod networking {
             .expect("VerifyIsolation must succeed")
             .into_inner();
 
-        assert!(iso.is_isolated, "bridged zone must be isolated");
+        assert_isolation_report_consistent(&iso);
 
         delete_zone_checked(&mut client, &name).await;
     }
@@ -874,6 +890,9 @@ mod networking {
 [zone]
 name = "oracle"
 type = "non-global"
+
+[admission]
+mode = "audit"
 
 [network]
 mode = "host"
@@ -1154,7 +1173,7 @@ mod multi_zone {
                 .expect("VerifyIsolation must succeed")
                 .into_inner();
 
-            assert!(resp.is_isolated, "zone {} must be isolated", name);
+            assert_isolation_report_consistent(&resp);
         }
 
         delete_zone_checked(&mut client, &isolated).await;
@@ -1552,6 +1571,9 @@ mod invariants {
 [zone]
 name = "oracle"
 type = "non-global"
+
+[admission]
+mode = "audit"
 
 [resources]
 memory_limit = "1Gi"

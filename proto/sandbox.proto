@@ -28,6 +28,9 @@ message RunSandboxRequest {
     uint32 timeout_seconds = 7;
     // Extra environment variables.
     map<string, string> env = 8;
+    // Explicitly permit execution when the selected backend reports degraded
+    // enforcement. Strict admission remains the default.
+    bool audit = 9;
 }
 
 message SandboxResult {
@@ -56,6 +59,10 @@ message SandboxResult {
     // Best-effort: daemon-wide broadcast lag or missing backend support can
     // make this empty even when the task ran.
     repeated EnforcementEventSummary enforcement_events = 12;
+    // Effective policy admission used for this task: strict or audit.
+    string admission = 13;
+    // Isolation checks that were unavailable or failed at execution time.
+    repeated string unavailable_controls = 14;
 }
 
 message SandboxEventSummary {

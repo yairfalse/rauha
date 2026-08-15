@@ -1,0 +1,12 @@
+{
+  "schema": "sykli-contract.v1",
+  "tasks": [
+    {
+      "name": "full",
+      "run": "bash tests/security/run.sh --gate",
+      "inputs": [
+        ".sykli/runtime"
+      ]
+    }
+  ]
+}

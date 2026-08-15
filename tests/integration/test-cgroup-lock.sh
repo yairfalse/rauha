@@ -17,15 +17,20 @@ FIFO="/tmp/rauha-test-cglock-$$"
 RESULT_FILE="/tmp/rauha-test-cglock-result-$$"
 ERR_FILE="/tmp/rauha-test-cglock-error-$$"
 HELPER_PID=""
+CONTAINER_ID=""
 
 cleanup() {
     if [ -n "${HELPER_PID:-}" ]; then
         kill "$HELPER_PID" 2>/dev/null || true
         wait "$HELPER_PID" 2>/dev/null || true
     fi
+    if [ -n "${CONTAINER_ID:-}" ]; then
+        $RAUHA stop "$CONTAINER_ID" 2>/dev/null || true
+        $RAUHA delete "$CONTAINER_ID" --force 2>/dev/null || true
+    fi
     rm -f "$FIFO" "$RESULT_FILE" "$ERR_FILE"
-    $RAUHA zone delete --name "$ZONE_A" --force 2>/dev/null || true
-    $RAUHA zone delete --name "$ZONE_B" --force 2>/dev/null || true
+    $RAUHA zone delete "$ZONE_A" --force 2>/dev/null || true
+    $RAUHA zone delete "$ZONE_B" --force 2>/dev/null || true
 }
 trap cleanup EXIT
 
@@ -34,8 +39,17 @@ echo "=== cgroup_lock enforcement test ==="
 # Pull image (idempotent).
 $RAUHA image pull "$IMAGE" 2>/dev/null || true
 
-# Create two zones.
-$RAUHA zone create --name "$ZONE_A"
+# Create two strict zones. A kernel without cgroup_attach_task must reject
+# strict admission instead of pretending the escape control is active.
+if CREATE_ERROR=$($RAUHA zone create --name "$ZONE_A" 2>&1); then
+    :
+elif grep -q "lsm.cgroup_attach_task" <<<"$CREATE_ERROR"; then
+    echo "PASS: strict admission rejected unavailable cgroup_attach_task enforcement"
+    exit 0
+else
+    echo "FAIL: strict zone admission failed unexpectedly: $CREATE_ERROR" >&2
+    exit 1
+fi
 $RAUHA zone create --name "$ZONE_B"
 
 CGROUP_A="/sys/fs/cgroup/rauha.slice/zone-${ZONE_A}"
@@ -143,5 +157,7 @@ echo "  PASS: cross-zone cgroup move correctly denied"
 
 # Cleanup the container.
 $RAUHA stop "$CONTAINER_ID" 2>/dev/null || true
+$RAUHA delete "$CONTAINER_ID" --force 2>/dev/null || true
+CONTAINER_ID=""
 
 echo "=== All cgroup_lock tests passed ==="

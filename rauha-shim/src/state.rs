@@ -122,6 +122,12 @@ impl ShimState {
             .map(|p| (p.pid, p.status.to_string(), p.exit_code))
     }
 
+    pub fn spec_json(&self, id: &str) -> Option<&str> {
+        self.containers
+            .get(id)
+            .map(|process| process.spec_json.as_str())
+    }
+
     /// Reap exited child processes.
     pub fn reap_children(&mut self) {
         for proc in self.containers.values_mut() {

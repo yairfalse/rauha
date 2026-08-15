@@ -202,13 +202,134 @@ fn write_all_fd(fd: i32, mut data: &[u8]) -> Result<(), ()> {
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
+struct ContainerNamespaces {
+    root: std::fs::File,
+    mount: std::fs::File,
+    uts: std::fs::File,
+    ipc: std::fs::File,
+    network: std::fs::File,
+    pid: std::fs::File,
+}
+
+#[cfg(target_os = "linux")]
+impl ContainerNamespaces {
+    fn open(pid: u32) -> anyhow::Result<Self> {
+        let proc = std::path::PathBuf::from(format!("/proc/{pid}"));
+        Ok(Self {
+            root: std::fs::File::open(proc.join("root"))?,
+            mount: std::fs::File::open(proc.join("ns/mnt"))?,
+            uts: std::fs::File::open(proc.join("ns/uts"))?,
+            ipc: std::fs::File::open(proc.join("ns/ipc"))?,
+            network: std::fs::File::open(proc.join("ns/net"))?,
+            pid: std::fs::File::open(proc.join("ns/pid"))?,
+        })
+    }
+
+    /// Enter all non-user namespaces. PID membership takes effect for the next
+    /// child, which fork_and_exec_pty creates immediately afterward.
+    fn enter(&self) -> bool {
+        [
+            (&self.mount, nix::sched::CloneFlags::CLONE_NEWNS),
+            (&self.uts, nix::sched::CloneFlags::CLONE_NEWUTS),
+            (&self.ipc, nix::sched::CloneFlags::CLONE_NEWIPC),
+            (&self.network, nix::sched::CloneFlags::CLONE_NEWNET),
+            (&self.pid, nix::sched::CloneFlags::CLONE_NEWPID),
+        ]
+        .into_iter()
+        .all(|(namespace, flag)| nix::sched::setns(namespace, flag).is_ok())
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
+fn exec_child(
+    namespaces: ContainerNamespaces,
+    pty_slave: std::os::fd::OwnedFd,
+    setup_wr: std::os::fd::OwnedFd,
+    ready_wr: std::os::fd::OwnedFd,
+    go_rd: std::os::fd::OwnedFd,
+    slave_fd: i32,
+    go_rd_raw: i32,
+    process_security: crate::container::ProcessSecurity,
+    cap_last_cap: u32,
+    args: &[std::ffi::CString],
+    env: &[std::ffi::CString],
+    term: &std::ffi::CString,
+) -> ! {
+    use std::os::fd::AsRawFd;
+
+    drop(setup_wr);
+    let _ = nix::unistd::setsid();
+    let _ = nix::unistd::dup2(slave_fd, 0);
+    let _ = nix::unistd::dup2(slave_fd, 1);
+    let _ = nix::unistd::dup2(slave_fd, 2);
+    if slave_fd > 2 {
+        drop(pty_slave);
+    }
+    unsafe {
+        libc::ioctl(0, libc::TIOCSCTTY, 0);
+    }
+
+    let root_ok = unsafe {
+        libc::fchdir(namespaces.root.as_raw_fd()) == 0
+            && libc::chroot(c".".as_ptr()) == 0
+            && libc::chdir(c"/".as_ptr()) == 0
+    };
+    drop(namespaces);
+    if !root_ok {
+        unsafe {
+            let msg = b"rauha-shim: exec root entry failed\n";
+            let _ = libc::write(2, msg.as_ptr() as _, msg.len());
+            libc::_exit(1);
+        }
+    }
+
+    if crate::container::apply_process_security(process_security, cap_last_cap).is_err() {
+        unsafe {
+            let msg = b"rauha-shim: exec process security failed\n";
+            let _ = libc::write(2, msg.as_ptr() as _, msg.len());
+            libc::_exit(1);
+        }
+    }
+
+    let _ = nix::unistd::write(&ready_wr, &[1u8]);
+    drop(ready_wr);
+    let mut buf = [0u8; 1];
+    let enrolled = matches!(nix::unistd::read(go_rd_raw, &mut buf), Ok(1));
+    drop(go_rd);
+    if !enrolled {
+        unsafe {
+            let msg = b"rauha-shim: exec cgroup enrollment failed\n";
+            let _ = libc::write(2, msg.as_ptr() as _, msg.len());
+            libc::_exit(125);
+        }
+    }
+
+    unsafe {
+        libc::clearenv();
+        for var in env {
+            libc::putenv(var.as_ptr() as *mut libc::c_char);
+        }
+        libc::putenv(term.as_ptr() as *mut libc::c_char);
+    }
+    let _ = nix::unistd::execvp(&args[0], args);
+    unsafe {
+        let msg = b"rauha-shim: execvp failed\n";
+        let _ = libc::write(2, msg.as_ptr() as _, msg.len());
+        libc::_exit(127);
+    }
+}
+
 /// Allocate a PTY pair and fork+exec a command, returning (master_fd, child_pid).
 #[cfg(target_os = "linux")]
 pub fn fork_and_exec_pty(
     zone_name: &str,
     container_id: &str,
+    init_pid: u32,
     command: &[String],
     env: &[String],
+    spec_json: &str,
     rootfs_root: &Path,
 ) -> anyhow::Result<(i32, u32)> {
     use nix::pty::openpty;
@@ -220,19 +341,16 @@ pub fn fork_and_exec_pty(
         anyhow::bail!("exec command is empty");
     }
 
+    if init_pid == 0 {
+        anyhow::bail!("container {container_id} is not running");
+    }
+
     // Check rootfs exists (merged or legacy).
     let container_dir = rootfs_root.join("containers").join(container_id);
-    let rootfs = {
-        let merged = container_dir.join("merged");
-        let legacy = container_dir.join("rootfs");
-        if merged.exists() {
-            merged
-        } else if legacy.exists() {
-            legacy
-        } else {
-            anyhow::bail!("rootfs not found for container {container_id}");
-        }
-    };
+    if !container_dir.join("merged").exists() && !container_dir.join("rootfs").exists() {
+        anyhow::bail!("rootfs not found for container {container_id}");
+    }
+    let namespaces = ContainerNamespaces::open(init_pid)?;
 
     let pty = openpty(None, None)?;
     let master_fd = pty.master.as_raw_fd();
@@ -242,85 +360,134 @@ pub fn fork_and_exec_pty(
 
     let c_env = cstring_vec(env, "exec.env")?;
     let term = CString::new("TERM=xterm-256color")?;
+    let spec: oci_spec::runtime::Spec = serde_json::from_str(spec_json)?;
+    let process = spec
+        .process()
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("spec missing process"))?;
+    let process_security = crate::container::ProcessSecurity::from_process(process)?;
+    let cap_last_cap = std::fs::read_to_string("/proc/sys/kernel/cap_last_cap")?
+        .trim()
+        .parse::<u32>()?
+        .min(63);
 
-    // Sync pipe for cgroup enrollment.
-    let (pipe_rd, pipe_wr) = nix::unistd::pipe()?;
-    let rd_raw = pipe_rd.as_raw_fd();
-    let wr_raw = pipe_wr.as_raw_fd();
+    // Two-phase handshake: trusted chroot and privilege drop happen before
+    // enrollment; image code starts only after enrollment succeeds.
+    let (setup_rd, setup_wr) = nix::unistd::pipe()?;
+    let (go_rd, go_wr) = nix::unistd::pipe()?;
+    let (ready_rd, ready_wr) = nix::unistd::pipe()?;
+    let setup_rd_raw = setup_rd.as_raw_fd();
+    let setup_wr_raw = setup_wr.as_raw_fd();
+    let go_rd_raw = go_rd.as_raw_fd();
+    let go_wr_raw = go_wr.as_raw_fd();
 
     match unsafe { unistd::fork() }? {
         ForkResult::Child => {
-            drop(pipe_wr);
+            drop(setup_rd);
+            drop(go_wr);
             drop(pty.master);
-
-            // Wait for cgroup enrollment.
-            let mut buf = [0u8; 1];
-            let _ = nix::unistd::read(rd_raw, &mut buf);
-            drop(pipe_rd);
-
-            // New session + set controlling terminal.
-            let _ = nix::unistd::setsid();
-
-            // Dup slave fd to stdin/stdout/stderr.
-            let _ = nix::unistd::dup2(slave_fd, 0);
-            let _ = nix::unistd::dup2(slave_fd, 1);
-            let _ = nix::unistd::dup2(slave_fd, 2);
-            if slave_fd > 2 {
-                drop(pty.slave);
-            }
-
-            // Set controlling terminal.
-            unsafe { libc::ioctl(0, libc::TIOCSCTTY, 0) };
-
-            // Chroot into container rootfs.
-            if let Err(e) = nix::unistd::chroot(&rootfs) {
-                let msg = format!("chroot failed: {e}\n");
+            if !namespaces.enter() {
                 unsafe {
+                    let msg = b"rauha-shim: exec namespace entry failed\n";
                     let _ = libc::write(2, msg.as_ptr() as _, msg.len());
                     libc::_exit(1);
                 }
             }
-            let _ = nix::unistd::chdir("/");
 
-            // Set environment using libc directly — Rust's std::env functions
-            // are NOT async-signal-safe (they hold a global mutex that may be
-            // held by another thread in the parent process after fork).
-            unsafe {
-                libc::clearenv();
-                for var in &c_env {
-                    libc::putenv(var.as_ptr() as *mut libc::c_char);
-                }
-                // Set TERM if not already in env.
-                libc::putenv(term.as_ptr() as *mut libc::c_char);
-            }
-
-            let err = nix::unistd::execvp(&c_args[0], &c_args);
-            let msg = format!("execvp failed: {err:?}\n");
-            unsafe {
-                let _ = libc::write(2, msg.as_ptr() as _, msg.len());
-                libc::_exit(127);
+            // setns(CLONE_NEWPID) applies to the next child, so a second clone
+            // is required for the exec process itself to enter the container's
+            // PID namespace.
+            match crate::container::clone_process(0) {
+                Ok(ForkResult::Child) => exec_child(
+                    namespaces,
+                    pty.slave,
+                    setup_wr,
+                    ready_wr,
+                    go_rd,
+                    slave_fd,
+                    go_rd_raw,
+                    process_security,
+                    cap_last_cap,
+                    &c_args,
+                    &c_env,
+                    &term,
+                ),
+                Ok(ForkResult::Parent { child: exec_child }) => unsafe {
+                    drop(namespaces);
+                    drop(pty.slave);
+                    drop(go_rd);
+                    drop(ready_wr);
+                    let mut ready = [0u8; 1];
+                    let is_ready =
+                        matches!(nix::unistd::read(ready_rd.as_raw_fd(), &mut ready), Ok(1));
+                    drop(ready_rd);
+                    if is_ready {
+                        let pid = exec_child.as_raw().to_ne_bytes();
+                        let _ = libc::write(setup_wr_raw, pid.as_ptr() as _, pid.len());
+                    }
+                    drop(setup_wr);
+                    let mut status = 0;
+                    let _ = libc::waitpid(exec_child.as_raw(), &mut status, 0);
+                    if libc::WIFEXITED(status) {
+                        libc::_exit(libc::WEXITSTATUS(status));
+                    }
+                    if libc::WIFSIGNALED(status) {
+                        libc::_exit(128 + libc::WTERMSIG(status));
+                    }
+                    libc::_exit(125);
+                },
+                Err(_) => unsafe {
+                    let msg = b"rauha-shim: exec namespace clone failed\n";
+                    let _ = libc::write(2, msg.as_ptr() as _, msg.len());
+                    libc::_exit(1);
+                },
             }
         }
         ForkResult::Parent { child } => {
-            drop(pipe_rd);
+            drop(setup_wr);
+            drop(go_rd);
             drop(pty.slave);
+            drop(ready_rd);
+            drop(ready_wr);
+            drop(namespaces);
 
-            let child_pid = child.as_raw() as u32;
+            let mut buf = [0u8; std::mem::size_of::<libc::pid_t>()];
+            let setup_ok =
+                matches!(nix::unistd::read(setup_rd_raw, &mut buf), Ok(n) if n == buf.len());
+            drop(setup_rd);
+            if !setup_ok {
+                drop(go_wr);
+                let _ = nix::sys::wait::waitpid(child, None);
+                anyhow::bail!("exec child failed during trusted setup");
+            }
+            let child_pid = i32::from_ne_bytes(buf) as u32;
+            let exec_pid = nix::unistd::Pid::from_raw(child_pid as i32);
 
             // Enroll child in zone cgroup.
             let cgroup_path = format!("/sys/fs/cgroup/rauha.slice/zone-{zone_name}/cgroup.procs");
             if let Err(e) = std::fs::write(&cgroup_path, child_pid.to_string()) {
-                tracing::warn!(%e, cgroup = cgroup_path, "failed to enroll exec child in cgroup");
+                let _ = nix::sys::signal::kill(exec_pid, nix::sys::signal::Signal::SIGKILL);
+                let _ = nix::sys::wait::waitpid(child, None);
+                drop(go_wr);
+                anyhow::bail!("failed to enroll exec child in zone cgroup {cgroup_path}: {e}");
             }
 
             // Signal child to proceed.
-            let _ = nix::unistd::write(unsafe { BorrowedFd::borrow_raw(wr_raw) }, &[1u8]);
-            drop(pipe_wr);
+            let signaled = nix::unistd::write(unsafe { BorrowedFd::borrow_raw(go_wr_raw) }, &[1u8]);
+            drop(go_wr);
+            if !matches!(signaled, Ok(1)) {
+                let _ = nix::sys::signal::kill(exec_pid, nix::sys::signal::Signal::SIGKILL);
+                let _ = nix::sys::wait::waitpid(child, None);
+                anyhow::bail!("exec child exited before workload start");
+            }
 
             // Prevent Rust from closing master_fd when pty.master drops —
             // the relay thread owns the fd and closes it via libc::close()
             // when the session ends (see serve_attach_session).
             std::mem::forget(pty.master);
+            std::thread::spawn(move || {
+                let _ = nix::sys::wait::waitpid(child, None);
+            });
 
             tracing::info!(
                 pid = child_pid,
@@ -377,8 +544,10 @@ pub fn resize_pty(_session_id: &str, _rows: u32, _cols: u32) -> anyhow::Result<(
 pub fn fork_and_exec_pty(
     _zone_name: &str,
     _container_id: &str,
+    _init_pid: u32,
     _command: &[String],
     _env: &[String],
+    _spec_json: &str,
     _rootfs_root: &Path,
 ) -> anyhow::Result<(i32, u32)> {
     anyhow::bail!("PTY exec is only supported on Linux")

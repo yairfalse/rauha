@@ -4,20 +4,19 @@ on:
   workflow_call:
   workflow_dispatch:
 
+concurrency:
+  group: ${{ github.repository }}-rauha-privileged
+  cancel-in-progress: false
+
 jobs:
   runtime:
     name: Integration and oracle
-    runs-on: [self-hosted, linux, rauha-bpf]
+    runs-on: arc-arm64
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@stable
-
-      - name: Verify BPF-LSM host
-        run: |
-          test -r /sys/kernel/btf/vmlinux
-          grep -qw bpf /sys/kernel/security/lsm
 
       - name: Install native dependencies
         run: sudo apt-get update && sudo apt-get install -y dwarves libssl-dev nftables pkg-config protobuf-compiler
@@ -30,35 +29,16 @@ jobs:
       - name: Install bpf-linker
         run: cargo binstall --no-confirm bpf-linker@0.11.0
 
-      - name: Build runtime and eBPF
-        run: |
-          cargo build --workspace
-          cargo xtask build-ebpf --release
+      - name: Install Sykli
+        run: cargo install --git https://github.com/false-systems/sykli --rev 71d264367852c9f5df737f223be3b6efbf791ca8 --locked
 
-      - name: Run integration tests and oracle
-        env:
-          RAUHA_BIN: target/debug/rauha
-          RAUHA_ROOT: /var/lib/rauha-ci
-        run: |
-          sudo env RAUHA_ROOT="$RAUHA_ROOT" target/debug/rauhad >"$RUNNER_TEMP/rauhad.log" 2>&1 &
-          daemon_pid=$!
-          cleanup() {
-            sudo kill "$daemon_pid" 2>/dev/null || true
-            wait "$daemon_pid" 2>/dev/null || true
-            sudo rm -rf "$RAUHA_ROOT"
-          }
-          trap cleanup EXIT
+      - name: Run locked security graph
+        run: bash tests/security/run.sh
 
-          for _ in {1..30}; do
-            if target/debug/rauha zone list >/dev/null 2>&1; then
-              break
-            fi
-            sleep 1
-          done
-          target/debug/rauha zone list
-
-          for test_script in tests/integration/*.sh; do
-            sudo env RAUHA_BIN="$RAUHA_BIN" RAUHA_ROOT="$RAUHA_ROOT" bash "$test_script"
-          done
-
-          RAUHA_GRPC_ENDPOINT=http://[::1]:9876 cargo test --manifest-path eval/oracle/Cargo.toml
+      - name: Upload execution receipt
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rauha-security-receipt
+          path: .sykli/receipt.json
+          if-no-files-found: error

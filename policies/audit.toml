@@ -1,9 +1,9 @@
 [zone]
-name = "strict"
+name = "audit"
 type = "non-global"
 
 [admission]
-mode = "strict"
+mode = "audit"
 
 [capabilities]
 allowed = []
@@ -22,10 +22,10 @@ allowed_ingress = []
 
 [filesystem]
 shared_layers = true
-writable_paths = ["/tmp"]
+writable_paths = []
 
 [devices]
-allowed = ["/dev/null", "/dev/zero", "/dev/urandom"]
+allowed = []
 
 [syscalls]
-deny = ["mount", "umount2", "pivot_root", "ptrace", "kexec_load", "reboot"]
+deny = []
