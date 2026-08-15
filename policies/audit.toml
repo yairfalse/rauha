@@ -1,0 +1,31 @@
+[zone]
+name = "audit"
+type = "non-global"
+
+[admission]
+mode = "audit"
+
+[capabilities]
+allowed = []
+
+[resources]
+cpu_shares = 512
+memory_limit = "1Gi"
+io_weight = 50
+pids_max = 128
+
+[network]
+mode = "isolated"
+allowed_zones = []
+allowed_egress = []
+allowed_ingress = []
+
+[filesystem]
+shared_layers = true
+writable_paths = []
+
+[devices]
+allowed = []
+
+[syscalls]
+deny = []

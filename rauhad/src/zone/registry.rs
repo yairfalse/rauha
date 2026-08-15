@@ -148,6 +148,7 @@ impl ZoneRegistry {
         tracing::info!(count = zones.len(), "reconciling zones from metadata");
 
         let mut handles = Vec::new();
+        let mut known_handles = Vec::with_capacity(zones.len());
         for zone in &zones {
             let mut handle = ZoneHandle {
                 id: zone.id,
@@ -155,6 +156,7 @@ impl ZoneRegistry {
                 platform_id: 0, // Updated by recover_zone with live cgroup_id.
                 network_state: zone.network_state.clone(),
             };
+            known_handles.push(handle.clone());
 
             match self
                 .backend
@@ -178,7 +180,7 @@ impl ZoneRegistry {
         }
 
         // Clean up orphaned kernel state.
-        if let Err(e) = self.backend.cleanup_orphans(&handles) {
+        if let Err(e) = self.backend.cleanup_orphans(&known_handles) {
             tracing::warn!(%e, "failed to clean up orphaned kernel state");
         }
 

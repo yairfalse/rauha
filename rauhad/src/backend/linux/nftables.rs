@@ -8,7 +8,8 @@
 //! syscall policy (file_open, ptrace, etc). This separation keeps each
 //! subsystem doing what it does best.
 
-use std::process::Command;
+use std::io::Write;
+use std::process::{Command, Stdio};
 
 use rauha_common::error::{RauhaError, Result};
 use rauha_common::zone::{NetworkMode, NetworkPolicy};
@@ -19,81 +20,30 @@ const TABLE_FAMILY: &str = "inet";
 /// Ensure the rauha nftables table and NAT masquerade chain exist.
 /// Called once during LinuxBackend::new().
 pub fn ensure_nat(subnet_cidr: &str) -> Result<()> {
-    // Check if table already exists.
-    if table_exists()? {
-        return Ok(());
-    }
-
-    // Create table.
-    run_nft(&["add", "table", TABLE_FAMILY, TABLE_NAME])?;
-
-    // Create postrouting NAT chain.
-    run_nft(&[
-        "add",
-        "chain",
-        TABLE_FAMILY,
-        TABLE_NAME,
-        "postrouting",
-        "{",
-        "type",
-        "nat",
-        "hook",
-        "postrouting",
-        "priority",
-        "srcnat",
-        ";",
-        "}",
-    ])?;
-
-    // Masquerade zone traffic going out through non-bridge interfaces.
-    let rule = format!("ip saddr {subnet_cidr} oifname != \"rauha0\" masquerade");
-    run_nft(&[
-        "add",
-        "rule",
-        TABLE_FAMILY,
-        TABLE_NAME,
-        "postrouting",
-        &rule,
-    ])?;
-
-    // Create forward chain with default drop policy.
-    // Any traffic not explicitly accepted by a zone chain is dropped.
-    run_nft(&[
-        "add",
-        "chain",
-        TABLE_FAMILY,
-        TABLE_NAME,
-        "forward",
-        "{",
-        "type",
-        "filter",
-        "hook",
-        "forward",
-        "priority",
-        "filter",
-        ";",
-        "policy",
-        "drop",
-        ";",
-        "}",
-    ])?;
-
-    // Allow established/related at the top of the forward chain so return
-    // traffic is never blocked.
-    run_nft(&[
-        "add",
-        "rule",
-        TABLE_FAMILY,
-        TABLE_NAME,
-        "forward",
-        "ct state established,related accept",
-    ])?;
+    // nft -f applies the complete batch as one kernel transaction. A syntax or
+    // runtime failure therefore leaves the previous enforcement table intact.
+    run_nft_script(&base_ruleset(subnet_cidr, table_exists()?))?;
 
     tracing::info!(
         subnet = subnet_cidr,
         "nftables NAT + forward chains created"
     );
     Ok(())
+}
+
+fn base_ruleset(subnet_cidr: &str, replace: bool) -> String {
+    format!(
+        "{delete}add table inet rauha\n\
+         add chain inet rauha postrouting {{ type nat hook postrouting priority srcnat; }}\n\
+         add rule inet rauha postrouting ip saddr {subnet_cidr} oifname != \"rauha0\" masquerade\n\
+         add chain inet rauha forward {{ type filter hook forward priority filter; policy drop; }}\n\
+         add rule inet rauha forward ct state established,related accept\n",
+        delete = if replace {
+            "delete table inet rauha\n"
+        } else {
+            ""
+        }
+    )
 }
 
 /// Remove the entire rauha nftables table.
@@ -185,34 +135,9 @@ pub fn apply_zone_rules(zone_name: &str, veth_name: &str, policy: &NetworkPolicy
                 );
             }
 
-            // Allow DNS always (before egress rules so it's never blocked).
-            run_nft(&[
-                "add",
-                "rule",
-                TABLE_FAMILY,
-                TABLE_NAME,
-                &chain_name,
-                &format!("iifname \"{veth_name}\" udp dport 53 accept"),
-            ])?;
-            run_nft(&[
-                "add",
-                "rule",
-                TABLE_FAMILY,
-                TABLE_NAME,
-                &chain_name,
-                &format!("iifname \"{veth_name}\" tcp dport 53 accept"),
-            ])?;
-
             // Allow specific egress destinations.
-            for dest in &policy.allowed_egress {
-                run_nft(&[
-                    "add",
-                    "rule",
-                    TABLE_FAMILY,
-                    TABLE_NAME,
-                    &chain_name,
-                    &format!("iifname \"{veth_name}\" ip daddr {dest} accept"),
-                ])?;
+            for rule in egress_rules(veth_name, &policy.allowed_egress) {
+                run_nft(&["add", "rule", TABLE_FAMILY, TABLE_NAME, &chain_name, &rule])?;
             }
 
             // Empty egress is deny-all. Default-drop also covers IPv6, while
@@ -258,6 +183,29 @@ pub fn remove_zone_rules(zone_name: &str) -> Result<()> {
     let _ = run_nft(&["delete", "chain", TABLE_FAMILY, TABLE_NAME, &chain_name]);
 
     Ok(())
+}
+
+pub fn zone_rules_exist(zone_name: &str, veth_name: &str, mode: NetworkMode) -> bool {
+    if mode == NetworkMode::Host {
+        return true;
+    }
+    let chain_name = zone_chain_name(zone_name);
+    let chain_ok = Command::new("nft")
+        .args(["list", "chain", TABLE_FAMILY, TABLE_NAME, &chain_name])
+        .output()
+        .is_ok_and(|output| output.status.success());
+    let forward = Command::new("nft")
+        .args(["list", "chain", TABLE_FAMILY, TABLE_NAME, "forward"])
+        .output();
+    chain_ok
+        && forward.is_ok_and(|output| {
+            if !output.status.success() {
+                return false;
+            }
+            let rules = String::from_utf8_lossy(&output.stdout);
+            rules.contains(&format!("iifname \"{veth_name}\" jump {chain_name}"))
+                && rules.contains(&format!("oifname \"{veth_name}\" jump {chain_name}"))
+        })
 }
 
 /// Remove rules in the forward chain that jump to the given zone chain.
@@ -306,6 +254,13 @@ fn zone_chain_name(zone_name: &str) -> String {
     format!("zone-{zone_name}")
 }
 
+fn egress_rules(veth_name: &str, destinations: &[String]) -> Vec<String> {
+    destinations
+        .iter()
+        .map(|dest| format!("iifname \"{veth_name}\" ip daddr {dest} accept"))
+        .collect()
+}
+
 fn table_exists() -> Result<bool> {
     let output = Command::new("nft")
         .args(["list", "table", TABLE_FAMILY, TABLE_NAME])
@@ -338,6 +293,48 @@ fn run_nft(args: &[&str]) -> Result<()> {
     Ok(())
 }
 
+fn run_nft_script(script: &str) -> Result<()> {
+    let mut child = Command::new("nft")
+        .args(["-f", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| RauhaError::NetworkError {
+            message: format!("failed to start nftables transaction: {e}"),
+            hint: "ensure nftables is installed and rauhad runs as root".into(),
+        })?;
+    let mut stdin = child.stdin.take().ok_or_else(|| RauhaError::NetworkError {
+        message: "failed to open nftables transaction input".into(),
+        hint: "restart rauhad".into(),
+    })?;
+    if let Err(e) = stdin.write_all(script.as_bytes()) {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(RauhaError::NetworkError {
+            message: format!("failed to write nftables transaction: {e}"),
+            hint: "restart rauhad".into(),
+        });
+    }
+    drop(stdin);
+    let output = child
+        .wait_with_output()
+        .map_err(|e| RauhaError::NetworkError {
+            message: format!("failed to wait for nftables transaction: {e}"),
+            hint: "restart rauhad".into(),
+        })?;
+    if !output.status.success() {
+        return Err(RauhaError::NetworkError {
+            message: format!(
+                "nftables transaction failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ),
+            hint: "check nftables support and run rauhad as root".into(),
+        });
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -346,5 +343,18 @@ mod tests {
     fn zone_chain_name_format() {
         assert_eq!(zone_chain_name("web"), "zone-web");
         assert_eq!(zone_chain_name("my-app"), "zone-my-app");
+    }
+
+    #[test]
+    fn empty_egress_adds_no_implicit_dns_exception() {
+        assert!(egress_rules("veth-test", &[]).is_empty());
+    }
+
+    #[test]
+    fn base_ruleset_replaces_atomically_with_default_drop() {
+        let rules = base_ruleset("10.89.0.0/16", true);
+        assert!(rules.starts_with("delete table inet rauha\nadd table inet rauha"));
+        assert!(rules.contains("policy drop"));
+        assert!(rules.contains("ip saddr 10.89.0.0/16"));
     }
 }

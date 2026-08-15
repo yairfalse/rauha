@@ -41,7 +41,7 @@ $RAUHA image pull "$IMAGE" >/dev/null
 if STRICT_ERROR=$($RAUHA zone create --name "$ZONE-full" --policy "$ROOT/policies/strict.toml" 2>&1); then
     fail "full strict policy was admitted despite unsupported controls"
     $RAUHA zone delete "$ZONE-full" --force 2>/dev/null || true
-elif ! grep -q "strict policy requests unsupported Linux controls" <<<"$STRICT_ERROR"; then
+elif ! grep -q "strict policy requests unsupported or unavailable Linux controls" <<<"$STRICT_ERROR"; then
     fail "full strict policy failed without an unsupported-control admission result: $STRICT_ERROR"
 else
     echo "PASS: unsupported full strict policy rejected"
@@ -71,7 +71,16 @@ allowed_egress = []
 allowed_ingress = []
 TOML
 
-$RAUHA zone create --name "$ZONE" --policy "$POLICY_FILE"
+if CREATE_ERROR=$($RAUHA zone create --name "$ZONE" --policy "$POLICY_FILE" 2>&1); then
+    echo "PASS: strict baseline admitted with complete host enforcement"
+elif grep -q "lsm\." <<<"$CREATE_ERROR"; then
+    echo "PASS: strict baseline rejected on degraded host"
+    sed -i 's/mode = "strict"/mode = "audit"/' "$POLICY_FILE"
+    $RAUHA zone create --name "$ZONE" --policy "$POLICY_FILE"
+else
+    echo "FAIL: baseline policy admission failed unexpectedly: $CREATE_ERROR" >&2
+    exit 1
+fi
 CONTAINER_ID=$($RAUHA run --zone "$ZONE" --name "$NAME" "$IMAGE" /bin/sleep 120)
 
 PID=""
@@ -110,6 +119,24 @@ CAPEFF=$(awk '/^CapEff:/ { print $2 }' "/proc/$PID/status")
 NO_NEW_PRIVS=$(awk '/^NoNewPrivs:/ { print $2 }' "/proc/$PID/status")
 [ "$CAPEFF" = 0000000000000000 ] || fail "strict policy has effective capabilities $CAPEFF"
 [ "$NO_NEW_PRIVS" = 1 ] || fail "NoNewPrivs is $NO_NEW_PRIVS, expected 1"
+
+if $RAUHA sandbox --name "$ZONE" --image "$IMAGE" -- /bin/sh -c 'touch /rauha-write-probe' >/dev/null 2>&1; then
+    fail "empty writable_paths allowed a rootfs write"
+else
+    echo "PASS: empty writable_paths makes the rootfs read-only"
+fi
+
+if $RAUHA sandbox --name "$ZONE" --image "$IMAGE" -- /bin/sh -c 'test -r /proc/1/status && test "$(cat /proc/1/comm)" = rauha-shim' >/dev/null 2>&1; then
+    echo "PASS: procfs exposes the container PID namespace"
+else
+    fail "container procfs does not expose its PID 1"
+fi
+
+if $RAUHA sandbox --name "$ZONE" --image "$IMAGE" -- /bin/sh -c 'i=0; while [ "$i" -lt 20 ]; do /bin/sh -c "sleep 0.01 &"; i=$((i + 1)); done; sleep 1; ! grep -l "^State:.*Z" /proc/[0-9]*/status >/dev/null 2>&1' >/dev/null 2>&1; then
+    echo "PASS: container PID 1 reaps orphaned descendants"
+else
+    fail "container PID 1 left zombie descendants"
+fi
 
 sleep 120 &
 SENTINEL_PID=$!

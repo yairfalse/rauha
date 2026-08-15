@@ -18,6 +18,7 @@ use std::process::Command;
 
 use rauha_common::error::{RauhaError, Result};
 use rauha_common::zone::ZoneNetworkState;
+use sha2::{Digest, Sha256};
 
 const BRIDGE_NAME: &str = "rauha0";
 
@@ -97,38 +98,44 @@ fn enable_ip_forwarding() -> Result<()> {
 /// via the gateway.
 pub fn create_veth_pair(zone_name: &str, net_state: Option<&ZoneNetworkState>) -> Result<()> {
     let host_if = veth_host_name(zone_name);
+    let zone_peer_if = veth_peer_name(zone_name);
     let zone_if = "eth0";
     let ns_name = format!("rauha-{zone_name}");
 
-    // Create the veth pair.
+    // Both ends initially exist in the host namespace, whose own `eth0` is
+    // normally already taken. Rename the peer only after moving it.
     run_ip(&[
-        "link", "add", &host_if, "type", "veth", "peer", "name", zone_if,
+        "link",
+        "add",
+        &host_if,
+        "type",
+        "veth",
+        "peer",
+        "name",
+        &zone_peer_if,
     ])?;
 
-    // Move zone-side interface into the namespace.
-    run_ip(&["link", "set", zone_if, "netns", &ns_name])?;
+    let configure = (|| {
+        run_ip(&["link", "set", &zone_peer_if, "netns", &ns_name])?;
+        run_ip_netns(&ns_name, &["link", "set", &zone_peer_if, "name", zone_if])?;
+        run_ip(&["link", "set", &host_if, "master", BRIDGE_NAME])?;
+        run_ip(&["link", "set", &host_if, "up"])?;
+        run_ip_netns(&ns_name, &["link", "set", zone_if, "up"])?;
+        run_ip_netns(&ns_name, &["link", "set", "lo", "up"])?;
 
-    // Attach host-side to the bridge.
-    run_ip(&["link", "set", &host_if, "master", BRIDGE_NAME])?;
-    run_ip(&["link", "set", &host_if, "up"])?;
+        if let Some(state) = net_state {
+            let cidr = state.cidr();
+            let gateway = state.gateway().to_string();
+            run_ip_netns(&ns_name, &["addr", "add", &cidr, "dev", zone_if])?;
+            run_ip_netns(&ns_name, &["route", "add", "default", "via", &gateway])?;
+            tracing::info!(zone = zone_name, ip = %state.ip(), "assigned IP to zone veth");
+        }
+        Ok(())
+    })();
 
-    // Bring up the zone-side interface.
-    run_ip_netns(&ns_name, &["link", "set", zone_if, "up"])?;
-    run_ip_netns(&ns_name, &["link", "set", "lo", "up"])?;
-
-    // Assign IP and default route if network state is provided.
-    if let Some(state) = net_state {
-        let cidr = state.cidr();
-        let gateway = state.gateway().to_string();
-
-        run_ip_netns(&ns_name, &["addr", "add", &cidr, "dev", zone_if])?;
-        run_ip_netns(&ns_name, &["route", "add", "default", "via", &gateway])?;
-
-        tracing::info!(
-            zone = zone_name,
-            ip = %state.ip(),
-            "assigned IP to zone veth"
-        );
+    if let Err(error) = configure {
+        let _ = run_ip(&["link", "delete", &host_if]);
+        return Err(error);
     }
 
     tracing::info!(zone = zone_name, host_if = host_if, "created veth pair");
@@ -137,13 +144,30 @@ pub fn create_veth_pair(zone_name: &str, net_state: Option<&ZoneNetworkState>) -
 
 /// Get the host-side veth interface name for a zone (public for nftables).
 pub fn veth_host_name_for(zone_name: &str) -> String {
-    veth_host_name(zone_name)
+    resolve_veth_host_name(zone_name, interface_exists)
+}
+
+fn resolve_veth_host_name(zone_name: &str, exists: impl Fn(&str) -> bool) -> String {
+    let current = veth_host_name(zone_name);
+    if exists(&current) {
+        return current;
+    }
+    let legacy = legacy_veth_host_name(zone_name);
+    if exists(&legacy) {
+        return legacy;
+    }
+    current
+}
+
+pub fn veth_exists(zone_name: &str) -> bool {
+    interface_exists(&veth_host_name(zone_name))
+        || interface_exists(&legacy_veth_host_name(zone_name))
 }
 
 /// Destroy a zone's veth pair. Deleting the host side automatically
 /// removes the zone side too.
 pub fn destroy_veth_pair(zone_name: &str) -> Result<()> {
-    let host_if = veth_host_name(zone_name);
+    let host_if = veth_host_name_for(zone_name);
 
     // Check if interface exists.
     let output = Command::new("ip")
@@ -186,13 +210,33 @@ pub fn destroy_bridge() -> Result<()> {
 }
 
 fn veth_host_name(zone_name: &str) -> String {
-    // Truncate to fit Linux's 15-char interface name limit.
-    let suffix = if zone_name.len() > 10 {
-        &zone_name[..10]
-    } else {
-        zone_name
-    };
-    format!("veth-{suffix}")
+    veth_name("veth", zone_name)
+}
+
+fn veth_peer_name(zone_name: &str) -> String {
+    veth_name("peer", zone_name)
+}
+
+fn veth_name(prefix: &str, zone_name: &str) -> String {
+    let digest = Sha256::digest(zone_name.as_bytes());
+    format!(
+        "{prefix}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        digest[0], digest[1], digest[2], digest[3], digest[4]
+    )
+}
+
+fn legacy_veth_host_name(zone_name: &str) -> String {
+    format!(
+        "veth-{}",
+        zone_name.get(..zone_name.len().min(10)).unwrap_or_default()
+    )
+}
+
+fn interface_exists(name: &str) -> bool {
+    Command::new("ip")
+        .args(["link", "show", name])
+        .output()
+        .is_ok_and(|output| output.status.success())
 }
 
 fn run_ip(args: &[&str]) -> Result<()> {
@@ -243,4 +287,32 @@ fn run_ip_netns(ns_name: &str, args: &[&str]) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn veth_names_are_unique_and_fit_linux_limit() {
+        let first = veth_host_name("test-integration-alpha");
+        let second = veth_host_name("test-integration-beta");
+        assert_eq!(first, "veth5459f3b660");
+        assert_ne!(first, second);
+        assert!(first.len() <= 15);
+        assert!(veth_peer_name("test-integration-alpha").len() <= 15);
+        assert_eq!(
+            legacy_veth_host_name("test-integration-alpha"),
+            "veth-test-integ"
+        );
+    }
+
+    #[test]
+    fn recovery_uses_an_existing_legacy_veth() {
+        let legacy = legacy_veth_host_name("test-integration-alpha");
+        assert_eq!(
+            resolve_veth_host_name("test-integration-alpha", |name| name == legacy),
+            legacy
+        );
+    }
 }

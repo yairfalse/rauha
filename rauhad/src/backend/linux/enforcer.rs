@@ -155,6 +155,16 @@ impl LinuxEnforcer {
         })
     }
 
+    pub(super) fn zone_member_matches(&self, cgroup_id: u64, zone_id: u32) -> Result<bool> {
+        let mut ebpf_guard = lock_backend(&self.ebpf, "linux_enforcer.ebpf")?;
+        let ebpf = ebpf_guard.as_mut().ok_or_else(|| RauhaError::EbpfError {
+            message: "eBPF manager not available during membership verification".into(),
+            hint: "restart rauhad after restoring eBPF LSM support".into(),
+        })?;
+        Ok(MapManager::zone_member(ebpf.bpf_mut(), cgroup_id)?
+            .is_some_and(|member| member.zone_id == zone_id))
+    }
+
     pub(super) fn remove_zone_policy(&self, zone_id: u32) -> Result<()> {
         self.with_bpf("zone policy cleanup", |bpf| {
             MapManager::remove_zone_policy(bpf, zone_id)
@@ -386,7 +396,8 @@ impl EnforcerBackend for LinuxEnforcer {
         let inodes = super::maps::collect_rootfs_inodes(
             std::path::Path::new(path),
             rauha_ebpf_common::MAX_INODES,
-        );
+        )
+        .map_err(to_enforcer_error)?;
         let inserted = self
             .insert_inodes(&inodes, zone.kernel_id)
             .map_err(to_enforcer_error)?;

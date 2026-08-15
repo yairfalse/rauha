@@ -26,7 +26,7 @@ pub fn fork_and_exec(
     spec_json: &str,
     rootfs_root: &Path,
 ) -> anyhow::Result<u32> {
-    use nix::unistd::{self, ForkResult};
+    use nix::unistd::ForkResult;
     use oci_spec::runtime::Spec;
     use std::ffi::CString;
     use std::os::fd::{AsRawFd, BorrowedFd};
@@ -34,6 +34,11 @@ pub fn fork_and_exec(
     use std::path::PathBuf;
 
     let spec: Spec = serde_json::from_str(spec_json)?;
+    let readonly_root = spec
+        .root()
+        .as_ref()
+        .and_then(|root| root.readonly())
+        .unwrap_or(false);
 
     let process = spec
         .process()
@@ -91,6 +96,7 @@ pub fn fork_and_exec(
     let hostname = spec.hostname().clone();
     let mut unshare_flags = nix::sched::CloneFlags::CLONE_NEWNS;
     let mut netns = None;
+    let mut new_pid_namespace = false;
     if let Some(linux) = spec.linux().as_ref() {
         if let Some(namespaces) = linux.namespaces().as_ref() {
             for namespace in namespaces {
@@ -106,6 +112,9 @@ pub fn fork_and_exec(
                             anyhow::anyhow!("network namespace requires an existing path")
                         })?;
                         netns = Some(std::fs::File::open(path)?);
+                    }
+                    oci_spec::runtime::LinuxNamespaceType::Pid => {
+                        new_pid_namespace = true;
                     }
                     _ => {}
                 }
@@ -143,8 +152,15 @@ pub fn fork_and_exec(
     let go_rd_raw = go_rd.as_raw_fd();
     let go_wr_raw = go_wr.as_raw_fd();
 
-    // Fork.
-    match unsafe { unistd::fork() }? {
+    // clone3 creates the workload bootstrap directly as PID 1 when requested;
+    // unshare(CLONE_NEWPID) would affect only later children and leave the
+    // workload itself in the host PID namespace.
+    let clone_flags = if new_pid_namespace {
+        libc::CLONE_NEWPID as u64
+    } else {
+        0
+    };
+    match clone_process(clone_flags)? {
         ForkResult::Child => {
             // Close the pipe ends this process does not use.
             drop(setup_rd);
@@ -214,6 +230,46 @@ pub fn fork_and_exec(
                 }
             }
 
+            unsafe {
+                libc::mkdir(c"/proc".as_ptr(), 0o555);
+            }
+            if nix::mount::mount(
+                Some("proc"),
+                "/proc",
+                Some("proc"),
+                nix::mount::MsFlags::MS_NOSUID
+                    | nix::mount::MsFlags::MS_NODEV
+                    | nix::mount::MsFlags::MS_NOEXEC,
+                None::<&str>,
+            )
+            .is_err()
+            {
+                unsafe {
+                    let msg = b"rauha-shim: procfs mount failed\n";
+                    let _ = libc::write(2, msg.as_ptr() as _, msg.len());
+                    libc::_exit(1);
+                }
+            }
+
+            if readonly_root
+                && nix::mount::mount(
+                    None::<&str>,
+                    "/",
+                    None::<&str>,
+                    nix::mount::MsFlags::MS_BIND
+                        | nix::mount::MsFlags::MS_REMOUNT
+                        | nix::mount::MsFlags::MS_RDONLY,
+                    None::<&str>,
+                )
+                .is_err()
+            {
+                unsafe {
+                    let msg = b"rauha-shim: read-only rootfs remount failed\n";
+                    let _ = libc::write(2, msg.as_ptr() as _, msg.len());
+                    libc::_exit(1);
+                }
+            }
+
             // Set hostname.
             if let Some(ref h) = hostname {
                 let _ = nix::unistd::sethostname(h);
@@ -251,26 +307,10 @@ pub fn fork_and_exec(
                 }
             }
 
-            // Set environment using libc directly — bypasses Rust's env mutex.
-            // std::env::set_var/remove_var are NOT async-signal-safe (they hold
-            // a global lock that may be held by the parent process's other threads).
-            unsafe {
-                libc::clearenv();
-                for var in &env_vars {
-                    // CString is pre-allocated before fork — no allocation here.
-                    libc::putenv(var.as_ptr() as *mut libc::c_char);
-                }
-            }
-
-            // chdir.
-            let _ = nix::unistd::chdir(cwd_cstr.as_c_str());
-
-            // Replace process with container command (execvp, no shell involved).
-            let _ = nix::unistd::execvp(&c_args[0], &c_args);
-            unsafe {
-                let msg = b"rauha-shim: execvp failed\n";
-                let _ = libc::write(2, msg.as_ptr() as _, msg.len());
-                libc::_exit(127);
+            if new_pid_namespace {
+                supervise_workload(&c_args, &env_vars, cwd_cstr.as_c_str());
+            } else {
+                exec_workload(&c_args, &env_vars, cwd_cstr.as_c_str());
             }
         }
         ForkResult::Parent { child } => {
@@ -460,6 +500,168 @@ pub(crate) fn apply_process_security(
     Ok(())
 }
 
+/// fork(2)-equivalent clone3 with optional namespace flags.
+///
+/// clone3 uses the caller's copied stack when CLONE_VM is absent, so no child
+/// stack allocation is required. Rauha's supported Linux kernels already need
+/// clone3-era features for the security backend.
+#[cfg(target_os = "linux")]
+pub(crate) fn clone_process(flags: u64) -> nix::Result<nix::unistd::ForkResult> {
+    #[repr(C)]
+    #[derive(Default)]
+    struct CloneArgs {
+        flags: u64,
+        pidfd: u64,
+        child_tid: u64,
+        parent_tid: u64,
+        exit_signal: u64,
+        stack: u64,
+        stack_size: u64,
+        tls: u64,
+        set_tid: u64,
+        set_tid_size: u64,
+        cgroup: u64,
+    }
+
+    let args = CloneArgs {
+        flags,
+        exit_signal: libc::SIGCHLD as u64,
+        ..Default::default()
+    };
+    let pid = unsafe {
+        libc::syscall(
+            libc::SYS_clone3,
+            &args as *const CloneArgs,
+            std::mem::size_of::<CloneArgs>(),
+        )
+    };
+    if pid < 0 {
+        Err(nix::errno::Errno::last())
+    } else if pid == 0 {
+        Ok(nix::unistd::ForkResult::Child)
+    } else {
+        Ok(nix::unistd::ForkResult::Parent {
+            child: nix::unistd::Pid::from_raw(pid as i32),
+        })
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn exec_workload(args: &[std::ffi::CString], env: &[std::ffi::CString], cwd: &std::ffi::CStr) -> ! {
+    unsafe {
+        libc::clearenv();
+        for var in env {
+            libc::putenv(var.as_ptr() as *mut libc::c_char);
+        }
+    }
+    let _ = nix::unistd::chdir(cwd);
+    let _ = nix::unistd::execvp(&args[0], args);
+    unsafe {
+        let msg = b"rauha-shim: execvp failed\n";
+        let _ = libc::write(2, msg.as_ptr() as _, msg.len());
+        libc::_exit(127);
+    }
+}
+
+#[cfg(target_os = "linux")]
+static INIT_CHILD_PID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+#[cfg(target_os = "linux")]
+extern "C" fn forward_init_signal(signal: libc::c_int) {
+    let child = INIT_CHILD_PID.load(std::sync::atomic::Ordering::Relaxed);
+    if child > 0 {
+        unsafe {
+            libc::kill(child, signal);
+        }
+    }
+}
+
+/// Minimal PID 1: forward lifecycle signals and reap the actual workload.
+#[cfg(target_os = "linux")]
+fn supervise_workload(
+    args: &[std::ffi::CString],
+    env: &[std::ffi::CString],
+    cwd: &std::ffi::CStr,
+) -> ! {
+    const FORWARDED_SIGNALS: &[libc::c_int] = &[
+        libc::SIGHUP,
+        libc::SIGINT,
+        libc::SIGQUIT,
+        libc::SIGTERM,
+        libc::SIGUSR1,
+        libc::SIGUSR2,
+        libc::SIGWINCH,
+        libc::SIGCONT,
+        libc::SIGTSTP,
+        libc::SIGTTIN,
+        libc::SIGTTOU,
+    ];
+
+    let mut blocked = unsafe { std::mem::zeroed::<libc::sigset_t>() };
+    let mut previous = unsafe { std::mem::zeroed::<libc::sigset_t>() };
+    unsafe {
+        libc::sigemptyset(&mut blocked);
+        for &signal in FORWARDED_SIGNALS {
+            libc::sigaddset(&mut blocked, signal);
+            let mut action = std::mem::zeroed::<libc::sigaction>();
+            action.sa_sigaction = forward_init_signal as *const () as usize;
+            libc::sigemptyset(&mut action.sa_mask);
+            libc::sigaction(signal, &action, std::ptr::null_mut());
+        }
+        libc::sigprocmask(libc::SIG_BLOCK, &blocked, &mut previous);
+    }
+
+    match clone_process(0) {
+        Ok(nix::unistd::ForkResult::Child) => {
+            unsafe {
+                libc::sigprocmask(libc::SIG_SETMASK, &previous, std::ptr::null_mut());
+            }
+            exec_workload(args, env, cwd);
+        }
+        Ok(nix::unistd::ForkResult::Parent { child }) => unsafe {
+            INIT_CHILD_PID.store(child.as_raw(), std::sync::atomic::Ordering::Relaxed);
+            libc::sigprocmask(libc::SIG_SETMASK, &previous, std::ptr::null_mut());
+            let mut main_exit = None;
+            loop {
+                let mut status = 0;
+                let waited = libc::waitpid(-1, &mut status, 0);
+                if waited > 0 {
+                    if waited == child.as_raw() {
+                        main_exit = wait_status_exit_code(status);
+                        // Container lifetime follows its main workload. Stop
+                        // descendants, then reap them before PID 1 exits.
+                        libc::kill(-1, libc::SIGKILL);
+                    }
+                    continue;
+                }
+                if waited < 0 {
+                    match nix::errno::Errno::last() {
+                        nix::errno::Errno::EINTR => continue,
+                        nix::errno::Errno::ECHILD => libc::_exit(main_exit.unwrap_or(125)),
+                        _ => libc::_exit(125),
+                    }
+                }
+            }
+        },
+        Err(_) => unsafe {
+            let msg = b"rauha-shim: PID 1 failed to start workload\n";
+            let _ = libc::write(2, msg.as_ptr() as _, msg.len());
+            libc::_exit(125);
+        },
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn wait_status_exit_code(status: libc::c_int) -> Option<libc::c_int> {
+    if libc::WIFEXITED(status) {
+        Some(libc::WEXITSTATUS(status))
+    } else if libc::WIFSIGNALED(status) {
+        Some(128 + libc::WTERMSIG(status))
+    } else {
+        None
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn cstring_vec(values: &[String], field: &str) -> anyhow::Result<Vec<std::ffi::CString>> {
     values
@@ -474,7 +676,7 @@ fn cstring_vec(values: &[String], field: &str) -> anyhow::Result<Vec<std::ffi::C
 
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
-    use super::{cstring_vec, ProcessSecurity};
+    use super::{cstring_vec, wait_status_exit_code, ProcessSecurity};
     use oci_spec::runtime::{Capabilities, LinuxCapabilitiesBuilder, ProcessBuilder};
 
     #[test]
@@ -507,6 +709,15 @@ mod tests {
                 no_new_privileges: true,
                 ..Default::default()
             }
+        );
+    }
+
+    #[test]
+    fn wait_status_preserves_main_exit_code() {
+        assert_eq!(wait_status_exit_code(7 << 8), Some(7));
+        assert_eq!(
+            wait_status_exit_code(libc::SIGTERM),
+            Some(128 + libc::SIGTERM)
         );
     }
 }

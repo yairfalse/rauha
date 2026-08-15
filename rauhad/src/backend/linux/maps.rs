@@ -3,7 +3,7 @@
 //! Translates domain concepts (zones, policies, inodes) into BPF map
 //! key/value pairs. All BPF map access goes through MapManager.
 
-use aya::maps::HashMap as AyaHashMap;
+use aya::maps::{HashMap as AyaHashMap, MapError};
 use aya::Ebpf;
 
 use rauha_common::error::{RauhaError, Result};
@@ -14,6 +14,30 @@ use rauha_enforcer_api::ZoneEnforcement;
 pub struct MapManager;
 
 impl MapManager {
+    /// Read a cgroup's kernel membership entry.
+    pub fn zone_member(bpf: &Ebpf, cgroup_id: u64) -> Result<Option<ZoneInfoKernel>> {
+        let map: AyaHashMap<_, u64, ZoneInfoKernel> =
+            AyaHashMap::try_from(bpf.map("ZONE_MEMBERSHIP").ok_or_else(|| {
+                RauhaError::EbpfError {
+                    message: "ZONE_MEMBERSHIP map not found".into(),
+                    hint: "eBPF programs may not be loaded".into(),
+                }
+            })?)
+            .map_err(|e| RauhaError::EbpfError {
+                message: format!("failed to open ZONE_MEMBERSHIP map: {e}"),
+                hint: "check eBPF object was built correctly".into(),
+            })?;
+
+        match map.get(&cgroup_id, 0) {
+            Ok(member) => Ok(Some(member)),
+            Err(MapError::KeyNotFound) => Ok(None),
+            Err(e) => Err(RauhaError::EbpfError {
+                message: format!("failed to read zone membership: {e}"),
+                hint: "check BPF map health".into(),
+            }),
+        }
+    }
+
     /// Register a cgroup as belonging to a zone.
     pub fn add_zone_member(
         bpf: &mut Ebpf,
@@ -318,7 +342,7 @@ impl MapManager {
 /// eBPF is defense-in-depth.
 ///
 /// Returns the collected inodes (capped at `max_inodes`).
-pub fn collect_rootfs_inodes(rootfs_path: &std::path::Path, max_inodes: u32) -> Vec<u64> {
+pub fn collect_rootfs_inodes(rootfs_path: &std::path::Path, max_inodes: u32) -> Result<Vec<u64>> {
     use std::collections::HashSet;
     use std::os::unix::fs::MetadataExt;
 
@@ -327,33 +351,30 @@ pub fn collect_rootfs_inodes(rootfs_path: &std::path::Path, max_inodes: u32) -> 
     let mut stack = vec![rootfs_path.to_path_buf()];
 
     while let Some(dir) = stack.pop() {
-        let entries = match std::fs::read_dir(&dir) {
-            Ok(e) => e,
-            Err(e) => {
-                tracing::debug!(dir = %dir.display(), %e, "skipping unreadable directory during inode collection");
-                continue;
-            }
-        };
+        let entries = std::fs::read_dir(&dir).map_err(|e| RauhaError::RootfsError {
+            message: format!("failed to read rootfs directory {}: {e}", dir.display()),
+        })?;
 
         for entry in entries {
             if inodes.len() as u32 >= max_inodes {
-                tracing::warn!(
-                    count = inodes.len(),
-                    max_inodes,
-                    "inode collection hit cap — some files won't be tracked"
-                );
-                return inodes;
+                return Err(RauhaError::RootfsError {
+                    message: format!(
+                        "rootfs inode count exceeds enforcement capacity of {max_inodes}"
+                    ),
+                });
             }
 
-            let entry = match entry {
-                Ok(e) => e,
-                Err(_) => continue,
-            };
+            let entry = entry.map_err(|e| RauhaError::RootfsError {
+                message: format!("failed to enumerate rootfs {}: {e}", dir.display()),
+            })?;
 
-            let meta = match std::fs::symlink_metadata(entry.path()) {
-                Ok(m) => m,
-                Err(_) => continue,
-            };
+            let meta =
+                std::fs::symlink_metadata(entry.path()).map_err(|e| RauhaError::RootfsError {
+                    message: format!(
+                        "failed to inspect rootfs entry {}: {e}",
+                        entry.path().display()
+                    ),
+                })?;
 
             inodes.push(meta.ino());
 
@@ -364,7 +385,7 @@ pub fn collect_rootfs_inodes(rootfs_path: &std::path::Path, max_inodes: u32) -> 
     }
 
     tracing::debug!(count = inodes.len(), path = %rootfs_path.display(), "collected rootfs inodes");
-    inodes
+    Ok(inodes)
 }
 
 /// Convert userspace ZonePolicy to kernel-side ZonePolicyKernel.
@@ -471,5 +492,16 @@ mod tests {
     #[test]
     fn policy_to_kernel_unknown_cap_rejected() {
         assert!(policy_to_kernel(&default_policy_with_caps(vec!["CAP_NONEXISTENT"])).is_err());
+    }
+
+    #[test]
+    fn inode_collection_fails_instead_of_truncating() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("one"), b"1").unwrap();
+        std::fs::write(root.path().join("two"), b"2").unwrap();
+
+        let err = collect_rootfs_inodes(root.path(), 1)
+            .expect_err("an incomplete ownership set must not look successful");
+        assert!(err.to_string().contains("enforcement capacity"));
     }
 }

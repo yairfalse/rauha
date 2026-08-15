@@ -227,7 +227,14 @@ fn check_cross_zone_task_access(ctx: &LsmContext, hook: u8) -> Result<i32, i64> 
 
     let target = match unsafe { lookup_task_zone(target_ptr) } {
         Some(info) => info,
-        None => return Ok(0),
+        None => {
+            // A zoned process must never act on an unzoned host task. Treat a
+            // missing target membership as the host boundary, not as global
+            // permission. Unzoned callers still pass through above, so the
+            // daemon and shim retain lifecycle control over workloads.
+            emit_deny_event(hook, caller.zone_id, 0, 0);
+            return Ok(-1);
+        }
     };
 
     if is_cross_zone_allowed(caller.zone_id, target.zone_id) {

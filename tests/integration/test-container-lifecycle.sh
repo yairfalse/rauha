@@ -4,6 +4,8 @@
 set -euo pipefail
 
 RAUHA="${RAUHA_BIN:-cargo run --bin rauha --}"
+ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+AUDIT_POLICY=${RAUHA_TEST_AUDIT_POLICY:-$ROOT/policies/audit.toml}
 ZONE_NAME="test-integration-$$"
 IMAGE="${TEST_IMAGE:-alpine:latest}"
 
@@ -19,7 +21,7 @@ echo "1. Pulling image (if not present)..."
 $RAUHA image pull "$IMAGE" 2>/dev/null || true
 
 echo "2. Creating zone: ${ZONE_NAME}..."
-$RAUHA zone create --name "$ZONE_NAME"
+$RAUHA zone create --name "$ZONE_NAME" --policy "$AUDIT_POLICY"
 
 echo "3. Verifying zone exists..."
 $RAUHA zone list | grep -q "$ZONE_NAME" || {

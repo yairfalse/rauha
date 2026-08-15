@@ -191,9 +191,20 @@ fn handle_request(state: &mut ShimState, request: ShimRequest) -> ShimResponse {
                     message: format!("container {id} not found"),
                 };
             };
+            let Some((init_pid, status, _)) = state.get_state(&id) else {
+                return ShimResponse::Error {
+                    message: format!("container {id} not found"),
+                };
+            };
+            if status != "running" || init_pid == 0 {
+                return ShimResponse::Error {
+                    message: format!("container {id} is not running"),
+                };
+            }
             match attach::fork_and_exec_pty(
                 state.zone_name(),
                 &id,
+                init_pid,
                 &command,
                 &env,
                 spec_json,

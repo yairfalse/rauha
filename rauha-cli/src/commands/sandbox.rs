@@ -45,6 +45,9 @@ pub struct SandboxArgs {
     /// Leave the task zone behind for debugging after the run.
     #[arg(long)]
     pub keep_zone: bool,
+    /// Permit a temporary zone to run with explicitly degraded enforcement.
+    #[arg(long)]
+    pub audit: bool,
     /// Soft timeout in seconds. 0 waits indefinitely.
     #[arg(long, default_value = "0")]
     pub timeout: u32,
@@ -69,6 +72,7 @@ pub async fn handle_sandbox(args: SandboxArgs, out: OutputMode) -> anyhow::Resul
         keep_zone: args.keep_zone,
         timeout_seconds: args.timeout,
         env: args.env.into_iter().collect(),
+        audit: args.audit,
     };
 
     // Strip the tonic Status wrapper so the user sees the daemon's message,
@@ -98,6 +102,8 @@ pub async fn handle_sandbox(args: SandboxArgs, out: OutputMode) -> anyhow::Resul
         stdout: result.stdout,
         stderr: result.stderr,
         duration_ms: result.duration_ms,
+        admission: result.admission,
+        unavailable_controls: result.unavailable_controls,
         events: result
             .events
             .into_iter()
@@ -140,12 +146,19 @@ pub async fn handle_sandbox(args: SandboxArgs, out: OutputMode) -> anyhow::Resul
             format!("  enforcement: {} event(s)", view.enforcement_events.len())
         };
         eprintln!(
-            "status: {}  exit: {}  ({:.1}s){}",
+            "status: {}  exit: {}  admission: {}  ({:.1}s){}",
             view.status,
             code,
+            view.admission,
             view.duration_ms as f64 / 1000.0,
             enforcement,
         );
+        if !view.unavailable_controls.is_empty() {
+            eprintln!(
+                "degraded controls: {}",
+                view.unavailable_controls.join(", ")
+            );
+        }
     });
 
     if exit_code != 0 {
@@ -183,6 +196,7 @@ mod tests {
         assert_eq!(args.command, vec!["echo".to_string(), "hello".to_string()]);
         assert_eq!(args.timeout, 0);
         assert!(!args.keep_zone);
+        assert!(!args.audit);
         assert!(args.name.is_none());
     }
 
@@ -203,6 +217,7 @@ mod tests {
             "-e",
             "EMPTY=",
             "--keep-zone",
+            "--audit",
             "--timeout",
             "300",
             "--",
@@ -223,6 +238,7 @@ mod tests {
             ]
         );
         assert!(args.keep_zone);
+        assert!(args.audit);
         assert_eq!(args.timeout, 300);
         assert_eq!(
             args.command,

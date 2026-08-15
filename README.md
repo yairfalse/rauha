@@ -108,6 +108,8 @@ returning one structured result:
   "duration_ms": 1842,
   "stdout": "...",
   "stderr": "",
+  "admission": "strict",
+  "unavailable_controls": [],
   "events": [],
   "enforcement_events": []
 }
@@ -119,6 +121,9 @@ result types in `rauha-common` are wired end to end through the daemon and CLI.
 The daemon allocates a task zone when needed, starts the container, waits,
 captures stdout/stderr/exit code, collects lifecycle and best-effort enforcement
 events, and cleans up temporary resources unless `--keep-zone` is set.
+Strict admission is the default and refuses execution when a requested control
+is unavailable. `--audit` explicitly permits a temporary task zone to run
+degraded; the effective admission and failed controls remain in the result.
 
 ## Architecture
 

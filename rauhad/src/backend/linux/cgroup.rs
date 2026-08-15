@@ -166,6 +166,15 @@ impl CgroupManager {
         self.zone_path(zone_name).exists()
     }
 
+    pub fn zone_has_processes(&self, zone_name: &str) -> Result<bool> {
+        let path = self.zone_path(zone_name).join("cgroup.procs");
+        let processes = fs::read_to_string(&path).map_err(|e| RauhaError::CgroupError {
+            message: format!("failed to read {}: {e}", path.display()),
+            hint: "retain kernel membership until cgroup state is readable".into(),
+        })?;
+        Ok(!processes.trim().is_empty())
+    }
+
     fn zone_path(&self, zone_name: &str) -> PathBuf {
         self.slice_path.join(format!("zone-{zone_name}"))
     }

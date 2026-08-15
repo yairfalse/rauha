@@ -47,6 +47,8 @@ sandbox execution:
   "duration_ms": 1842,
   "started_at": null,
   "finished_at": null,
+  "admission": "strict",
+  "unavailable_controls": [],
   "events": [],
   "enforcement_events": []
 }
@@ -57,6 +59,11 @@ portable baseline on backends without Linux kernel enforcement. On Linux, the
 daemon drains a task-scoped subscription from a daemon-wide broadcast; broadcast
 lag can still drop events, so consumers must not treat the field as an
 audit-complete log.
+
+`admission` is the effective zone policy, not merely the requested CLI flag.
+Strict tasks are rejected when live isolation verification fails. `--audit`
+permits a temporary zone to run with those failures and records their check
+names in `unavailable_controls` and structured completion evidence.
 
 `timeout_seconds == 0` means wait indefinitely. Callers that need bounded task
 execution should set an explicit timeout.

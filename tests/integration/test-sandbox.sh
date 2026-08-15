@@ -8,6 +8,8 @@
 set -euo pipefail
 
 RAUHA="${RAUHA_BIN:-cargo run --bin rauha --}"
+ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+AUDIT_POLICY=${RAUHA_TEST_AUDIT_POLICY:-$ROOT/policies/audit.toml}
 IMAGE="${TEST_IMAGE:-alpine:latest}"
 NAMED_ZONE="test-sandbox-$$"
 
@@ -23,7 +25,7 @@ echo "1. Pulling image (if not present)..."
 $RAUHA image pull "$IMAGE" 2>/dev/null || true
 
 echo "2. Running a task in a temporary zone, capturing stdout..."
-OUT=$($RAUHA sandbox --image "$IMAGE" -- /bin/echo hello-from-sandbox)
+OUT=$($RAUHA sandbox --audit --image "$IMAGE" -- /bin/echo hello-from-sandbox)
 if echo "$OUT" | grep -q "hello-from-sandbox"; then
     echo "   stdout captured (OK)"
 else
@@ -32,7 +34,7 @@ else
 fi
 
 echo "3. A succeeding task exits 0..."
-if $RAUHA sandbox --image "$IMAGE" -- /bin/true >/dev/null 2>&1; then
+if $RAUHA sandbox --audit --image "$IMAGE" -- /bin/true >/dev/null 2>&1; then
     echo "   exit 0 on success (OK)"
 else
     echo "   FAIL: succeeding task did not exit 0"
@@ -41,7 +43,7 @@ fi
 
 echo "4. The CLI mirrors a failing task's exit code..."
 set +e
-$RAUHA sandbox --image "$IMAGE" -- /bin/sh -c "exit 3" >/dev/null 2>&1
+$RAUHA sandbox --audit --image "$IMAGE" -- /bin/sh -c "exit 3" >/dev/null 2>&1
 CODE=$?
 set -e
 if [ "$CODE" -eq 3 ]; then
@@ -52,8 +54,10 @@ else
 fi
 
 echo "5. JSON output reports a succeeded status..."
-JSON=$($RAUHA --json sandbox --image "$IMAGE" -- /bin/echo hi)
-if echo "$JSON" | grep -q '"status":"succeeded"' && echo "$JSON" | grep -q '"exit_code":0'; then
+JSON=$($RAUHA --json sandbox --audit --image "$IMAGE" -- /bin/echo hi)
+if echo "$JSON" | grep -q '"status":"succeeded"' \
+    && echo "$JSON" | grep -q '"exit_code":0' \
+    && echo "$JSON" | grep -q '"admission":"audit"'; then
     echo "   JSON contract intact (OK)"
 else
     echo "   FAIL: unexpected JSON result: $JSON"
@@ -61,7 +65,7 @@ else
 fi
 
 echo "6. A named, pre-existing zone is reused and left intact..."
-$RAUHA zone create --name "$NAMED_ZONE"
+$RAUHA zone create --name "$NAMED_ZONE" --policy "$AUDIT_POLICY"
 $RAUHA sandbox --image "$IMAGE" --name "$NAMED_ZONE" -- /bin/echo in-named-zone >/dev/null
 if $RAUHA zone list 2>/dev/null | grep -q "$NAMED_ZONE"; then
     echo "   named zone survived the task (OK)"

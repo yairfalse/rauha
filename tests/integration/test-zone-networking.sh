@@ -16,6 +16,9 @@ cat > "$POLICY_FILE" <<TOML
 name = "placeholder"
 type = "non-global"
 
+[admission]
+mode = "audit"
+
 [network]
 mode = "bridged"
 allowed_zones = ["$ZONE_A", "$ZONE_B"]

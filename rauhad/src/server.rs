@@ -1846,7 +1846,18 @@ fn sandbox_status_str(status: SandboxStatus) -> String {
     .to_string()
 }
 
-fn to_proto_result(exec: SandboxExecResult) -> pb::sandbox::SandboxResult {
+fn admission_str(admission: rauha_common::zone::PolicyAdmission) -> &'static str {
+    match admission {
+        rauha_common::zone::PolicyAdmission::Strict => "strict",
+        rauha_common::zone::PolicyAdmission::Audit => "audit",
+    }
+}
+
+fn to_proto_result(
+    exec: SandboxExecResult,
+    admission: rauha_common::zone::PolicyAdmission,
+    unavailable_controls: Vec<String>,
+) -> pb::sandbox::SandboxResult {
     pb::sandbox::SandboxResult {
         task_id: exec.task_id,
         zone_id: exec.zone_id,
@@ -1882,6 +1893,8 @@ fn to_proto_result(exec: SandboxExecResult) -> pb::sandbox::SandboxResult {
                 object: e.object.unwrap_or_default(),
             })
             .collect(),
+        admission: admission_str(admission).into(),
+        unavailable_controls,
     }
 }
 
@@ -1946,18 +1959,19 @@ impl SandboxService for SandboxServiceImpl {
             // Resolve the zone. An empty name allocates a temporary zone that we own
             // and (by default) delete afterwards; a named zone must already exist
             // and is left intact.
-            let (zone_name, zone_id, temp_zone) = if req.name.trim().is_empty() {
+            let (zone_name, zone_id, temp_zone, admission) = if req.name.trim().is_empty() {
                 let name = format!(
                     "sandbox-{}",
                     &uuid::Uuid::new_v4().simple().to_string()[..12]
                 );
+                let mut policy = rauha_common::zone::ZonePolicy::default();
+                if req.audit {
+                    policy.admission = rauha_common::zone::PolicyAdmission::Audit;
+                }
+                let admission = policy.admission;
                 let zone = self
                     .registry
-                    .create_zone(
-                        &name,
-                        rauha_common::zone::ZoneType::NonGlobal,
-                        rauha_common::zone::ZonePolicy::default(),
-                    )
+                    .create_zone(&name, rauha_common::zone::ZoneType::NonGlobal, policy)
                     .await
                     .map_err(to_status)?;
                 sandbox_event_builder(
@@ -1968,19 +1982,78 @@ impl SandboxService for SandboxServiceImpl {
                     &zone.name,
                     &zone.id.to_string(),
                 )
+                .field(
+                    "policy.admission",
+                    FieldValue::String(admission_str(admission).into()),
+                )
                 .trust_level(TrustLevel::Complete)
                 .emit();
-                (zone.name, zone.id.to_string(), true)
+                (zone.name, zone.id.to_string(), true, admission)
             } else {
                 let zone = self.registry.get_zone(&req.name).await.map_err(to_status)?;
-                (zone.name, zone.id.to_string(), false)
+                (zone.name, zone.id.to_string(), false, zone.policy.admission)
             };
             let mut zone_cleanup = (temp_zone && !req.keep_zone)
                 .then(|| ZoneCleanupGuard::new(self.registry.clone(), zone_name.clone()));
 
+            let report = self
+                .registry
+                .verify_isolation(&zone_name)
+                .await
+                .map_err(to_status)?;
+            let mut unavailable_controls = report
+                .checks
+                .iter()
+                .filter(|check| !check.passed)
+                .map(|check| check.name.clone())
+                .collect::<Vec<_>>();
+            if admission == rauha_common::zone::PolicyAdmission::Strict && !report.is_isolated {
+                sandbox_event_builder(
+                    &self.registry,
+                    event_name::SANDBOX_RUN_FAILED,
+                    EventOutcome::Failed,
+                    &task_id,
+                    &zone_name,
+                    &zone_id,
+                )
+                .level(Severity::Error)
+                .field(
+                    "policy.admission",
+                    FieldValue::String(admission_str(admission).into()),
+                )
+                .field(
+                    "policy.unavailable_controls",
+                    FieldValue::String(unavailable_controls.join(",")),
+                )
+                .error(
+                    "sandbox_isolation_verification_failed",
+                    "failed_precondition",
+                    unavailable_controls.join(", "),
+                )
+                .trust_level(TrustLevel::Complete)
+                .emit();
+                return Err(Status::failed_precondition(format!(
+                    "strict sandbox isolation verification failed: {}",
+                    unavailable_controls.join(", ")
+                )));
+            }
+
             let outcome = self
                 .execute_task(&task_id, &zone_name, &zone_id, &req)
                 .await;
+
+            match self.registry.verify_isolation(&zone_name).await {
+                Ok(postflight) => unavailable_controls.extend(
+                    postflight
+                        .checks
+                        .into_iter()
+                        .filter(|check| !check.passed)
+                        .map(|check| check.name),
+                ),
+                Err(_) => unavailable_controls.push("isolation:postflight".into()),
+            }
+            unavailable_controls.sort();
+            unavailable_controls.dedup();
 
             // Tear down the temporary zone unless the caller asked to keep it.
             if temp_zone && !req.keep_zone {
@@ -2045,11 +2118,23 @@ impl SandboxService for SandboxServiceImpl {
                     .map(|code| FieldValue::I64(code as i64))
                     .unwrap_or_else(|| FieldValue::String("none".into())),
             )
+            .field(
+                "policy.admission",
+                FieldValue::String(admission_str(admission).into()),
+            )
+            .field(
+                "policy.unavailable_controls",
+                FieldValue::String(unavailable_controls.join(",")),
+            )
             .trust_level(TrustLevel::BestEffort)
             .degraded_reason("enforcement_events_are_best_effort")
             .emit();
 
-            Ok(Response::new(to_proto_result(exec)))
+            Ok(Response::new(to_proto_result(
+                exec,
+                admission,
+                unavailable_controls,
+            )))
         }
         .instrument(span)
         .await
@@ -2100,11 +2185,17 @@ mod tests {
     fn runtime_error_maps_to_proto_result() {
         let exec =
             SandboxExecResult::runtime_error("task-1", "zone-1", vec!["pytest".into()], "boom");
-        let proto = to_proto_result(exec);
+        let proto = to_proto_result(
+            exec,
+            rauha_common::zone::PolicyAdmission::Audit,
+            vec!["ebpf:test".into()],
+        );
         assert_eq!(proto.status, "runtime_error");
         assert_eq!(proto.stderr, "boom");
         assert_eq!(proto.exit_code, None);
         assert!(proto.started_at.is_empty());
+        assert_eq!(proto.admission, "audit");
+        assert_eq!(proto.unavailable_controls, vec!["ebpf:test"]);
     }
 
     // --- enforcement-event correlation & projection ---

@@ -39,8 +39,17 @@ echo "=== cgroup_lock enforcement test ==="
 # Pull image (idempotent).
 $RAUHA image pull "$IMAGE" 2>/dev/null || true
 
-# Create two zones.
-$RAUHA zone create --name "$ZONE_A"
+# Create two strict zones. A kernel without cgroup_attach_task must reject
+# strict admission instead of pretending the escape control is active.
+if CREATE_ERROR=$($RAUHA zone create --name "$ZONE_A" 2>&1); then
+    :
+elif grep -q "lsm.cgroup_attach_task" <<<"$CREATE_ERROR"; then
+    echo "PASS: strict admission rejected unavailable cgroup_attach_task enforcement"
+    exit 0
+else
+    echo "FAIL: strict zone admission failed unexpectedly: $CREATE_ERROR" >&2
+    exit 1
+fi
 $RAUHA zone create --name "$ZONE_B"
 
 CGROUP_A="/sys/fs/cgroup/rauha.slice/zone-${ZONE_A}"
