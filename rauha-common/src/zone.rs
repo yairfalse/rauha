@@ -2,6 +2,8 @@ use std::net::Ipv4Addr;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::net::IpAddr;
+use std::str::FromStr;
 use uuid::Uuid;
 
 /// Network state assigned to a zone at creation time.
@@ -121,6 +123,99 @@ pub struct NetworkPolicy {
     pub allowed_zones: Vec<String>,
     pub allowed_egress: Vec<String>,
     pub allowed_ingress: Vec<String>,
+}
+
+/// A validated network policy target: IP address/CIDR with an optional TCP port.
+///
+/// IPv4 ports use `address:port`; IPv6 ports require `[address]:port` so the
+/// policy grammar stays unambiguous. A target without a port allows all IP
+/// protocols to that network.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NetworkEndpoint {
+    pub address: IpAddr,
+    pub prefix_len: u8,
+    pub port: Option<u16>,
+}
+
+impl NetworkEndpoint {
+    fn parse_network(value: &str) -> Result<(IpAddr, u8), String> {
+        let (address, prefix) = match value.split_once('/') {
+            Some((address, prefix)) => (address, Some(prefix)),
+            None => (value, None),
+        };
+        let address = address
+            .parse::<IpAddr>()
+            .map_err(|_| format!("invalid IP address or CIDR: {value}"))?;
+        let max_prefix = if address.is_ipv4() { 32 } else { 128 };
+        let prefix_len = prefix
+            .map(|prefix| {
+                prefix
+                    .parse::<u8>()
+                    .map_err(|_| format!("invalid CIDR prefix: {value}"))
+            })
+            .transpose()?
+            .unwrap_or(max_prefix);
+        if prefix_len > max_prefix {
+            return Err(format!("CIDR prefix exceeds {max_prefix}: {value}"));
+        }
+        Ok((address, prefix_len))
+    }
+
+    pub fn nft_family(self) -> &'static str {
+        if self.address.is_ipv4() {
+            "ip"
+        } else {
+            "ip6"
+        }
+    }
+
+    pub fn network(self) -> String {
+        format!("{}/{}", self.address, self.prefix_len)
+    }
+}
+
+impl FromStr for NetworkEndpoint {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let value = value.trim();
+        if value.is_empty() {
+            return Err("network target is empty".into());
+        }
+
+        let (network, port) = if let Some(rest) = value.strip_prefix('[') {
+            let (network, port) = rest
+                .split_once("]:")
+                .ok_or_else(|| format!("invalid bracketed network target: {value}"))?;
+            (network, Some(port))
+        } else if Self::parse_network(value).is_ok() {
+            (value, None)
+        } else {
+            let (network, port) = value
+                .rsplit_once(':')
+                .ok_or_else(|| format!("invalid network target: {value}"))?;
+            (network, Some(port))
+        };
+
+        let (address, prefix_len) = Self::parse_network(network)?;
+        let port = port
+            .map(|port| {
+                let port = port
+                    .parse::<u16>()
+                    .map_err(|_| format!("invalid TCP port: {value}"))?;
+                if port == 0 {
+                    return Err(format!("TCP port must be between 1 and 65535: {value}"));
+                }
+                Ok(port)
+            })
+            .transpose()?;
+
+        Ok(Self {
+            address,
+            prefix_len,
+            port,
+        })
+    }
 }
 
 impl Default for NetworkPolicy {
@@ -488,11 +583,20 @@ impl PolicyFile {
                         )))
                     }
                 };
+                let allowed_egress = n.allowed_egress.clone().unwrap_or_default();
+                let allowed_ingress = n.allowed_ingress.clone().unwrap_or_default();
+                for target in allowed_egress.iter().chain(&allowed_ingress) {
+                    target.parse::<NetworkEndpoint>().map_err(|error| {
+                        crate::error::RauhaError::InvalidPolicy(format!(
+                            "invalid network target {target:?}: {error}"
+                        ))
+                    })?;
+                }
                 Ok(NetworkPolicy {
                     mode,
                     allowed_zones: n.allowed_zones.clone().unwrap_or_default(),
-                    allowed_egress: n.allowed_egress.clone().unwrap_or_default(),
-                    allowed_ingress: n.allowed_ingress.clone().unwrap_or_default(),
+                    allowed_egress,
+                    allowed_ingress,
                 })
             })
             .transpose()?
@@ -589,6 +693,24 @@ mod tests {
         assert!(policy.capabilities.allowed.is_empty());
         assert_eq!(policy.resources.cpu_shares, 1024);
         assert_eq!(policy.network.mode, NetworkMode::Isolated);
+    }
+
+    #[test]
+    fn network_targets_validate_ipv4_ipv6_and_ports() {
+        let ipv4: NetworkEndpoint = "10.0.0.0/8:443".parse().unwrap();
+        assert_eq!(ipv4.nft_family(), "ip");
+        assert_eq!(ipv4.network(), "10.0.0.0/8");
+        assert_eq!(ipv4.port, Some(443));
+
+        let ipv6: NetworkEndpoint = "[2001:db8::/32]:8443".parse().unwrap();
+        assert_eq!(ipv6.nft_family(), "ip6");
+        assert_eq!(ipv6.network(), "2001:db8::/32");
+        assert_eq!(ipv6.port, Some(8443));
+
+        assert!("2001:db8::/32".parse::<NetworkEndpoint>().is_ok());
+        assert!("0.0.0.0/0:0".parse::<NetworkEndpoint>().is_err());
+        assert!("0.0.0.0/99".parse::<NetworkEndpoint>().is_err());
+        assert!("0.0.0.0/0 accept".parse::<NetworkEndpoint>().is_err());
     }
 
     fn policy_with_caps(caps: &[&str]) -> ZonePolicy {

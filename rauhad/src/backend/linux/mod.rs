@@ -376,9 +376,6 @@ fn unsupported_linux_controls(policy: &ZonePolicy) -> Vec<String> {
     if !policy.syscalls.deny.is_empty() {
         unsupported.push("syscalls.deny".to_string());
     }
-    if !policy.network.allowed_ingress.is_empty() {
-        unsupported.push("network.allowed_ingress".to_string());
-    }
     unsupported
 }
 
@@ -417,7 +414,10 @@ fn oci_capabilities(policy: &ZonePolicy) -> Result<oci_spec::runtime::LinuxCapab
         .allowed
         .iter()
         .map(|name| {
-            rauha_common::zone::canonical_linux_capability_name(name)
+            let canonical = rauha_common::zone::canonical_linux_capability_name(name);
+            canonical
+                .strip_prefix("CAP_")
+                .ok_or_else(|| RauhaError::InvalidPolicy(format!("unknown capability: {name}")))?
                 .parse::<Capability>()
                 .map_err(|_| RauhaError::InvalidPolicy(format!("unknown capability: {name}")))
         })
@@ -1667,7 +1667,7 @@ mod tests {
         policy.filesystem.writable_paths = vec!["/tmp".into()];
         policy.devices.allowed = vec!["/dev/null".into()];
         policy.syscalls.deny = vec!["mount".into()];
-        policy.network.allowed_ingress = vec!["tcp:8080".into()];
+        policy.network.allowed_ingress = vec!["0.0.0.0/0:8080".into()];
 
         assert_eq!(
             unsupported_linux_controls(&policy),
@@ -1675,7 +1675,6 @@ mod tests {
                 "filesystem.writable_paths",
                 "devices.allowed",
                 "syscalls.deny",
-                "network.allowed_ingress",
             ]
         );
 
@@ -1701,6 +1700,17 @@ mod tests {
         assert!(capabilities.inheritable().as_ref().unwrap().is_empty());
         assert!(capabilities.permitted().as_ref().unwrap().is_empty());
         assert!(capabilities.ambient().as_ref().unwrap().is_empty());
+    }
+
+    #[test]
+    fn named_policy_capabilities_convert_to_oci_capabilities() {
+        let mut policy = ZonePolicy::default();
+        policy.capabilities.allowed = vec!["CAP_NET_RAW".into(), "chown".into()];
+
+        let capabilities = oci_capabilities(&policy).unwrap();
+        let effective = capabilities.effective().as_ref().unwrap();
+        assert!(effective.contains(&oci_spec::runtime::Capability::NetRaw));
+        assert!(effective.contains(&oci_spec::runtime::Capability::Chown));
     }
 
     #[test]

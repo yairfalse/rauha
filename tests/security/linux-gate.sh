@@ -9,7 +9,7 @@ export RAUHA_ADDR='http://[::1]:9876'
 [ "$(uname -s)" = Linux ] || { echo "Linux is required" >&2; exit 2; }
 test -r /sys/kernel/btf/vmlinux || { echo "kernel BTF is required" >&2; exit 2; }
 grep -qw bpf /sys/kernel/security/lsm || { echo "BPF LSM is required" >&2; exit 2; }
-for command in cargo bpf-linker crun findmnt ip jq nft pgrep protoc rustup sudo timeout; do
+for command in cargo bpf-linker crun findmnt ip jq nft pgrep protoc python3 rustup sudo timeout; do
     command -v "$command" >/dev/null || { echo "$command is required" >&2; exit 2; }
 done
 
