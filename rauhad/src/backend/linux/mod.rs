@@ -433,34 +433,6 @@ fn oci_capabilities(policy: &ZonePolicy) -> Result<oci_spec::runtime::LinuxCapab
         .map_err(|e| RauhaError::BackendError(format!("failed to build OCI capabilities: {e}")))
 }
 
-/// Keep crun's trusted setup outside the zone, then enroll PID 1 before image code runs.
-fn add_crun_zone_boundary(spec: &mut serde_json::Value, zone_name: &str) -> Result<()> {
-    let object = spec.as_object_mut().ok_or_else(|| {
-        RauhaError::BackendError("generated OCI spec is not a JSON object".into())
-    })?;
-    let mounts = object
-        .get_mut("mounts")
-        .and_then(serde_json::Value::as_array_mut)
-        .ok_or_else(|| RauhaError::BackendError("generated OCI mounts are missing".into()))?;
-    mounts.push(serde_json::json!({
-        "destination": "/run/rauha-zone.procs",
-        "type": "bind",
-        "source": format!("/sys/fs/cgroup/rauha.slice/zone-{zone_name}/cgroup.procs"),
-        "options": ["bind", "rw", "nosuid", "noexec", "nodev"]
-    }));
-    object.insert(
-        "hooks".into(),
-        serde_json::json!({
-            "startContainer": [{
-                "path": "/bin/sh",
-                "args": ["sh", "-c", "printf 1 > /run/rauha-zone.procs"],
-                "env": ["PATH=/usr/sbin:/usr/bin:/sbin:/bin"]
-            }]
-        }),
-    );
-    Ok(())
-}
-
 fn collect_zone_rootfs_inodes(root: &str, zone_name: &str) -> Result<Vec<u64>> {
     let containers = PathBuf::from(root)
         .join("zones")
@@ -1037,18 +1009,6 @@ impl IsolationBackend for LinuxBackend {
             tracing::warn!(%e, "failed to write resolv.conf — DNS may not work inside container");
         }
 
-        // crun otherwise creates this bind target after inode registration,
-        // making the enforced rootfs set stale as the container starts.
-        let cgroup_target = rootfs_dir.join("run/rauha-zone.procs");
-        if let Some(parent) = cgroup_target.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| RauhaError::RootfsError {
-                message: format!("failed to create OCI hook directory: {e}"),
-            })?;
-        }
-        std::fs::File::create(&cgroup_target).map_err(|e| RauhaError::RootfsError {
-            message: format!("failed to create OCI cgroup bind target: {e}"),
-        })?;
-
         // Generate OCI runtime spec.
         use oci_spec::runtime::{LinuxBuilder, LinuxNamespaceBuilder, LinuxNamespaceType};
         let mut namespaces = vec![
@@ -1084,7 +1044,7 @@ impl IsolationBackend for LinuxBackend {
             .map_err(|e| {
                 RauhaError::BackendError(format!("failed to build OCI Linux spec: {e}"))
             })?;
-        let mut runtime_spec = serde_json::to_value(
+        let runtime_spec = serde_json::to_value(
             oci_spec::runtime::SpecBuilder::default()
                 .version("1.0.2")
                 .root(
@@ -1126,7 +1086,6 @@ impl IsolationBackend for LinuxBackend {
                 .unwrap(),
         )
         .map_err(|e| RauhaError::BackendError(format!("failed to serialize spec: {e}")))?;
-        add_crun_zone_boundary(&mut runtime_spec, &zone.name)?;
         let spec_json = serde_json::to_string(&runtime_spec)
             .map_err(|e| RauhaError::BackendError(format!("failed to serialize spec: {e}")))?;
 
@@ -1639,8 +1598,8 @@ fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> Result<()
 #[cfg(test)]
 mod tests {
     use super::{
-        add_crun_zone_boundary, admit_linux_policy, collect_zone_rootfs_inodes, lock_backend,
-        oci_capabilities, unsupported_linux_controls,
+        admit_linux_policy, collect_zone_rootfs_inodes, lock_backend, oci_capabilities,
+        unsupported_linux_controls,
     };
     use rauha_common::zone::{PolicyAdmission, ZonePolicy};
     use std::os::unix::fs::MetadataExt;
@@ -1711,22 +1670,6 @@ mod tests {
         let effective = capabilities.effective().as_ref().unwrap();
         assert!(effective.contains(&oci_spec::runtime::Capability::NetRaw));
         assert!(effective.contains(&oci_spec::runtime::Capability::Chown));
-    }
-
-    #[test]
-    fn crun_enrolls_init_before_releasing_the_workload() {
-        let mut spec = serde_json::json!({"mounts": [{"destination": "/dev"}]});
-        add_crun_zone_boundary(&mut spec, "test").unwrap();
-
-        assert_eq!(spec["mounts"][0]["destination"], "/dev");
-        assert_eq!(
-            spec["mounts"][1]["source"],
-            "/sys/fs/cgroup/rauha.slice/zone-test/cgroup.procs"
-        );
-        assert_eq!(
-            spec["hooks"]["startContainer"][0]["args"][2],
-            "printf 1 > /run/rauha-zone.procs"
-        );
     }
 
     #[test]

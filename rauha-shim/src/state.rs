@@ -21,7 +21,7 @@ struct ContainerProcess {
     exit_code: Option<i32>,
     /// OCI runtime spec JSON (saved at create time, used at start time).
     spec_json: String,
-    /// Foreground crun process supervised by this shim.
+    /// OCI init process supervised by this shim.
     runtime: Option<container::RuntimeProcess>,
 }
 
@@ -85,7 +85,8 @@ impl ShimState {
 
         let spec_json = proc.spec_json.clone();
 
-        let (runtime, pid) = container::start_with_crun(id, &spec_json, &self.rootfs_root)?;
+        let (runtime, pid) =
+            container::start_with_crun(&self.zone_name, id, &spec_json, &self.rootfs_root)?;
 
         let proc = self
             .containers

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Prove crun can consume a Rauha-prepared rootfs while preserving Rauha's
-# exact cgroup and network-namespace boundary used by the production executor.
+# Prove the production handoff: crun creates a blocked init, trusted host code
+# enrolls it in the exact zone cgroup, then crun releases the workload.
 set -euo pipefail
 
 RAUHA=${RAUHA_BIN:?RAUHA_BIN is required}
@@ -50,7 +50,6 @@ HOST_NETNS=$(readlink /proc/self/ns/net)
 jq -n \
     --arg hostname "crun-$ZONE" \
     --arg netns "/var/run/netns/rauha-$ZONE" \
-    --arg cgroup_procs "$CGROUP/cgroup.procs" \
     '{
         ociVersion: "1.0.2",
         process: {
@@ -65,16 +64,8 @@ jq -n \
         root: {path: "rootfs", readonly: true},
         hostname: $hostname,
         mounts: [
-            {destination: "/proc", type: "proc", source: "proc", options: ["nosuid", "noexec", "nodev"]},
-            {destination: "/run/rauha-zone.procs", type: "bind", source: $cgroup_procs, options: ["bind", "rw", "nosuid", "noexec", "nodev"]}
+            {destination: "/proc", type: "proc", source: "proc", options: ["nosuid", "noexec", "nodev"]}
         ],
-        hooks: {
-            startContainer: [{
-                path: "/bin/sh",
-                args: ["sh", "-c", "printf 1 > /run/rauha-zone.procs"],
-                env: ["PATH=/usr/sbin:/usr/bin:/sbin:/bin"]
-            }]
-        },
         linux: {
             namespaces: [
                 {type: "pid"},
@@ -86,7 +77,27 @@ jq -n \
         }
     }' >"$BUNDLE/config.json"
 
-OUTPUT=$(crun --root "$RUNTIME_ROOT" --cgroup-manager=disabled run --bundle "$BUNDLE" "probe-$ZONE")
+run_probe() {
+    local id=$1 output=$2 pid status
+    : >"$output"
+    crun --root "$RUNTIME_ROOT" --cgroup-manager=disabled create --bundle "$BUNDLE" \
+        --pid-file "$BUNDLE/$id.pid" "$id" >"$output"
+    pid=$(cat "$BUNDLE/$id.pid")
+    [ ! -s "$output" ] || { echo "workload ran before cgroup enrollment" >&2; exit 1; }
+    printf '%s' "$pid" >"$CGROUP/cgroup.procs"
+    grep -Fq "/rauha.slice/zone-$ZONE" "/proc/$pid/cgroup"
+    crun --root "$RUNTIME_ROOT" --cgroup-manager=disabled start "$id"
+    for _ in $(seq 1 500); do
+        status=$(crun --root "$RUNTIME_ROOT" --cgroup-manager=disabled state "$id" 2>/dev/null | jq -r .status || true)
+        [ "$status" = stopped ] && break
+        sleep 0.01
+    done
+    [ "$status" = stopped ] || { echo "crun workload did not stop" >&2; exit 1; }
+    crun --root "$RUNTIME_ROOT" --cgroup-manager=disabled delete "$id"
+}
+
+run_probe "probe-$ZONE" "$BUNDLE/output"
+OUTPUT=$(cat "$BUNDLE/output")
 printf '%s\n' "$OUTPUT" | grep -qx "crun-$ZONE"
 printf '%s\n' "$OUTPUT" | grep -Eq '^CapEff:[[:space:]]+0+$'
 printf '%s\n' "$OUTPUT" | grep -Eq '^NoNewPrivs:[[:space:]]+1$'
@@ -99,9 +110,8 @@ printf '%s\n' "$OUTPUT" | grep -Fq "/rauha.slice/zone-$ZONE"
 
 START=$(date +%s%N)
 for iteration in 1 2 3 4 5; do
-    crun --root "$RUNTIME_ROOT" --cgroup-manager=disabled run --bundle "$BUNDLE" \
-        "probe-$ZONE-$iteration" >/dev/null
+    run_probe "probe-$ZONE-$iteration" "$BUNDLE/output-$iteration"
 done
 END=$(date +%s%N)
 AVERAGE_MS=$(((END - START) / 5000000))
-echo "PASS: crun preserved Rauha cgroup/netns/security state; warm bundle launch average ${AVERAGE_MS}ms (n=5)"
+echo "PASS: crun create/enroll/start preserved Rauha containment; warm bundle launch average ${AVERAGE_MS}ms (n=5)"

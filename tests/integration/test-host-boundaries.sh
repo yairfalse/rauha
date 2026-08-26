@@ -126,6 +126,12 @@ else
     echo "PASS: empty writable_paths makes the rootfs read-only"
 fi
 
+if $RAUHA sandbox --name "$ZONE" --image "$IMAGE" -- /bin/sh -c 'test ! -e /run/rauha-zone.procs' >/dev/null 2>&1; then
+    echo "PASS: workload has no writable cgroup enrollment handle"
+else
+    fail "workload can access the zone cgroup enrollment handle"
+fi
+
 if $RAUHA sandbox --name "$ZONE" --image "$IMAGE" -- /bin/sh -c 'test "$$" -eq 1 && test "$(cat /proc/1/comm)" = sh' >/dev/null 2>&1; then
     echo "PASS: procfs exposes the container PID namespace"
 else
