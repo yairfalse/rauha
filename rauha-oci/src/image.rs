@@ -1,5 +1,5 @@
 use std::collections::HashSet;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use rauha_common::error::RauhaError;
@@ -529,6 +529,111 @@ impl ImageService {
     }
 }
 
+fn invalid_layer_path(path: &Path, reason: &str) -> RauhaError {
+    RauhaError::RootfsError {
+        message: format!("unsafe layer path {}: {reason}", path.display()),
+    }
+}
+
+fn clean_layer_path(path: &Path) -> Result<PathBuf, RauhaError> {
+    let mut clean = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Normal(part) => clean.push(part),
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err(invalid_layer_path(path, "path escapes the rootfs"));
+            }
+        }
+    }
+    if clean.as_os_str().is_empty() {
+        return Err(invalid_layer_path(path, "path is empty"));
+    }
+    Ok(clean)
+}
+
+/// Resolve an existing whiteout parent without following image-controlled symlinks.
+///
+/// Layer extraction happens in a private staging directory, so rejecting every
+/// symlink component closes the whiteout escape without another path library.
+fn whiteout_parent(target: &Path, relative: &Path) -> Result<Option<PathBuf>, RauhaError> {
+    let mut current = target.canonicalize().map_err(|e| RauhaError::RootfsError {
+        message: format!("failed to resolve rootfs {}: {e}", target.display()),
+    })?;
+
+    for component in relative.components() {
+        let Component::Normal(part) = component else {
+            return Err(invalid_layer_path(relative, "invalid whiteout parent"));
+        };
+        current.push(part);
+        match std::fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(invalid_layer_path(relative, "whiteout parent is a symlink"));
+            }
+            Ok(metadata) if !metadata.is_dir() => {
+                return Err(invalid_layer_path(
+                    relative,
+                    "whiteout parent is not a directory",
+                ));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(RauhaError::RootfsError {
+                    message: format!(
+                        "failed to inspect whiteout parent {}: {error}",
+                        current.display()
+                    ),
+                });
+            }
+        }
+    }
+
+    Ok(Some(current))
+}
+
+fn remove_path(path: &Path) -> Result<(), RauhaError> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(RauhaError::RootfsError {
+                message: format!(
+                    "failed to inspect whiteout target {}: {error}",
+                    path.display()
+                ),
+            });
+        }
+    };
+
+    let result = if metadata.is_dir() && !metadata.file_type().is_symlink() {
+        std::fs::remove_dir_all(path)
+    } else {
+        std::fs::remove_file(path)
+    };
+    result.map_err(|e| RauhaError::RootfsError {
+        message: format!("failed to apply whiteout to {}: {e}", path.display()),
+    })
+}
+
+fn clear_directory(path: &Path) -> Result<(), RauhaError> {
+    for entry in std::fs::read_dir(path).map_err(|e| RauhaError::RootfsError {
+        message: format!(
+            "failed to read opaque whiteout directory {}: {e}",
+            path.display()
+        ),
+    })? {
+        remove_path(
+            &entry
+                .map_err(|e| RauhaError::RootfsError {
+                    message: format!("failed to read opaque whiteout entry: {e}"),
+                })?
+                .path(),
+        )?;
+    }
+    Ok(())
+}
+
 /// Unpack a tar layer into a target directory, handling OCI whiteout files.
 pub fn unpack_layer(
     archive: &mut tar::Archive<flate2::read::GzDecoder<std::fs::File>>,
@@ -544,39 +649,31 @@ pub fn unpack_layer(
         let path = entry.path().map_err(|e| RauhaError::RootfsError {
             message: format!("invalid tar entry path: {e}"),
         })?;
-        let path = path.to_path_buf();
+        let path = clean_layer_path(&path)?;
 
         // Check for OCI whiteout markers.
         if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
             if name == ".wh..wh..opq" {
                 // Opaque whiteout: remove all existing contents of the parent directory.
                 if let Some(parent) = path.parent() {
-                    let full_parent = target.join(parent);
-                    if full_parent.exists() {
-                        let _ = std::fs::remove_dir_all(&full_parent);
-                        let _ = std::fs::create_dir_all(&full_parent);
+                    if let Some(full_parent) = whiteout_parent(target, parent)? {
+                        clear_directory(&full_parent)?;
                     }
                 }
                 continue;
             }
             if let Some(original) = name.strip_prefix(".wh.") {
+                if original.is_empty() {
+                    return Err(invalid_layer_path(&path, "whiteout target is empty"));
+                }
                 // File whiteout: delete the corresponding file.
                 if let Some(parent) = path.parent() {
-                    let to_delete = target.join(parent).join(original);
-                    if to_delete.is_dir() {
-                        let _ = std::fs::remove_dir_all(&to_delete);
-                    } else {
-                        let _ = std::fs::remove_file(&to_delete);
+                    if let Some(full_parent) = whiteout_parent(target, parent)? {
+                        remove_path(&full_parent.join(original))?;
                     }
                 }
                 continue;
             }
-        }
-
-        // Validate path: prevent path traversal.
-        let full_path = target.join(&path);
-        if !full_path.starts_with(target) {
-            continue;
         }
 
         entry
@@ -858,6 +955,36 @@ pub(crate) mod tests {
 
         // The file should have been deleted by the whiteout.
         assert!(!rootfs.join("etc/config.txt").exists());
+    }
+
+    #[test]
+    fn whiteout_rejects_parent_traversal() {
+        let error = clean_layer_path(Path::new("../outside/.wh.victim")).unwrap_err();
+        assert!(error.to_string().contains("path escapes the rootfs"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn whiteout_does_not_follow_a_symlinked_parent() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("rootfs");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("victim"), b"host data").unwrap();
+        symlink(&outside, target.join("escape")).unwrap();
+
+        let layer = make_tar_gz(&[("escape/.wh.victim", b"")]);
+        let layer_path = dir.path().join("layer.tar.gz");
+        std::fs::write(&layer_path, layer).unwrap();
+        let decoder = flate2::read::GzDecoder::new(std::fs::File::open(layer_path).unwrap());
+        let mut archive = tar::Archive::new(decoder);
+
+        let error = unpack_layer(&mut archive, &target).unwrap_err();
+        assert!(error.to_string().contains("whiteout parent is a symlink"));
+        assert_eq!(std::fs::read(outside.join("victim")).unwrap(), b"host data");
     }
 
     #[test]
