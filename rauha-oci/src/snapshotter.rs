@@ -183,7 +183,7 @@ impl OverlayfsSnapshotter {
         work: &Path,
         merged: &Path,
     ) -> Result<()> {
-        use nix::mount::{mount, MsFlags};
+        use nix::mount::{mount, umount2, MntFlags, MsFlags};
 
         if layer_paths.is_empty() {
             return Err(RauhaError::RootfsError {
@@ -224,6 +224,18 @@ impl OverlayfsSnapshotter {
                 "overlayfs mount failed: {e} — try: modprobe overlay; or check that /proc/filesystems contains overlay"
             ),
         })?;
+        if let Err(error) = mount(
+            None::<&str>,
+            merged,
+            None::<&str>,
+            MsFlags::MS_PRIVATE,
+            None::<&str>,
+        ) {
+            let _ = umount2(merged, MntFlags::MNT_DETACH);
+            return Err(RauhaError::RootfsError {
+                message: format!("failed to make overlay rootfs private: {error}"),
+            });
+        }
 
         Ok(())
     }
