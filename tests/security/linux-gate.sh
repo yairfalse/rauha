@@ -5,6 +5,8 @@ set -euo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 cd "$ROOT"
 export RAUHA_ADDR='http://[::1]:9876'
+TEST_IMAGE=${TEST_IMAGE:-alpine:latest}
+TEST_SECONDARY_IMAGE=${TEST_SECONDARY_IMAGE:-busybox:latest}
 
 [ "$(uname -s)" = Linux ] || { echo "Linux is required" >&2; exit 2; }
 test -r /sys/kernel/btf/vmlinux || { echo "kernel BTF is required" >&2; exit 2; }
@@ -96,7 +98,7 @@ start_daemon
 FAILURES=0
 TEST_TIMEOUT=${RAUHA_TEST_TIMEOUT_SECONDS:-120}
 for test_script in tests/integration/*.sh; do
-    if ! sudo env RAUHA_ADDR="$RAUHA_ADDR" RAUHA_BIN="$ROOT/target/debug/rauha" RAUHA_ROOT="$RUN_ROOT" \
+    if ! sudo env RAUHA_ADDR="$RAUHA_ADDR" RAUHA_BIN="$ROOT/target/debug/rauha" RAUHA_ROOT="$RUN_ROOT" TEST_IMAGE="$TEST_IMAGE" \
         timeout --foreground --kill-after=5s "$TEST_TIMEOUT" bash "$test_script"; then
         echo "FAILED: $test_script" >&2
         FAILURES=$((FAILURES + 1))
@@ -105,19 +107,19 @@ done
 
 # Prove crash recovery against live kernel state, not only serialized metadata.
 RECOVERY_STATE="$RUN_ROOT/recovery-probe.state"
-sudo env RAUHA_ADDR="$RAUHA_ADDR" RAUHA_BIN="$ROOT/target/debug/rauha" RAUHA_ROOT="$RUN_ROOT" \
+sudo env RAUHA_ADDR="$RAUHA_ADDR" RAUHA_BIN="$ROOT/target/debug/rauha" RAUHA_ROOT="$RUN_ROOT" TEST_IMAGE="$TEST_IMAGE" \
     bash "$ROOT/tests/security/recovery-probe.sh" prepare "$RECOVERY_STATE"
 crash_daemon
 start_daemon
-sudo env RAUHA_ADDR="$RAUHA_ADDR" RAUHA_BIN="$ROOT/target/debug/rauha" RAUHA_ROOT="$RUN_ROOT" \
+sudo env RAUHA_ADDR="$RAUHA_ADDR" RAUHA_BIN="$ROOT/target/debug/rauha" RAUHA_ROOT="$RUN_ROOT" TEST_IMAGE="$TEST_IMAGE" \
     bash "$ROOT/tests/security/recovery-probe.sh" verify "$RECOVERY_STATE"
 
-# Exercise a mature OCI executor against a Rauha-prepared rootfs and the
-# existing zone cgroup/netns boundary without changing the production path.
-sudo env RAUHA_ADDR="$RAUHA_ADDR" RAUHA_BIN="$ROOT/target/debug/rauha" RAUHA_ROOT="$RUN_ROOT" \
+# Prove the production two-phase OCI handoff against a Rauha-prepared rootfs.
+sudo env RAUHA_ADDR="$RAUHA_ADDR" RAUHA_BIN="$ROOT/target/debug/rauha" RAUHA_ROOT="$RUN_ROOT" TEST_IMAGE="$TEST_IMAGE" \
     bash "$ROOT/tests/security/oci-executor-probe.sh"
 
 if ! timeout --foreground --kill-after=5s "$TEST_TIMEOUT" env RAUHA_GRPC_ENDPOINT=http://[::1]:9876 \
+    TEST_IMAGE="$TEST_IMAGE" TEST_SECONDARY_IMAGE="$TEST_SECONDARY_IMAGE" \
     cargo test --quiet --manifest-path eval/oracle/Cargo.toml --locked; then
     echo "FAILED: eval/oracle" >&2
     FAILURES=$((FAILURES + 1))

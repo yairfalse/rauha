@@ -56,14 +56,21 @@ fingerprint_linux() {
 if [ "${1:-}" = "--gate" ]; then
     [ "$#" -eq 1 ] || { echo "--gate takes no additional arguments" >&2; exit 2; }
     kind=$(sed -n 's/^kind=//p' "$RUNTIME")
+    test_image=$(sed -n 's/^test_image=//p' "$RUNTIME")
+    test_image=${test_image:-alpine:latest}
+    test_secondary_image=$(sed -n 's/^test_secondary_image=//p' "$RUNTIME")
+    test_secondary_image=${test_secondary_image:-busybox:latest}
     case "$kind" in
         linux)
-            exec bash "$ROOT/tests/security/linux-gate.sh"
+            exec env TEST_IMAGE="$test_image" TEST_SECONDARY_IMAGE="$test_secondary_image" \
+                bash "$ROOT/tests/security/linux-gate.sh"
             ;;
         lima)
             instance=$(sed -n 's/^instance=//p' "$RUNTIME")
             [ -n "$instance" ] || { echo "missing Lima instance in $RUNTIME" >&2; exit 2; }
-            exec limactl shell "$instance" -- bash "$ROOT/tests/security/linux-gate.sh"
+            exec limactl shell "$instance" -- env TEST_IMAGE="$test_image" \
+                TEST_SECONDARY_IMAGE="$test_secondary_image" \
+                bash "$ROOT/tests/security/linux-gate.sh"
             ;;
         *)
             echo "invalid or missing security runtime fingerprint; use tests/security/run.sh" >&2
@@ -78,13 +85,15 @@ mkdir -p "$ROOT/.sykli"
 RUN_ID=$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')
 if [ "$(uname -s)" = Linux ]; then
     {
-        printf 'run_id=%s\nkind=linux\n' "$RUN_ID"
+        printf 'run_id=%s\nkind=linux\ntest_image=%s\ntest_secondary_image=%s\n' \
+            "$RUN_ID" "${TEST_IMAGE:-alpine:latest}" "${TEST_SECONDARY_IMAGE:-busybox:latest}"
         fingerprint_linux
     } >"$RUNTIME"
 else
     instance=$(select_lima)
     {
-        printf 'run_id=%s\nkind=lima\ninstance=%s\n' "$RUN_ID" "$instance"
+        printf 'run_id=%s\nkind=lima\ninstance=%s\ntest_image=%s\ntest_secondary_image=%s\n' \
+            "$RUN_ID" "$instance" "${TEST_IMAGE:-alpine:latest}" "${TEST_SECONDARY_IMAGE:-busybox:latest}"
         limactl shell "$instance" -- bash -c "$(declare -f fingerprint_linux); fingerprint_linux"
     } >"$RUNTIME"
 fi
