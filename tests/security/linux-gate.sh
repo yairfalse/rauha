@@ -9,7 +9,7 @@ export RAUHA_ADDR='http://[::1]:9876'
 [ "$(uname -s)" = Linux ] || { echo "Linux is required" >&2; exit 2; }
 test -r /sys/kernel/btf/vmlinux || { echo "kernel BTF is required" >&2; exit 2; }
 grep -qw bpf /sys/kernel/security/lsm || { echo "BPF LSM is required" >&2; exit 2; }
-for command in cargo bpf-linker findmnt ip nft pgrep protoc rustup sudo timeout; do
+for command in cargo bpf-linker crun findmnt ip jq nft pgrep protoc rustup sudo timeout; do
     command -v "$command" >/dev/null || { echo "$command is required" >&2; exit 2; }
 done
 
@@ -21,14 +21,53 @@ cargo xtask build-ebpf --release
 
 RUN_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/rauha-security.XXXXXX")
 DAEMON_LOG="$ROOT/.sykli/rauhad.log"
+DAEMON_PID_FILE="$RUN_ROOT/rauhad.pid"
 HOSTNAME_BEFORE=$(hostname)
 mkdir -p "$ROOT/.sykli"
 DAEMON_PID=""
+DAEMON_LAUNCH_PID=""
+
+start_daemon() {
+    sudo env RAUHA_ROOT="$RUN_ROOT" RAUHA_PID_FILE="$DAEMON_PID_FILE" \
+        sh -c 'printf "%s\n" "$$" >"$RAUHA_PID_FILE"; exec "$1"' \
+        sh "$ROOT/target/debug/rauhad" >>"$DAEMON_LOG" 2>&1 &
+    DAEMON_LAUNCH_PID=$!
+
+    for _ in $(seq 1 30); do
+        [ -s "$DAEMON_PID_FILE" ] && break
+        sleep 0.1
+    done
+    DAEMON_PID=$(cat "$DAEMON_PID_FILE" 2>/dev/null || true)
+    [ -n "$DAEMON_PID" ] || { echo "rauhad did not publish its PID" >&2; return 1; }
+
+    for _ in $(seq 1 30); do
+        if ! sudo kill -0 "$DAEMON_PID" 2>/dev/null; then
+            wait "$DAEMON_LAUNCH_PID" 2>/dev/null || true
+            tail -100 "$DAEMON_LOG" >&2
+            echo "rauhad exited before becoming ready" >&2
+            return 1
+        fi
+        if "$ROOT/target/debug/rauha" zone list >/dev/null 2>&1; then
+            return 0
+        fi
+        sleep 1
+    done
+    tail -100 "$DAEMON_LOG" >&2
+    return 1
+}
+
+crash_daemon() {
+    sudo kill -KILL "$DAEMON_PID"
+    wait "$DAEMON_LAUNCH_PID" 2>/dev/null || true
+    DAEMON_PID=""
+    DAEMON_LAUNCH_PID=""
+    rm -f "$DAEMON_PID_FILE"
+}
 
 cleanup() {
     if [ -n "$DAEMON_PID" ]; then
         sudo kill "$DAEMON_PID" 2>/dev/null || true
-        wait "$DAEMON_PID" 2>/dev/null || true
+        wait "$DAEMON_LAUNCH_PID" 2>/dev/null || true
     fi
     while read -r shim_pid; do
         sudo kill "$shim_pid" 2>/dev/null || true
@@ -51,27 +90,8 @@ if "$ROOT/target/debug/rauha" zone list >/dev/null 2>&1; then
     exit 2
 fi
 
-sudo env RAUHA_ROOT="$RUN_ROOT" "$ROOT/target/debug/rauhad" >"$DAEMON_LOG" 2>&1 &
-DAEMON_PID=$!
-
-READY=false
-for _ in $(seq 1 30); do
-    if ! sudo kill -0 "$DAEMON_PID" 2>/dev/null; then
-        wait "$DAEMON_PID" 2>/dev/null || true
-        tail -100 "$DAEMON_LOG" >&2
-        echo "rauhad exited before becoming ready" >&2
-        exit 1
-    fi
-    if "$ROOT/target/debug/rauha" zone list >/dev/null 2>&1; then
-        READY=true
-        break
-    fi
-    sleep 1
-done
-if [ "$READY" != true ]; then
-    tail -100 "$DAEMON_LOG" >&2
-    exit 1
-fi
+: >"$DAEMON_LOG"
+start_daemon
 
 FAILURES=0
 TEST_TIMEOUT=${RAUHA_TEST_TIMEOUT_SECONDS:-120}
@@ -82,6 +102,20 @@ for test_script in tests/integration/*.sh; do
         FAILURES=$((FAILURES + 1))
     fi
 done
+
+# Prove crash recovery against live kernel state, not only serialized metadata.
+RECOVERY_STATE="$RUN_ROOT/recovery-probe.state"
+sudo env RAUHA_ADDR="$RAUHA_ADDR" RAUHA_BIN="$ROOT/target/debug/rauha" RAUHA_ROOT="$RUN_ROOT" \
+    bash "$ROOT/tests/security/recovery-probe.sh" prepare "$RECOVERY_STATE"
+crash_daemon
+start_daemon
+sudo env RAUHA_ADDR="$RAUHA_ADDR" RAUHA_BIN="$ROOT/target/debug/rauha" RAUHA_ROOT="$RUN_ROOT" \
+    bash "$ROOT/tests/security/recovery-probe.sh" verify "$RECOVERY_STATE"
+
+# Exercise a mature OCI executor against a Rauha-prepared rootfs and the
+# existing zone cgroup/netns boundary without changing the production path.
+sudo env RAUHA_ADDR="$RAUHA_ADDR" RAUHA_BIN="$ROOT/target/debug/rauha" RAUHA_ROOT="$RUN_ROOT" \
+    bash "$ROOT/tests/security/oci-executor-probe.sh"
 
 if ! timeout --foreground --kill-after=5s "$TEST_TIMEOUT" env RAUHA_GRPC_ENDPOINT=http://[::1]:9876 \
     cargo test --quiet --manifest-path eval/oracle/Cargo.toml --locked; then

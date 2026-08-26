@@ -61,7 +61,7 @@ else
 fi
 
 echo "6. Checking nftables NAT table exists..."
-if nft list table inet rauha 2>/dev/null | grep -q "masquerade"; then
+if nft list table inet rauha 2>/dev/null | grep "masquerade" >/dev/null; then
     echo "   nftables masquerade: present (OK)"
 else
     echo "   FAIL: nftables masquerade rule not found"

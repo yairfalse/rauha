@@ -126,7 +126,7 @@ else
     echo "PASS: empty writable_paths makes the rootfs read-only"
 fi
 
-if $RAUHA sandbox --name "$ZONE" --image "$IMAGE" -- /bin/sh -c 'test -r /proc/1/status && test "$(cat /proc/1/comm)" = rauha-shim' >/dev/null 2>&1; then
+if $RAUHA sandbox --name "$ZONE" --image "$IMAGE" -- /bin/sh -c 'test "$$" -eq 1 && test "$(cat /proc/1/comm)" = sh' >/dev/null 2>&1; then
     echo "PASS: procfs exposes the container PID namespace"
 else
     fail "container procfs does not expose its PID 1"
