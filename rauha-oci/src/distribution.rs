@@ -99,9 +99,10 @@ impl DistributionClient {
         &self,
         reference: &ImageReference,
     ) -> Result<OciManifest, RauhaError> {
+        let selector = reference.digest.as_deref().unwrap_or(&reference.tag);
         let url = format!(
             "https://{}/v2/{}/manifests/{}",
-            reference.registry, reference.repository, reference.tag
+            reference.registry, reference.repository, selector
         );
 
         let accept = &[
@@ -116,6 +117,7 @@ impl DistributionClient {
             .await?;
 
         let canonical = reference.to_string_canonical();
+        verify_manifest_digest(reference.digest.as_deref(), &body, &canonical)?;
 
         // Try parsing as a single manifest first.
         if let Ok(manifest) = serde_json::from_slice::<OciManifest>(&body) {
@@ -176,6 +178,7 @@ impl DistributionClient {
                 ],
             )
             .await?;
+        verify_manifest_digest(Some(&platform_entry.digest), &manifest_body, &canonical)?;
 
         self.content
             .put_manifest(&canonical, &manifest_body)
@@ -264,16 +267,14 @@ impl DistributionClient {
         // Try with cached token first.
         if let Some(token) = self.get_cached_token(registry, &scope).await {
             let resp = self
-                .http
-                .get(url)
-                .header("Accept", accept.join(", "))
-                .bearer_auth(&token)
-                .send()
-                .await
-                .map_err(|e| RauhaError::ImagePullError {
-                    reference: url.to_string(),
-                    message: format!("request failed: {e}"),
-                })?;
+                .send_with_rate_limit(
+                    self.http
+                        .get(url)
+                        .header("Accept", accept.join(", "))
+                        .bearer_auth(&token),
+                    url,
+                )
+                .await?;
 
             if resp.status().is_success() {
                 return resp.bytes().await.map(|b| b.to_vec()).map_err(|e| {
@@ -287,15 +288,8 @@ impl DistributionClient {
 
         // Initial request (may get 401).
         let resp = self
-            .http
-            .get(url)
-            .header("Accept", accept.join(", "))
-            .send()
-            .await
-            .map_err(|e| RauhaError::ImagePullError {
-                reference: url.to_string(),
-                message: format!("request failed: {e}"),
-            })?;
+            .send_with_rate_limit(self.http.get(url).header("Accept", accept.join(", ")), url)
+            .await?;
 
         if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
             let www_auth = resp
@@ -310,16 +304,14 @@ impl DistributionClient {
 
             // Retry with token.
             let resp = self
-                .http
-                .get(url)
-                .header("Accept", accept.join(", "))
-                .bearer_auth(&token)
-                .send()
-                .await
-                .map_err(|e| RauhaError::ImagePullError {
-                    reference: url.to_string(),
-                    message: format!("retry request failed: {e}"),
-                })?;
+                .send_with_rate_limit(
+                    self.http
+                        .get(url)
+                        .header("Accept", accept.join(", "))
+                        .bearer_auth(&token),
+                    url,
+                )
+                .await?;
 
             if !resp.status().is_success() {
                 return Err(RauhaError::ImagePullError {
@@ -363,15 +355,8 @@ impl DistributionClient {
         // Try with cached token.
         if let Some(token) = self.get_cached_token(registry, &scope).await {
             let resp = self
-                .http
-                .get(url)
-                .bearer_auth(&token)
-                .send()
-                .await
-                .map_err(|e| RauhaError::ImagePullError {
-                    reference: url.to_string(),
-                    message: format!("request failed: {e}"),
-                })?;
+                .send_with_rate_limit(self.http.get(url).bearer_auth(&token), url)
+                .await?;
 
             if resp.status().is_success() {
                 return Ok(resp);
@@ -379,15 +364,7 @@ impl DistributionClient {
         }
 
         // Initial request.
-        let resp = self
-            .http
-            .get(url)
-            .send()
-            .await
-            .map_err(|e| RauhaError::ImagePullError {
-                reference: url.to_string(),
-                message: format!("request failed: {e}"),
-            })?;
+        let resp = self.send_with_rate_limit(self.http.get(url), url).await?;
 
         if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
             let www_auth = resp
@@ -401,15 +378,8 @@ impl DistributionClient {
             self.cache_token(registry, &scope, &token).await;
 
             let resp = self
-                .http
-                .get(url)
-                .bearer_auth(&token)
-                .send()
-                .await
-                .map_err(|e| RauhaError::ImagePullError {
-                    reference: url.to_string(),
-                    message: format!("retry failed: {e}"),
-                })?;
+                .send_with_rate_limit(self.http.get(url).bearer_auth(&token), url)
+                .await?;
 
             if !resp.status().is_success() {
                 return Err(RauhaError::ImagePullError {
@@ -444,14 +414,8 @@ impl DistributionClient {
         let url = format!("{realm}?service={service}&scope={scope}");
 
         let resp: serde_json::Value = self
-            .http
-            .get(&url)
-            .send()
-            .await
-            .map_err(|e| RauhaError::ImagePullError {
-                reference: url.clone(),
-                message: format!("token request failed: {e}"),
-            })?
+            .send_with_rate_limit(self.http.get(&url), &url)
+            .await?
             .json()
             .await
             .map_err(|e| RauhaError::ImagePullError {
@@ -483,6 +447,51 @@ impl DistributionClient {
             .lock()
             .await
             .insert((registry.to_string(), scope.to_string()), token.to_string());
+    }
+
+    async fn send_with_rate_limit(
+        &self,
+        request: reqwest::RequestBuilder,
+        reference: &str,
+    ) -> Result<reqwest::Response, RauhaError> {
+        for attempt in 0..4 {
+            let response = request
+                .try_clone()
+                .expect("OCI GET requests are cloneable")
+                .send()
+                .await
+                .map_err(|error| RauhaError::ImagePullError {
+                    reference: reference.into(),
+                    message: format!("request failed: {error}"),
+                })?;
+            if response.status() != reqwest::StatusCode::TOO_MANY_REQUESTS || attempt == 3 {
+                return Ok(response);
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(1 << attempt)).await;
+        }
+        unreachable!()
+    }
+}
+
+fn verify_manifest_digest(
+    expected: Option<&str>,
+    body: &[u8],
+    reference: &str,
+) -> Result<(), RauhaError> {
+    let Some(expected) = expected else {
+        return Ok(());
+    };
+    let digest = Digest::parse(expected).ok_or_else(|| RauhaError::ImagePullError {
+        reference: reference.into(),
+        message: format!("invalid manifest digest: {expected}"),
+    })?;
+    if digest.validate(body) {
+        Ok(())
+    } else {
+        Err(RauhaError::ImagePullError {
+            reference: reference.into(),
+            message: format!("manifest digest mismatch for {digest}"),
+        })
     }
 }
 
@@ -561,6 +570,19 @@ mod tests {
             Some("https://ghcr.io/token")
         );
         assert_eq!(extract_param(header, "service"), Some("ghcr.io"));
+    }
+
+    #[test]
+    fn manifest_digest_mismatch_is_rejected() {
+        let body = b"manifest";
+        let digest = Digest::from_data(body);
+        verify_manifest_digest(Some(digest.as_str()), body, "image").unwrap();
+        assert!(verify_manifest_digest(
+            Some("sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            body,
+            "image",
+        )
+        .is_err());
     }
 
     #[test]

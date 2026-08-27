@@ -80,35 +80,31 @@ Sources: [gVisor perf](https://gvisor.dev/docs/architecture_guide/performance/),
 
 Verified against crun `src/libcrun/container.c` (main, 2026-08-27):
 `startContainer` hooks are forked by init **after** `pivot_root`, `setresuid`,
-capability drop, and seccomp, and `path` resolves in the image rootfs. So the
-hook on the in-flight crun executor branch (`sh -c "printf 1 >
-/run/rauha-zone.procs"`) runs the image's
-`/bin/sh` with workload privileges, and a hostile image can skip enrollment
-entirely. No trusted binary can be placed there either — the hook has no
-`CAP_SYS_ADMIN` and may be seccomp-blocked. `startContainer` is a dead end for
-enrollment in any runtime (runc sequences it the same way).
+capability drop, and seccomp, and `path` resolves in the image rootfs. A hook
+there runs the image's `/bin/sh` with workload privileges, so a hostile image
+can skip enrollment entirely, and no trusted binary can be placed there either —
+the hook has no `CAP_SYS_ADMIN` and may be seccomp-blocked. `startContainer` is
+a dead end for enrollment in any runtime (runc sequences it the same way).
+
+What the shim does (`rauha-shim/src/container.rs`): `crun create --pid-file`
+(all privileged setup, init parked on `exec.fifo`, outside the zone cgroup) →
+`pidfd_open` → write `cgroup.procs`, fail closed on error → `crun start`. No
+image code runs before enrollment; the pidfd makes signal/wait immune to PID
+reuse.
 
 | Option | Verdict |
 |---|---|
-| `startContainer` hook (in-flight branch) | fail-open; untrusted code before enrollment |
+| `startContainer` hook | fail-open; untrusted code before enrollment — never |
 | Trusted static helper in `startContainer` | cannot work: runs after privilege drop |
-| `createRuntime` hook, host binary, reads state JSON `pid` | spec-blessed (nvidia pattern); works with `crun create`+`start` because init is parked on `exec.fifo`; fallback only |
-| **`--cgroup-manager=cgroupfs` + `"cgroupsPath": "/rauha.slice/zone-X"`** | crun passes the zone cgroup dirfd to `clone3(CLONE_INTO_CGROUP)`: init is *born* enrolled, `crun exec` enrolls too, no hook at all |
+| **`crun create` → pidfd → `cgroup.procs` → `crun start`** (current) | enrollment while init is parked; crun setup judged outside the zone; one `cgroup.procs` write, fail closed |
+| `createRuntime` hook, host binary, reads state JSON `pid` | spec-blessed (nvidia pattern); equivalent to the current flow if a hook is ever required |
+| `--cgroup-manager=cgroupfs` + `"cgroupsPath": "/rauha.slice/zone-X"` | crun passes the zone cgroup dirfd to `clone3(CLONE_INTO_CGROUP)`: zero window and `crun exec` enrolls too — but crun's privileged setup then runs *inside* the zone cgroup, so Syva would need a `bprm_check_security`-keyed phase gate (audit before the workload's first exec, deny after) in `capable`/`file_open` |
 | Post-hoc `/proc/pid/cgroup` (or `PIDFD_GET_INFO` cgroupid, 6.13+) | not enforcement; keep as the invariant check |
 
-**Recommendation:** `cgroupsPath` + `CLONE_INTO_CGROUP` for enrollment,
-`crun create` + `crun start` instead of `run` so the shim can `pidfd_open` and
-verify the cgroup while init is still parked on `exec.fifo`, post-hoc check as
-the invariant, `createRuntime` host-hook as the pre-5.7 fallback.
-
-The consequence for Syva: crun's privileged setup (mounts, pivot, setuid, cap
-drop, seccomp) now runs *inside* the zone cgroup. A cgroup-keyed deny-by-default
-`capable` hook would break container creation. The LSM needs a phase gate: on
-the first successful `bprm_check_security` for a task in a zone cgroup, mark the
-task (task-local storage) as "workload"; `capable`/`file_open` deny only for
-workload-phase tasks and audit (not deny) before that. This preserves the old
-shim's invariant — trusted setup outside the policy, untrusted code inside — with
-zero enrollment window and no sync pipe.
+The `cgroupsPath` variant is the upgrade if exec-path enrollment or a zero-write
+sequence is ever needed; it is not required while the create/enroll/start
+sequence holds. Any change to the start path must keep enrollment strictly
+between `create` and `start`, and a hostile-image probe is the right test.
 
 Crun details to handle: omit `linux.resources` from the spec (Rauha owns limits);
 `crun delete` will try to `rmdir` the zone cgroup and get `EBUSY` — verify it is
@@ -170,9 +166,9 @@ user-namespace, Landlock, or pidfd code. These close those gaps, cheapest first.
 
 ## Suggested sequencing
 
-1. Enrollment fix (`cgroupsPath`/`CLONE_INTO_CGROUP` + create/start + pidfd +
-   Syva phase gate) with a hostile-image probe — this unblocks `obl_executor`
-   and `obl_hardening` honestly.
+1. Land the crun executor (create → pidfd → enroll → start) on `main` with a
+   hostile-image probe that proves nothing runs before enrollment — this closes
+   `obl_executor` honestly and is the precondition for `obl_hardening`.
 2. Items 1–4 above (cgroup basics, safe rootfs, pidfd, seccomp): closes
    `syscalls.deny`; all ≤5.14 so no baseline change.
 3. Landlock + userns + cgroup device BPF: closes `writable_paths` and

@@ -9,7 +9,10 @@ NAME="boundary-$$"
 IMAGE=${TEST_IMAGE:-alpine:latest}
 HOSTNAME_BEFORE=$(hostname)
 POLICY_FILE=$(mktemp /tmp/rauha-host-boundaries-XXXXXX.toml)
+HARDENED_POLICY_FILE=$(mktemp /tmp/rauha-hardening-XXXXXX.toml)
+HARDENED_ZONE="$ZONE-policy"
 CONTAINER_ID=""
+HARDENED_CONTAINER_ID=""
 SENTINEL_PID=""
 FAILURES=0
 
@@ -27,8 +30,13 @@ cleanup() {
         $RAUHA stop "$CONTAINER_ID" 2>/dev/null || true
         $RAUHA delete "$CONTAINER_ID" --force 2>/dev/null || true
     fi
+    if [ -n "$HARDENED_CONTAINER_ID" ]; then
+        $RAUHA stop "$HARDENED_CONTAINER_ID" 2>/dev/null || true
+        $RAUHA delete "$HARDENED_CONTAINER_ID" --force 2>/dev/null || true
+    fi
     $RAUHA zone delete "$ZONE" --force 2>/dev/null || true
-    rm -f "$POLICY_FILE"
+    $RAUHA zone delete "$HARDENED_ZONE" --force 2>/dev/null || true
+    rm -f "$POLICY_FILE" "$HARDENED_POLICY_FILE"
     if [ "$(hostname)" != "$HOSTNAME_BEFORE" ]; then
         hostname "$HOSTNAME_BEFORE"
     fi
@@ -126,7 +134,42 @@ else
     echo "PASS: empty writable_paths makes the rootfs read-only"
 fi
 
-if $RAUHA sandbox --name "$ZONE" --image "$IMAGE" -- /bin/sh -c 'test -r /proc/1/status && test "$(cat /proc/1/comm)" = rauha-shim' >/dev/null 2>&1; then
+if $RAUHA sandbox --name "$ZONE" --image "$IMAGE" -- /bin/sh -c 'test ! -e /run/rauha-zone.procs' >/dev/null 2>&1; then
+    echo "PASS: workload has no writable cgroup enrollment handle"
+else
+    fail "workload can access the zone cgroup enrollment handle"
+fi
+
+if $RAUHA sandbox --name "$ZONE" --image "$IMAGE" -- /bin/sh -c 'test ! -e /sys/fs/cgroup/rauha.slice && ! grep -q " cgroup2 " /proc/self/mounts' >/dev/null 2>&1; then
+    echo "PASS: host cgroup hierarchy is not visible to the workload"
+else
+    fail "workload can enumerate the host cgroup hierarchy"
+fi
+
+sed 's/mode = "strict"/mode = "audit"/' "$ROOT/policies/strict.toml" >"$HARDENED_POLICY_FILE"
+$RAUHA zone create --name "$HARDENED_ZONE" --policy "$HARDENED_POLICY_FILE" >/dev/null
+if $RAUHA sandbox --name "$HARDENED_ZONE" --image "$IMAGE" -- /bin/sh -c '
+    touch /tmp/allowed &&
+    ! touch /etc/denied &&
+    test -c /dev/null && test -c /dev/zero && test -c /dev/urandom &&
+    test ! -e /dev/kmsg &&
+    grep -Eq "^Seccomp:[[:space:]]+2$" /proc/self/status
+' >/dev/null 2>&1; then
+    echo "PASS: declared writable path, device allow-list, and seccomp deny profile applied"
+else
+    fail "OCI mount, device, or seccomp controls were not applied"
+fi
+HARDENED_CONTAINER_ID=$($RAUHA run --zone "$HARDENED_ZONE" "$IMAGE" /bin/sleep 30)
+if echo "" | $RAUHA exec -it "$HARDENED_CONTAINER_ID" /bin/true >/dev/null 2>&1; then
+    fail "interactive exec bypassed the container seccomp profile"
+else
+    echo "PASS: interactive exec fails closed for seccomp-filtered containers"
+fi
+$RAUHA stop "$HARDENED_CONTAINER_ID" >/dev/null
+$RAUHA delete "$HARDENED_CONTAINER_ID" --force >/dev/null
+HARDENED_CONTAINER_ID=""
+
+if $RAUHA sandbox --name "$ZONE" --image "$IMAGE" -- /bin/sh -c 'test "$$" -eq 1 && test "$(cat /proc/1/comm)" = sh' >/dev/null 2>&1; then
     echo "PASS: procfs exposes the container PID namespace"
 else
     fail "container procfs does not expose its PID 1"

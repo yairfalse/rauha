@@ -12,10 +12,12 @@ ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 AUDIT_POLICY=${RAUHA_TEST_AUDIT_POLICY:-$ROOT/policies/audit.toml}
 IMAGE="${TEST_IMAGE:-alpine:latest}"
 NAMED_ZONE="test-sandbox-$$"
+RECEIPT_FILE=$(mktemp /tmp/rauha-receipt-XXXXXX.json)
 
 cleanup() {
     echo "Cleaning up..."
     $RAUHA zone delete "$NAMED_ZONE" --force 2>/dev/null || true
+    rm -f "$RECEIPT_FILE"
 }
 trap cleanup EXIT
 
@@ -57,14 +59,21 @@ echo "5. JSON output reports a succeeded status..."
 JSON=$($RAUHA --json sandbox --audit --image "$IMAGE" -- /bin/echo hi)
 if echo "$JSON" | grep -q '"status":"succeeded"' \
     && echo "$JSON" | grep -q '"exit_code":0' \
-    && echo "$JSON" | grep -q '"admission":"audit"'; then
+    && echo "$JSON" | grep -q '"admission":"audit"' \
+    && echo "$JSON" | grep -q '"schema":"rauha.execution-receipt.v1"' \
+    && echo "$JSON" | grep -q '"digest_verified":true'; then
     echo "   JSON contract intact (OK)"
 else
     echo "   FAIL: unexpected JSON result: $JSON"
     exit 1
 fi
 
-echo "6. A named, pre-existing zone is reused and left intact..."
+echo "6. The execution receipt verifies independently..."
+printf '%s\n' "$JSON" >"$RECEIPT_FILE"
+$RAUHA receipt "$RECEIPT_FILE" --public-key "${RAUHA_ROOT:?}/metadata/receipt.ed25519.pub" >/dev/null
+echo "   signed receipt verified (OK)"
+
+echo "7. A named, pre-existing zone is reused and left intact..."
 $RAUHA zone create --name "$NAMED_ZONE" --policy "$AUDIT_POLICY"
 $RAUHA sandbox --image "$IMAGE" --name "$NAMED_ZONE" -- /bin/echo in-named-zone >/dev/null
 if $RAUHA zone list 2>/dev/null | grep -q "$NAMED_ZONE"; then

@@ -13,14 +13,16 @@ pub struct ShimState {
 
 /// A container process tracked by the shim.
 struct ContainerProcess {
-    /// PID after fork (0 if only created, not started).
+    /// OCI init PID (0 if only created, not started).
     pid: u32,
     /// Current status.
     status: ContainerStatus,
-    /// Exit code (set after waitpid).
+    /// Exit code reported by the foreground OCI runtime.
     exit_code: Option<i32>,
     /// OCI runtime spec JSON (saved at create time, used at start time).
     spec_json: String,
+    /// OCI init process supervised by this shim.
+    runtime: Option<container::RuntimeProcess>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -63,13 +65,14 @@ impl ShimState {
                 status: ContainerStatus::Created,
                 exit_code: None,
                 spec_json: spec_json.to_string(),
+                runtime: None,
             },
         );
 
         Ok(0) // No PID yet — will be assigned on start.
     }
 
-    /// Start a previously created container by forking and running the workload.
+    /// Start a previously created container through crun.
     pub fn start_container(&mut self, id: &str) -> anyhow::Result<u32> {
         let proc = self
             .containers
@@ -82,22 +85,45 @@ impl ShimState {
 
         let spec_json = proc.spec_json.clone();
 
-        let pid = container::fork_and_exec(&self.zone_name, id, &spec_json, &self.rootfs_root)?;
+        let (runtime, pid) =
+            container::start_with_crun(&self.zone_name, id, &spec_json, &self.rootfs_root)?;
 
         let proc = self
             .containers
             .get_mut(id)
-            .ok_or_else(|| anyhow::anyhow!("container {id} not found after fork"))?;
+            .ok_or_else(|| anyhow::anyhow!("container {id} not found after OCI start"))?;
         proc.pid = pid;
         proc.status = ContainerStatus::Running;
+        proc.runtime = Some(runtime);
 
         tracing::info!(container = id, pid, "container started");
         Ok(pid)
     }
 
-    /// Stop a container by sending a signal.
+    /// Stop a container: deliver `signal`, then escalate to SIGKILL if init
+    /// has not exited within the grace period. Returns only once init is gone.
     pub fn stop_container(&mut self, id: &str, signal: i32) -> anyhow::Result<()> {
-        self.signal_container(id, signal)
+        const GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
+        self.signal_container(id, signal)?;
+        let proc = self
+            .containers
+            .get_mut(id)
+            .ok_or_else(|| anyhow::anyhow!("container {id} not found"))?;
+        let runtime = proc
+            .runtime
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("container {id} has no OCI runtime"))?;
+        let exit_code = runtime.wait_or_kill(GRACE);
+        tracing::info!(
+            container = id,
+            pid = proc.pid,
+            exit_code,
+            "container stopped"
+        );
+        proc.status = ContainerStatus::Stopped;
+        proc.exit_code = Some(exit_code);
+        Ok(())
     }
 
     /// Send a signal to a container's process.
@@ -111,7 +137,10 @@ impl ShimState {
             anyhow::bail!("container {id} is not running");
         }
 
-        container::send_signal(proc.pid, signal)?;
+        proc.runtime
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("container {id} has no OCI runtime"))?
+            .signal(signal)?;
         Ok(())
     }
 
@@ -134,7 +163,7 @@ impl ShimState {
             if proc.status != ContainerStatus::Running || proc.pid == 0 {
                 continue;
             }
-            if let Some(exit_code) = container::try_wait(proc.pid) {
+            if let Some(exit_code) = proc.runtime.as_mut().and_then(|runtime| runtime.try_wait()) {
                 tracing::info!(pid = proc.pid, exit_code, "container exited");
                 proc.status = ContainerStatus::Stopped;
                 proc.exit_code = Some(exit_code);
@@ -153,6 +182,11 @@ impl ShimState {
     }
 
     pub fn request_shutdown(&mut self) {
+        for process in self.containers.values_mut() {
+            if let Some(runtime) = process.runtime.as_mut() {
+                runtime.stop_and_delete();
+            }
+        }
         self.shutdown = true;
     }
 

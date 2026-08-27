@@ -61,6 +61,14 @@ mod helpers {
             .unwrap_or_else(|_| "http://[::1]:9876".into())
     }
 
+    pub fn test_image() -> String {
+        std::env::var("TEST_IMAGE").unwrap_or_else(|_| "alpine:latest".into())
+    }
+
+    pub fn test_secondary_image() -> String {
+        std::env::var("TEST_SECONDARY_IMAGE").unwrap_or_else(|_| "busybox:latest".into())
+    }
+
     // --- Settlement constants ---
 
     /// Zone creation: cgroup + netns + veth + BPF map + IP assignment.
@@ -240,7 +248,7 @@ memory_limit = "{mem}"
     pub async fn ensure_alpine(client: &mut pb::image::image_service_client::ImageServiceClient<Channel>) {
         let mut stream = client
             .pull(pb::image::PullRequest {
-                reference: "alpine:latest".into(),
+                reference: test_image(),
             })
             .await
             .expect("Pull must succeed")
@@ -261,7 +269,7 @@ memory_limit = "{mem}"
             .create_container(pb::container::CreateContainerRequest {
                 zone_name: zone_name.into(),
                 name: name.into(),
-                image: "alpine:latest".into(),
+                image: test_image(),
                 command,
                 env: Default::default(),
                 working_dir: String::new(),
@@ -459,7 +467,7 @@ mod container_lifecycle {
             .create_container(pb::container::CreateContainerRequest {
                 zone_name: "oracle-005-nonexistent".into(),
                 name: "orphan".into(),
-                image: "alpine:latest".into(),
+                image: test_image(),
                 command: vec!["/bin/true".into()],
                 env: Default::default(),
                 working_dir: String::new(),
@@ -485,7 +493,7 @@ mod container_lifecycle {
             .create_container(pb::container::CreateContainerRequest {
                 zone_name: zone_name.clone(),
                 name: "echo-test".into(),
-                image: "alpine:latest".into(),
+                image: test_image(),
                 command: vec!["/bin/echo".into(), "hello-oracle".into()],
                 env: Default::default(),
                 working_dir: String::new(),
@@ -557,7 +565,7 @@ mod image_management {
 
         let inspect = client
             .inspect(pb::image::InspectImageRequest {
-                reference: "alpine:latest".into(),
+                reference: test_image(),
             })
             .await
             .expect("Inspect must succeed")
@@ -588,12 +596,12 @@ mod image_management {
     #[tokio::test]
     async fn case_009_remove_image() {
         let mut client = image_client().await;
-        let image_ref = "busybox:latest";
+        let image_ref = test_secondary_image();
 
         // Pull busybox for this test.
         let mut stream = client
             .pull(pb::image::PullRequest {
-                reference: image_ref.into(),
+                reference: image_ref.clone(),
             })
             .await
             .expect("Pull must succeed")
@@ -606,7 +614,7 @@ mod image_management {
         // Verify it's there before removing.
         client
             .inspect(pb::image::InspectImageRequest {
-                reference: image_ref.into(),
+                reference: image_ref.clone(),
             })
             .await
             .expect("busybox must be inspectable before remove");
@@ -614,7 +622,7 @@ mod image_management {
         // Remove.
         client
             .remove(pb::image::RemoveImageRequest {
-                reference: image_ref.into(),
+                reference: image_ref.clone(),
             })
             .await
             .expect("Remove must succeed");
@@ -624,7 +632,7 @@ mod image_management {
         // Inspect must now fail.
         let result = client
             .inspect(pb::image::InspectImageRequest {
-                reference: image_ref.into(),
+                reference: image_ref,
             })
             .await;
 
@@ -1549,11 +1557,11 @@ mod invariants {
         ensure_alpine(&mut client).await;
 
         let inspect1 = client
-            .inspect(pb::image::InspectImageRequest { reference: "alpine:latest".into() })
+            .inspect(pb::image::InspectImageRequest { reference: test_image() })
             .await.expect("Inspect 1 must succeed").into_inner();
 
         let inspect2 = client
-            .inspect(pb::image::InspectImageRequest { reference: "alpine:latest".into() })
+            .inspect(pb::image::InspectImageRequest { reference: test_image() })
             .await.expect("Inspect 2 must succeed").into_inner();
 
         assert_eq!(inspect1.digest, inspect2.digest, "digest must be stable across inspects");
@@ -1780,7 +1788,7 @@ mod stress {
 
         let mut stream = client
             .pull(pb::image::PullRequest {
-                reference: "alpine:latest".into(),
+                reference: test_image(),
             })
             .await
             .expect("Pull must succeed")

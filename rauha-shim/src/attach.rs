@@ -361,6 +361,13 @@ pub fn fork_and_exec_pty(
     let c_env = cstring_vec(env, "exec.env")?;
     let term = CString::new("TERM=xterm-256color")?;
     let spec: oci_spec::runtime::Spec = serde_json::from_str(spec_json)?;
+    if spec
+        .linux()
+        .as_ref()
+        .is_some_and(|linux| linux.seccomp().is_some())
+    {
+        anyhow::bail!("interactive exec is disabled for seccomp-filtered containers");
+    }
     let process = spec
         .process()
         .as_ref()

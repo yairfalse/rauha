@@ -30,8 +30,8 @@ pids_max = 4096
 [network]
 mode = "host"
 allowed_zones = []
-allowed_egress = ["0.0.0.0/0:0"]
-allowed_ingress = ["0.0.0.0/0:0"]
+allowed_egress = []
+allowed_ingress = []
 
 [filesystem]
 shared_layers = true

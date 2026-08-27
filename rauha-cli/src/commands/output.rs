@@ -208,6 +208,15 @@ pub struct SandboxRun {
     pub unavailable_controls: Vec<String>,
     pub events: Vec<SandboxEvent>,
     pub enforcement_events: Vec<SandboxEnforcementEvent>,
+    pub receipt: rauha_evidence::receipt::SignedExecutionReceipt,
+}
+
+#[derive(Serialize)]
+pub struct ReceiptVerification {
+    pub ok: bool,
+    pub schema: String,
+    pub task_id: String,
+    pub digest: String,
 }
 
 #[derive(Serialize)]

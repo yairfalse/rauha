@@ -2,7 +2,8 @@
 //!
 //! Handles two concerns:
 //! 1. NAT masquerade — zones can reach the internet via the host
-//! 2. Forward chain filtering — controls cross-zone and egress traffic
+//! 2. Inet filtering — controls routed egress and blocks zone-to-host traffic
+//! 3. Bridge filtering — controls same-subnet cross-zone traffic at layer 2
 //!
 //! nftables is the primary network enforcement layer. eBPF stays focused on
 //! syscall policy (file_open, ptrace, etc). This separation keeps each
@@ -12,17 +13,22 @@ use std::io::Write;
 use std::process::{Command, Stdio};
 
 use rauha_common::error::{RauhaError, Result};
-use rauha_common::zone::{NetworkMode, NetworkPolicy};
+use rauha_common::zone::{NetworkEndpoint, NetworkMode, NetworkPolicy};
 
 const TABLE_NAME: &str = "rauha";
 const TABLE_FAMILY: &str = "inet";
+const BRIDGE_FAMILY: &str = "bridge";
 
 /// Ensure the rauha nftables table and NAT masquerade chain exist.
 /// Called once during LinuxBackend::new().
 pub fn ensure_nat(subnet_cidr: &str) -> Result<()> {
     // nft -f applies the complete batch as one kernel transaction. A syntax or
     // runtime failure therefore leaves the previous enforcement table intact.
-    run_nft_script(&base_ruleset(subnet_cidr, table_exists()?))?;
+    run_nft_script(&base_ruleset(
+        subnet_cidr,
+        table_exists(TABLE_FAMILY)?,
+        table_exists(BRIDGE_FAMILY)?,
+    ))?;
 
     tracing::info!(
         subnet = subnet_cidr,
@@ -31,30 +37,50 @@ pub fn ensure_nat(subnet_cidr: &str) -> Result<()> {
     Ok(())
 }
 
-fn base_ruleset(subnet_cidr: &str, replace: bool) -> String {
+/// Every bridge base chain is `policy drop`: a zone only has connectivity
+/// through the per-zone jump rules installed by `apply_zone_rules`, so a zone
+/// whose rules failed to apply, or whose rules are mid-replacement, is cut off
+/// rather than left open. The inet forward `iifname "rauha0"` accept is only
+/// reachable for frames that already passed a bridge input chain.
+fn base_ruleset(subnet_cidr: &str, replace_inet: bool, replace_bridge: bool) -> String {
     format!(
-        "{delete}add table inet rauha\n\
+        "{delete_inet}{delete_bridge}add table inet rauha\n\
          add chain inet rauha postrouting {{ type nat hook postrouting priority srcnat; }}\n\
          add rule inet rauha postrouting ip saddr {subnet_cidr} oifname != \"rauha0\" masquerade\n\
          add chain inet rauha forward {{ type filter hook forward priority filter; policy drop; }}\n\
-         add rule inet rauha forward ct state established,related accept\n",
-        delete = if replace {
+         add rule inet rauha forward ct state established,related accept\n\
+         add rule inet rauha forward iifname \"rauha0\" accept\n\
+         add rule inet rauha forward oifname \"rauha0\" accept\n\
+         add chain inet rauha input {{ type filter hook input priority filter; policy accept; }}\n\
+         add rule inet rauha input ct state established,related accept\n\
+         add rule inet rauha input iifname \"rauha0\" drop\n\
+         add table bridge rauha\n\
+         add chain bridge rauha forward {{ type filter hook forward priority filter; policy drop; }}\n\
+         add chain bridge rauha input {{ type filter hook input priority filter; policy drop; }}\n\
+         add chain bridge rauha output {{ type filter hook output priority filter; policy drop; }}\n",
+        delete_inet = if replace_inet {
             "delete table inet rauha\n"
         } else {
             ""
-        }
+        },
+        delete_bridge = if replace_bridge {
+            "delete table bridge rauha\n"
+        } else {
+            ""
+        },
     )
 }
 
 /// Remove the entire rauha nftables table.
 /// Called during daemon shutdown.
 pub fn cleanup_nat() -> Result<()> {
-    if !table_exists()? {
-        return Ok(());
+    if table_exists(TABLE_FAMILY)? {
+        run_nft(&["delete", "table", TABLE_FAMILY, TABLE_NAME])?;
     }
-
-    run_nft(&["delete", "table", TABLE_FAMILY, TABLE_NAME])?;
-    tracing::info!("nftables table removed");
+    if table_exists(BRIDGE_FAMILY)? {
+        run_nft(&["delete", "table", BRIDGE_FAMILY, TABLE_NAME])?;
+    }
+    tracing::info!("nftables tables removed");
     Ok(())
 }
 
@@ -63,35 +89,43 @@ pub fn cleanup_nat() -> Result<()> {
 /// Zone names are validated by `validate_zone_name` (alphanumeric + hyphen,
 /// max 128 chars) which produces safe nftables chain identifiers.
 pub fn apply_zone_rules(zone_name: &str, veth_name: &str, policy: &NetworkPolicy) -> Result<()> {
-    // First remove any existing rules for this zone.
+    let bridge_rules = bridge_zone_chain_rules(veth_name, policy);
+    let bridge_input_rules = bridge_input_chain_rules(policy)?;
+    let bridge_output_rules = bridge_output_chain_rules(policy)?;
+
+    // Removal is fail-closed: the base chains deny traffic until the complete
+    // replacement is accepted as one nft transaction.
     let _ = remove_zone_rules(zone_name);
 
-    let chain_name = zone_chain_name(zone_name);
-
     if policy.mode != NetworkMode::Host {
-        run_nft(&["add", "chain", TABLE_FAMILY, TABLE_NAME, &chain_name])?;
-        for rule in zone_chain_rules(veth_name, policy) {
-            run_nft(&["add", "rule", TABLE_FAMILY, TABLE_NAME, &chain_name, &rule])?;
+        let chain_name = zone_chain_name(zone_name);
+        let input_chain_name = zone_input_chain_name(zone_name);
+        let output_chain_name = zone_output_chain_name(zone_name);
+        let mut script = format!(
+            "add chain bridge rauha {chain_name}\n\
+             add chain bridge rauha {input_chain_name}\n\
+             add chain bridge rauha {output_chain_name}\n"
+        );
+        for rule in bridge_rules {
+            script.push_str(&format!("add rule bridge rauha {chain_name} {rule}\n"));
         }
-        // Check both endpoints. Zone chains return instead of dropping, so an
-        // allow declared by either endpoint wins regardless of creation order;
-        // the base chain remains the final default deny.
-        run_nft(&[
-            "add",
-            "rule",
-            TABLE_FAMILY,
-            TABLE_NAME,
-            "forward",
-            &format!("iifname \"{veth_name}\" jump {chain_name}"),
-        ])?;
-        run_nft(&[
-            "add",
-            "rule",
-            TABLE_FAMILY,
-            TABLE_NAME,
-            "forward",
-            &format!("oifname \"{veth_name}\" jump {chain_name}"),
-        ])?;
+        for rule in bridge_input_rules {
+            script.push_str(&format!(
+                "add rule bridge rauha {input_chain_name} {rule}\n"
+            ));
+        }
+        for rule in bridge_output_rules {
+            script.push_str(&format!(
+                "add rule bridge rauha {output_chain_name} {rule}\n"
+            ));
+        }
+        script.push_str(&format!(
+            "add rule bridge rauha forward iifname \"{veth_name}\" jump {chain_name}\n\
+             add rule bridge rauha forward oifname \"{veth_name}\" jump {chain_name}\n\
+             add rule bridge rauha input iifname \"{veth_name}\" jump {input_chain_name}\n\
+             add rule bridge rauha output oifname \"{veth_name}\" jump {output_chain_name}\n"
+        ));
+        run_nft_script(&script)?;
     }
 
     tracing::info!(zone = zone_name, mode = ?policy.mode, "nftables rules applied");
@@ -101,13 +135,20 @@ pub fn apply_zone_rules(zone_name: &str, veth_name: &str, policy: &NetworkPolicy
 /// Remove all nftables rules for a zone.
 pub fn remove_zone_rules(zone_name: &str) -> Result<()> {
     let chain_name = zone_chain_name(zone_name);
+    let input_chain_name = zone_input_chain_name(zone_name);
+    let output_chain_name = zone_output_chain_name(zone_name);
 
-    // First, remove jump rules in the forward chain that reference this zone chain.
-    let _ = remove_forward_chain_jumps(&chain_name);
-
-    // Flush and delete the zone chain. Ignore errors — chain may not exist.
-    let _ = run_nft(&["flush", "chain", TABLE_FAMILY, TABLE_NAME, &chain_name]);
-    let _ = run_nft(&["delete", "chain", TABLE_FAMILY, TABLE_NAME, &chain_name]);
+    let _ = remove_chain_jumps(BRIDGE_FAMILY, "forward", &chain_name);
+    let _ = remove_chain_jumps(BRIDGE_FAMILY, "input", &input_chain_name);
+    let _ = remove_chain_jumps(BRIDGE_FAMILY, "output", &output_chain_name);
+    for (family, chain) in [
+        (BRIDGE_FAMILY, chain_name.as_str()),
+        (BRIDGE_FAMILY, input_chain_name.as_str()),
+        (BRIDGE_FAMILY, output_chain_name.as_str()),
+    ] {
+        let _ = run_nft(&["flush", "chain", family, TABLE_NAME, chain]);
+        let _ = run_nft(&["delete", "chain", family, TABLE_NAME, chain]);
+    }
 
     Ok(())
 }
@@ -117,34 +158,114 @@ pub fn zone_rules_exist(zone_name: &str, veth_name: &str, policy: &NetworkPolicy
         return true;
     }
     let chain_name = zone_chain_name(zone_name);
-    let chain = Command::new("nft")
-        .args(["list", "chain", TABLE_FAMILY, TABLE_NAME, &chain_name])
+    let input_chain_name = zone_input_chain_name(zone_name);
+    let output_chain_name = zone_output_chain_name(zone_name);
+    let bridge_chain = Command::new("nft")
+        .args(["list", "chain", BRIDGE_FAMILY, TABLE_NAME, &chain_name])
         .output();
-    let forward = Command::new("nft")
-        .args(["list", "chain", TABLE_FAMILY, TABLE_NAME, "forward"])
+    let bridge_input_chain = Command::new("nft")
+        .args([
+            "list",
+            "chain",
+            BRIDGE_FAMILY,
+            TABLE_NAME,
+            &input_chain_name,
+        ])
         .output();
-    chain.is_ok_and(|output| {
+    let bridge_output_chain = Command::new("nft")
+        .args([
+            "list",
+            "chain",
+            BRIDGE_FAMILY,
+            TABLE_NAME,
+            &output_chain_name,
+        ])
+        .output();
+    let bridge_forward = Command::new("nft")
+        .args(["list", "chain", BRIDGE_FAMILY, TABLE_NAME, "forward"])
+        .output();
+    let bridge_input = Command::new("nft")
+        .args(["list", "chain", BRIDGE_FAMILY, TABLE_NAME, "input"])
+        .output();
+    let bridge_output = Command::new("nft")
+        .args(["list", "chain", BRIDGE_FAMILY, TABLE_NAME, "output"])
+        .output();
+    bridge_chain.is_ok_and(|output| {
         output.status.success()
-            && nft_chain_rules(&output.stdout, &chain_name) == zone_chain_rules(veth_name, policy)
-    }) && forward.is_ok_and(|output| {
-        if !output.status.success() {
-            return false;
-        }
-        let rules = String::from_utf8_lossy(&output.stdout);
-        rules.contains(&format!("iifname \"{veth_name}\" jump {chain_name}"))
-            && rules.contains(&format!("oifname \"{veth_name}\" jump {chain_name}"))
-    })
+            && nft_chain_rules(&output.stdout, &chain_name)
+                == bridge_zone_chain_rules(veth_name, policy)
+    }) && bridge_input_chain.is_ok_and(|output| {
+        output.status.success()
+            && bridge_input_chain_rules(policy)
+                .is_ok_and(|rules| nft_chain_rules(&output.stdout, &input_chain_name) == rules)
+    }) && bridge_output_chain.is_ok_and(|output| {
+        output.status.success()
+            && bridge_output_chain_rules(policy)
+                .is_ok_and(|rules| nft_chain_rules(&output.stdout, &output_chain_name) == rules)
+    }) && bridge_forward.is_ok_and(|output| forward_has_jumps(&output, veth_name, &chain_name))
+        && bridge_input
+            .is_ok_and(|output| chain_has_jump(&output, "iifname", veth_name, &input_chain_name))
+        && bridge_output
+            .is_ok_and(|output| chain_has_jump(&output, "oifname", veth_name, &output_chain_name))
 }
 
-fn zone_chain_rules(veth_name: &str, policy: &NetworkPolicy) -> Vec<String> {
-    if policy.mode == NetworkMode::Isolated {
-        return vec!["return".into()];
+fn forward_has_jumps(output: &std::process::Output, veth_name: &str, chain_name: &str) -> bool {
+    if !output.status.success() {
+        return false;
     }
-    if policy.mode == NetworkMode::Host {
-        return Vec::new();
+    let rules = String::from_utf8_lossy(&output.stdout);
+    rules.contains(&format!("iifname \"{veth_name}\" jump {chain_name}"))
+        && rules.contains(&format!("oifname \"{veth_name}\" jump {chain_name}"))
+}
+
+fn chain_has_jump(
+    output: &std::process::Output,
+    interface_match: &str,
+    veth_name: &str,
+    chain_name: &str,
+) -> bool {
+    output.status.success()
+        && String::from_utf8_lossy(&output.stdout).contains(&format!(
+            "{interface_match} \"{veth_name}\" jump {chain_name}"
+        ))
+}
+
+fn bridge_input_chain_rules(policy: &NetworkPolicy) -> Result<Vec<String>> {
+    if policy.mode != NetworkMode::Bridged {
+        return Ok(vec!["drop".into()]);
     }
 
-    let mut rules = vec!["ct state established,related accept".into()];
+    let mut rules = vec![
+        "ether type arp accept".into(),
+        "meta l4proto ipv6-icmp accept".into(),
+        "ct state established,related accept".into(),
+    ];
+    rules.extend(endpoint_rules("daddr", &policy.allowed_egress)?);
+    rules.push("drop".into());
+    Ok(rules)
+}
+
+fn bridge_output_chain_rules(policy: &NetworkPolicy) -> Result<Vec<String>> {
+    if policy.mode != NetworkMode::Bridged {
+        return Ok(vec!["drop".into()]);
+    }
+
+    let mut rules = vec![
+        "ether type arp accept".into(),
+        "meta l4proto ipv6-icmp accept".into(),
+        "ct state established,related accept".into(),
+    ];
+    rules.extend(endpoint_rules("saddr", &policy.allowed_ingress)?);
+    rules.push("drop".into());
+    Ok(rules)
+}
+
+fn bridge_zone_chain_rules(veth_name: &str, policy: &NetworkPolicy) -> Vec<String> {
+    if policy.mode != NetworkMode::Bridged {
+        return vec!["return".into()];
+    }
+
+    let mut rules = Vec::new();
     for zone in &policy.allowed_zones {
         let peer = super::network::veth_host_name_for(zone);
         rules.push(format!(
@@ -153,7 +274,6 @@ fn zone_chain_rules(veth_name: &str, policy: &NetworkPolicy) -> Vec<String> {
         ));
         rules.push(format!("iifname \"{peer}\" oifname \"{veth_name}\" accept"));
     }
-    rules.extend(egress_rules(veth_name, &policy.allowed_egress));
     rules.push("return".into());
     rules
 }
@@ -181,14 +301,14 @@ fn nft_chain_rules(output: &[u8], chain_name: &str) -> Vec<String> {
         .collect()
 }
 
-/// Remove rules in the forward chain that jump to the given zone chain.
-/// Uses nft handle-based deletion to avoid leaving stale rules.
-fn remove_forward_chain_jumps(chain_name: &str) -> Result<()> {
+/// Remove rules in a base chain that jump to the given zone chain.
+/// Uses nft handle-based deletion to avoid leaving stale references.
+fn remove_chain_jumps(family: &str, base_chain: &str, chain_name: &str) -> Result<()> {
     let output = Command::new("nft")
-        .args(["-a", "list", "chain", TABLE_FAMILY, TABLE_NAME, "forward"])
+        .args(["-a", "list", "chain", family, TABLE_NAME, base_chain])
         .output()
         .map_err(|e| RauhaError::NetworkError {
-            message: format!("failed to list nftables forward chain: {e}"),
+            message: format!("failed to list nftables {family} {base_chain} chain: {e}"),
             hint: "ensure nftables is installed (nft command)".into(),
         })?;
 
@@ -204,13 +324,7 @@ fn remove_forward_chain_jumps(chain_name: &str) -> Result<()> {
                 let handle = line[idx + "# handle ".len()..].trim();
                 if !handle.is_empty() {
                     let _ = run_nft(&[
-                        "delete",
-                        "rule",
-                        TABLE_FAMILY,
-                        TABLE_NAME,
-                        "forward",
-                        "handle",
-                        handle,
+                        "delete", "rule", family, TABLE_NAME, base_chain, "handle", handle,
                     ]);
                 }
             }
@@ -227,16 +341,47 @@ fn zone_chain_name(zone_name: &str) -> String {
     format!("zone-{zone_name}")
 }
 
-fn egress_rules(veth_name: &str, destinations: &[String]) -> Vec<String> {
-    destinations
+fn zone_input_chain_name(zone_name: &str) -> String {
+    format!("input-{zone_name}")
+}
+
+fn zone_output_chain_name(zone_name: &str) -> String {
+    format!("output-{zone_name}")
+}
+
+fn endpoint_rules(address_match: &str, targets: &[String]) -> Result<Vec<String>> {
+    targets
         .iter()
-        .map(|dest| format!("iifname \"{veth_name}\" ip daddr {dest} accept"))
+        .map(|target| {
+            // Zones persisted before ports became mandatory-nonzero used
+            // `addr:0` to mean "any port"; keep those zones loadable.
+            let target = match target.strip_suffix(":0") {
+                Some(network) if network.parse::<NetworkEndpoint>().is_ok() => {
+                    tracing::warn!(target, "legacy ':0' network target treated as any port");
+                    network
+                }
+                _ => target.as_str(),
+            };
+            let endpoint = target.parse::<NetworkEndpoint>().map_err(|error| {
+                RauhaError::InvalidPolicy(format!("invalid network target {target:?}: {error}"))
+            })?;
+            let mut rule = format!(
+                "{} {address_match} {}",
+                endpoint.nft_family(),
+                endpoint.network()
+            );
+            if let Some(port) = endpoint.port {
+                rule.push_str(&format!(" tcp dport {port}"));
+            }
+            rule.push_str(" accept");
+            Ok(rule)
+        })
         .collect()
 }
 
-fn table_exists() -> Result<bool> {
+fn table_exists(family: &str) -> Result<bool> {
     let output = Command::new("nft")
-        .args(["list", "table", TABLE_FAMILY, TABLE_NAME])
+        .args(["list", "table", family, TABLE_NAME])
         .output()
         .map_err(|e| RauhaError::NetworkError {
             message: format!("failed to check nftables table: {e}"),
@@ -316,30 +461,41 @@ mod tests {
     fn zone_chain_name_format() {
         assert_eq!(zone_chain_name("web"), "zone-web");
         assert_eq!(zone_chain_name("my-app"), "zone-my-app");
+        assert_eq!(zone_input_chain_name("web"), "input-web");
+        assert_eq!(zone_output_chain_name("web"), "output-web");
     }
 
     #[test]
     fn empty_egress_adds_no_implicit_dns_exception() {
-        assert!(egress_rules("veth-test", &[]).is_empty());
+        assert!(endpoint_rules("daddr", &[]).unwrap().is_empty());
     }
 
     #[test]
-    fn base_ruleset_replaces_atomically_with_default_drop() {
-        let rules = base_ruleset("10.89.0.0/16", true);
-        assert!(rules.starts_with("delete table inet rauha\nadd table inet rauha"));
-        assert!(rules.contains("policy drop"));
+    fn base_ruleset_replaces_both_tables_and_blocks_host_input() {
+        let rules = base_ruleset("10.89.0.0/16", true, true);
+        assert!(rules.starts_with(
+            "delete table inet rauha\ndelete table bridge rauha\nadd table inet rauha"
+        ));
+        assert!(rules.contains("add chain bridge rauha forward"));
+        for chain in ["forward", "input", "output"] {
+            assert!(
+                rules.contains(&format!("add chain bridge rauha {chain} {{ type filter hook {chain} priority filter; policy drop; }}")),
+                "bridge {chain} chain must fail closed"
+            );
+        }
+        assert!(rules.contains("add rule inet rauha input iifname \"rauha0\" drop"));
         assert!(rules.contains("ip saddr 10.89.0.0/16"));
     }
 
     #[test]
-    fn bridged_rules_are_bidirectional_and_fall_through_to_default_deny() {
+    fn bridge_rules_are_bidirectional_and_fall_through_to_default_deny() {
         let policy = NetworkPolicy {
             mode: NetworkMode::Bridged,
             allowed_zones: vec!["peer".into()],
             allowed_egress: vec![],
             allowed_ingress: vec![],
         };
-        let rules = zone_chain_rules("veth-source", &policy);
+        let rules = bridge_zone_chain_rules("veth-source", &policy);
         let peer_veth = super::super::network::veth_host_name_for("peer");
 
         assert_eq!(rules.last().unwrap(), "return");
@@ -349,6 +505,31 @@ mod tests {
         assert!(rules.contains(&format!(
             "iifname \"{peer_veth}\" oifname \"veth-source\" accept"
         )));
+    }
+
+    #[test]
+    fn endpoint_rules_support_ipv4_ipv6_and_tcp_ports() {
+        let rules =
+            endpoint_rules("daddr", &["10.0.0.0/8:443".into(), "2001:db8::/32".into()]).unwrap();
+        assert_eq!(
+            rules,
+            [
+                "ip daddr 10.0.0.0/8 tcp dport 443 accept",
+                "ip6 daddr 2001:db8::/32 accept",
+            ]
+        );
+    }
+
+    #[test]
+    fn endpoint_rules_accept_legacy_port_zero_as_any_port() {
+        let rules = endpoint_rules("daddr", &["0.0.0.0/0:0".into()]).unwrap();
+        assert_eq!(rules, ["ip daddr 0.0.0.0/0 accept"]);
+    }
+
+    #[test]
+    fn endpoint_rules_reject_nft_injection() {
+        let error = endpoint_rules("daddr", &["0.0.0.0/0 accept".into()]).unwrap_err();
+        assert!(error.to_string().contains("invalid network target"));
     }
 
     #[test]

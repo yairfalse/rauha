@@ -92,6 +92,12 @@ pub async fn handle_sandbox(args: SandboxArgs, out: OutputMode) -> anyhow::Resul
         "timed_out" => 137,
         _ => 1,
     });
+    let receipt: rauha_evidence::receipt::SignedExecutionReceipt =
+        serde_json::from_str(&result.receipt_json)
+            .map_err(|error| anyhow::anyhow!("daemon returned an invalid receipt: {error}"))?;
+    receipt
+        .verify()
+        .map_err(|error| anyhow::anyhow!("daemon returned an unverifiable receipt: {error}"))?;
 
     let view = output::SandboxRun {
         ok: result.status == "succeeded",
@@ -128,6 +134,7 @@ pub async fn handle_sandbox(args: SandboxArgs, out: OutputMode) -> anyhow::Resul
                 object: e.object,
             })
             .collect(),
+        receipt,
     };
 
     output::print(out, &view, || {
@@ -146,12 +153,13 @@ pub async fn handle_sandbox(args: SandboxArgs, out: OutputMode) -> anyhow::Resul
             format!("  enforcement: {} event(s)", view.enforcement_events.len())
         };
         eprintln!(
-            "status: {}  exit: {}  admission: {}  ({:.1}s){}",
+            "status: {}  exit: {}  admission: {}  ({:.1}s){}  receipt: {}",
             view.status,
             code,
             view.admission,
             view.duration_ms as f64 / 1000.0,
             enforcement,
+            view.receipt.sha256(),
         );
         if !view.unavailable_controls.is_empty() {
             eprintln!(

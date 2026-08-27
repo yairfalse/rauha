@@ -106,8 +106,8 @@ across machines and teams. The full reasoning, market survey, and hardening road
 
 `rauhad` is a platform-agnostic daemon behind one `IsolationBackend` trait; the
 `rauha` CLI and `containerd-shim-rauha-v2` are thin gRPC clients. On Linux,
-`rauhad` spawns one `rauha-shim` per zone, which starts each container process
-and keeps lifecycle, logs, exec IPC, and evidence together. Zones get
+`rauhad` spawns one `rauha-shim` per zone, which supervises `crun` for each
+container and keeps lifecycle, logs, exec IPC, and evidence together. Zones get
 their own network namespace, an IP on the `rauha0` bridge, and nftables rules
 that default to drop. On macOS the zone is a Virtualization.framework VM with an
 APFS-cloned rootfs and a guest agent over vsock.
@@ -199,9 +199,8 @@ Three layers of verification, each independent of the source:
 
 In order:
 
-1. Delegate Linux container construction to `crun` with trusted enrollment —
-   no image code runs before the process is inside its zone; init and exec
-   treated identically.
+1. Finish safe user-namespace support on a runtime/storage combination that can
+   make the rootfs private after entering the target user namespace.
 2. Run Protocol v0 — the journal, reducer, lifecycle, ownership epochs,
    capability intents, checkpoints, forks, and adoption.
 3. Local custodian and tier-0 supervisor with three built-in services:

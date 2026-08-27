@@ -29,8 +29,9 @@ pub fn cleanup_network() {
 }
 
 use std::collections::{BTreeSet, HashMap};
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, MutexGuard};
@@ -367,19 +368,46 @@ impl LinuxBackend {
 
 fn unsupported_linux_controls(policy: &ZonePolicy) -> Vec<String> {
     let mut unsupported = Vec::new();
-    if !policy.filesystem.writable_paths.is_empty() {
+    if policy
+        .filesystem
+        .writable_paths
+        .iter()
+        .any(|path| !safe_writable_path(path))
+    {
         unsupported.push("filesystem.writable_paths".to_string());
     }
-    if !policy.devices.allowed.is_empty() {
+    if policy
+        .devices
+        .allowed
+        .iter()
+        .any(|path| device_numbers(path).is_none())
+    {
         unsupported.push("devices.allowed".to_string());
     }
-    if !policy.syscalls.deny.is_empty() {
-        unsupported.push("syscalls.deny".to_string());
-    }
-    if !policy.network.allowed_ingress.is_empty() {
-        unsupported.push("network.allowed_ingress".to_string());
-    }
     unsupported
+}
+
+fn safe_writable_path(path: &str) -> bool {
+    let path = Path::new(path);
+    path.is_absolute()
+        && path != Path::new("/")
+        && !["/proc", "/sys", "/dev", "/run"]
+            .iter()
+            .any(|reserved| path.starts_with(reserved))
+        && path
+            .components()
+            .all(|component| matches!(component, Component::RootDir | Component::Normal(_)))
+}
+
+fn device_numbers(path: &str) -> Option<(i64, i64)> {
+    match path {
+        "/dev/null" => Some((1, 3)),
+        "/dev/zero" => Some((1, 5)),
+        "/dev/full" => Some((1, 7)),
+        "/dev/random" => Some((1, 8)),
+        "/dev/urandom" => Some((1, 9)),
+        _ => None,
+    }
 }
 
 fn admit_linux_policy(policy: &ZonePolicy, skipped_hooks: &[String]) -> Result<()> {
@@ -417,7 +445,10 @@ fn oci_capabilities(policy: &ZonePolicy) -> Result<oci_spec::runtime::LinuxCapab
         .allowed
         .iter()
         .map(|name| {
-            rauha_common::zone::canonical_linux_capability_name(name)
+            let canonical = rauha_common::zone::canonical_linux_capability_name(name);
+            canonical
+                .strip_prefix("CAP_")
+                .ok_or_else(|| RauhaError::InvalidPolicy(format!("unknown capability: {name}")))?
                 .parse::<Capability>()
                 .map_err(|_| RauhaError::InvalidPolicy(format!("unknown capability: {name}")))
         })
@@ -431,6 +462,120 @@ fn oci_capabilities(policy: &ZonePolicy) -> Result<oci_spec::runtime::LinuxCapab
         .ambient(capabilities)
         .build()
         .map_err(|e| RauhaError::BackendError(format!("failed to build OCI capabilities: {e}")))
+}
+
+fn oci_seccomp(policy: &ZonePolicy) -> Result<Option<oci_spec::runtime::LinuxSeccomp>> {
+    use oci_spec::runtime::{LinuxSeccompAction, LinuxSeccompBuilder, LinuxSyscallBuilder};
+
+    if policy.syscalls.deny.is_empty() {
+        return Ok(None);
+    }
+    let denied = LinuxSyscallBuilder::default()
+        .names(policy.syscalls.deny.clone())
+        .action(LinuxSeccompAction::ScmpActErrno)
+        .errno_ret(libc::EPERM as u32)
+        .build()
+        .map_err(|error| {
+            RauhaError::BackendError(format!("failed to build OCI seccomp rule: {error}"))
+        })?;
+    LinuxSeccompBuilder::default()
+        .default_action(LinuxSeccompAction::ScmpActAllow)
+        .syscalls(vec![denied])
+        .build()
+        .map(Some)
+        .map_err(|error| {
+            RauhaError::BackendError(format!("failed to build OCI seccomp profile: {error}"))
+        })
+}
+
+fn oci_devices(policy: &ZonePolicy) -> Result<Vec<oci_spec::runtime::LinuxDevice>> {
+    use oci_spec::runtime::{LinuxDeviceBuilder, LinuxDeviceType};
+
+    policy
+        .devices
+        .allowed
+        .iter()
+        .filter_map(|path| device_numbers(path).map(|numbers| (path, numbers)))
+        .map(|(path, (major, minor))| {
+            LinuxDeviceBuilder::default()
+                .path(path)
+                .typ(LinuxDeviceType::C)
+                .major(major)
+                .minor(minor)
+                .file_mode(0o666u32)
+                .uid(0u32)
+                .gid(0u32)
+                .build()
+                .map_err(|error| {
+                    RauhaError::BackendError(format!("failed to build OCI device {path}: {error}"))
+                })
+        })
+        .collect()
+}
+
+fn oci_mounts(policy: &ZonePolicy, rootfs: &Path) -> Result<Vec<oci_spec::runtime::Mount>> {
+    use oci_spec::runtime::{get_default_mounts, MountBuilder};
+
+    let mut mounts = get_default_mounts();
+    // The host cgroup2 hierarchy names every zone and exposes its live
+    // counters; the workload has no use for it.
+    mounts.retain(|mount| mount.destination() != Path::new("/sys/fs/cgroup"));
+    for declared in policy
+        .filesystem
+        .writable_paths
+        .iter()
+        .filter(|path| safe_writable_path(path))
+    {
+        let relative = declared.trim_start_matches('/');
+        let mut current = rootfs.to_path_buf();
+        for component in Path::new(relative).components() {
+            let Component::Normal(component) = component else {
+                return Err(RauhaError::InvalidPolicy(format!(
+                    "unsafe writable path: {declared}"
+                )));
+            };
+            current.push(component);
+            let metadata = std::fs::symlink_metadata(&current).map_err(|error| {
+                RauhaError::InvalidPolicy(format!(
+                    "writable path {declared} is not present in the image: {error}"
+                ))
+            })?;
+            if metadata.file_type().is_symlink() {
+                return Err(RauhaError::InvalidPolicy(format!(
+                    "writable path crosses a symlink: {declared}"
+                )));
+            }
+        }
+        let metadata = std::fs::metadata(&current).map_err(|error| RauhaError::RootfsError {
+            message: format!("failed to inspect writable path {declared}: {error}"),
+        })?;
+        if !metadata.is_dir() {
+            return Err(RauhaError::InvalidPolicy(format!(
+                "writable path is not a directory: {declared}"
+            )));
+        }
+        mounts.push(
+            MountBuilder::default()
+                .destination(declared)
+                .typ("tmpfs")
+                .source("tmpfs")
+                .options(vec![
+                    "rw".into(),
+                    "nosuid".into(),
+                    "nodev".into(),
+                    "noexec".into(),
+                    format!("mode={:o}", metadata.mode() & 0o7777),
+                    "size=65536k".into(),
+                ])
+                .build()
+                .map_err(|error| {
+                    RauhaError::BackendError(format!(
+                        "failed to build OCI mount {declared}: {error}"
+                    ))
+                })?,
+        );
+    }
+    Ok(mounts)
 }
 
 fn collect_zone_rootfs_inodes(root: &str, zone_name: &str) -> Result<Vec<u64>> {
@@ -1028,6 +1173,10 @@ impl IsolationBackend for LinuxBackend {
                 .typ(LinuxNamespaceType::Pid)
                 .build()
                 .unwrap(),
+            LinuxNamespaceBuilder::default()
+                .typ(LinuxNamespaceType::Cgroup)
+                .build()
+                .unwrap(),
         ];
         if policy.network.mode != NetworkMode::Host {
             namespaces.push(
@@ -1038,22 +1187,29 @@ impl IsolationBackend for LinuxBackend {
                     .unwrap(),
             );
         }
-        let linux = LinuxBuilder::default()
+        let mut linux = LinuxBuilder::default()
             .namespaces(namespaces)
+            .devices(oci_devices(&policy)?)
             .build()
             .map_err(|e| {
                 RauhaError::BackendError(format!("failed to build OCI Linux spec: {e}"))
             })?;
-        let spec_json = serde_json::to_string(
-            &oci_spec::runtime::SpecBuilder::default()
+        if let Some(seccomp) = oci_seccomp(&policy)? {
+            linux.set_seccomp(Some(seccomp));
+        }
+        let mounts = oci_mounts(&policy, &rootfs_dir)?;
+        let runtime_spec = serde_json::to_value(
+            oci_spec::runtime::SpecBuilder::default()
+                .annotations(HashMap::from([(
+                    "run.oci.seccomp_fail_unknown_syscall".to_string(),
+                    "1".to_string(),
+                )]))
+                .mounts(mounts)
                 .version("1.0.2")
                 .root(
                     oci_spec::runtime::RootBuilder::default()
                         .path(rootfs_dir.to_string_lossy().as_ref())
-                        // An empty writable-path allow-list means allow no
-                        // writes. The shim remounts this root read-only before
-                        // releasing the workload.
-                        .readonly(policy.filesystem.writable_paths.is_empty())
+                        .readonly(true)
                         .build()
                         .unwrap(),
                 )
@@ -1086,6 +1242,8 @@ impl IsolationBackend for LinuxBackend {
                 .unwrap(),
         )
         .map_err(|e| RauhaError::BackendError(format!("failed to serialize spec: {e}")))?;
+        let spec_json = serde_json::to_string(&runtime_spec)
+            .map_err(|e| RauhaError::BackendError(format!("failed to serialize spec: {e}")))?;
 
         // Register rootfs inodes in BPF map for file isolation.
         // Phase 1: Collect inodes from filesystem (no lock, may be slow for large rootfs).
@@ -1597,7 +1755,7 @@ fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> Result<()
 mod tests {
     use super::{
         admit_linux_policy, collect_zone_rootfs_inodes, lock_backend, oci_capabilities,
-        unsupported_linux_controls,
+        oci_devices, oci_mounts, oci_seccomp, unsupported_linux_controls,
     };
     use rauha_common::zone::{PolicyAdmission, ZonePolicy};
     use std::os::unix::fs::MetadataExt;
@@ -1621,19 +1779,14 @@ mod tests {
     #[test]
     fn strict_admission_rejects_unsupported_controls() {
         let mut policy = ZonePolicy::default();
-        policy.filesystem.writable_paths = vec!["/tmp".into()];
-        policy.devices.allowed = vec!["/dev/null".into()];
+        policy.filesystem.writable_paths = vec!["/proc".into()];
+        policy.devices.allowed = vec!["/dev/sda".into()];
         policy.syscalls.deny = vec!["mount".into()];
-        policy.network.allowed_ingress = vec!["tcp:8080".into()];
+        policy.network.allowed_ingress = vec!["0.0.0.0/0:8080".into()];
 
         assert_eq!(
             unsupported_linux_controls(&policy),
-            vec![
-                "filesystem.writable_paths",
-                "devices.allowed",
-                "syscalls.deny",
-                "network.allowed_ingress",
-            ]
+            vec!["filesystem.writable_paths", "devices.allowed",]
         );
 
         let err = admit_linux_policy(&policy, &[]).expect_err("strict policy must fail closed");
@@ -1641,6 +1794,26 @@ mod tests {
 
         policy.admission = PolicyAdmission::Audit;
         admit_linux_policy(&policy, &[]).expect("audit mode explicitly accepts degraded admission");
+    }
+
+    #[test]
+    fn supported_controls_build_oci_seccomp_devices_and_mounts() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("tmp")).unwrap();
+        let mut policy = ZonePolicy::default();
+        policy.filesystem.writable_paths = vec!["/tmp".into()];
+        policy.devices.allowed = vec!["/dev/null".into()];
+        policy.syscalls.deny = vec!["mount".into()];
+
+        assert!(unsupported_linux_controls(&policy).is_empty());
+        assert_eq!(oci_devices(&policy).unwrap().len(), 1);
+        assert!(oci_seccomp(&policy).unwrap().is_some());
+        let mounts = serde_json::to_value(oci_mounts(&policy, root.path()).unwrap()).unwrap();
+        assert!(mounts
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|mount| mount["destination"] == "/tmp"));
     }
 
     #[test]
@@ -1658,6 +1831,17 @@ mod tests {
         assert!(capabilities.inheritable().as_ref().unwrap().is_empty());
         assert!(capabilities.permitted().as_ref().unwrap().is_empty());
         assert!(capabilities.ambient().as_ref().unwrap().is_empty());
+    }
+
+    #[test]
+    fn named_policy_capabilities_convert_to_oci_capabilities() {
+        let mut policy = ZonePolicy::default();
+        policy.capabilities.allowed = vec!["CAP_NET_RAW".into(), "chown".into()];
+
+        let capabilities = oci_capabilities(&policy).unwrap();
+        let effective = capabilities.effective().as_ref().unwrap();
+        assert!(effective.contains(&oci_spec::runtime::Capability::NetRaw));
+        assert!(effective.contains(&oci_spec::runtime::Capability::Chown));
     }
 
     #[test]

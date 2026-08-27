@@ -63,6 +63,10 @@ message SandboxResult {
     string admission = 13;
     // Isolation checks that were unavailable or failed at execution time.
     repeated string unavailable_controls = 14;
+    // Ed25519-signed rauha.execution-receipt.v1 JSON. The signature covers the
+    // manifest admission, effective policy, inputs, outputs, enforcement
+    // totals, observed drop count, and final outcome.
+    string receipt_json = 15;
 }
 
 message SandboxEventSummary {
