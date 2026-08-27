@@ -1,7 +1,10 @@
 # Rauha
 
-**Give any agent a disposable, fully equipped computer for each task — without
-Dockerfiles, credential hacks, or cleanup.**
+**Run coding agents unattended. Keep control of what leaves.**
+
+Give a coding agent a ready-to-use computer for every task, let it work
+unattended, and review the code, effects, checks, and behaviour before
+anything leaves. No Dockerfiles. No secret mounts. No cleanup.
 
 [![license](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](#license)
 [![release](https://img.shields.io/badge/release-v0.1.0-2ea44f.svg)](Cargo.toml)
@@ -66,8 +69,12 @@ See [`docs/architecture.md`](docs/architecture.md) for the full control surface.
 
 ## Where this is going
 
-The zone is the boundary. The **run** is the product: agent, workspace,
-authority, behaviour, and result as one portable, supervised object.
+**Any agent. Any environment. One Run.** Docker made applications portable
+across computers; Rauha makes agentic work portable across agents,
+environments, and stages. The zone is the boundary. The **Run** is the
+product: work, workspace, authority, journal, effects, behaviour, checks, and
+receipt as one portable, supervised object — whatever machinery its Cell runs
+on. The canonical thesis is [`docs/product-thesis.md`](docs/product-thesis.md).
 
 ```sh
 rauha run -- claude -p "upgrade Postgres and fix the migration"   # planned
@@ -81,7 +88,8 @@ and a persistent supervisor that follows its work until it is genuinely
 finished. Each run gets a copy-on-write workspace, brokered credentials it can
 use but never read, proof gates, and a signed receipt of what was enforced.
 Every run has a supervisor; an optional management layer makes it durable
-across machines and teams. The full reasoning, market survey, and hardening roadmap are in
+across machines and teams. The Run's wire contract is [`docs/run-protocol-v0.md`](docs/run-protocol-v0.md);
+the market survey and hardening roadmap are in
 [`docs/positioning-and-roadmap.md`](docs/positioning-and-roadmap.md).
 
 ## Why not just Docker, or a hosted sandbox?

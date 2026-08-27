@@ -30,6 +30,14 @@ same journals.
 One sentence: **the Run is truth, the Cell is cache, the supervisor is a
 view, the custodian is the guard.**
 
+Mapping to [`product-thesis.md`](product-thesis.md), which is the canonical
+product vocabulary: the thesis's *local guardian* is this document's
+**Custodian**; its *boundary-external witness* (False Agent) is §8's
+**witness**; its effect outcomes `committed | failed | unknown` are the
+journal's `succeeded | failed | uncertain` (§6); its *Zone* is the isolation
+primitive inside a Cell and stays internal. Where the two disagree, the
+thesis wins on product meaning and this document wins on wire format.
+
 ## 2. Lifecycle
 
 ```text
