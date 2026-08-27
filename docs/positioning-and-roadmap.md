@@ -28,6 +28,171 @@ is either shipped, probed on every release, or explicitly marked *planned*.
 - **A microVM tier through the same OCI bundle interface** — selection policy
   TBD. (*planned* — `obl_tier`; macOS VM-per-zone is the existing proof point)
 
+## Product contract: the behaviour diff
+
+The adoption path is one wrapper, with no agent SDK or agent cooperation:
+
+```sh
+# before
+claude -p "fix the failing test"
+
+# with Rauha (planned)
+rauha run -- claude -p "fix the failing test"
+```
+
+The agent remains unchanged. Rauha runs below it at the process boundary and
+does not trust the agent's account of its own actions. The intended witness
+records successful and denied process, file, network, and capability activity;
+the supervisor reduces those observations into a reviewable result.
+
+This is the planned product experience, not a claim about today's event stream.
+Current sandbox capture is best-effort and cannot yet prove a complete record of
+successful file and network activity. Rauha may only call the result complete
+after the witness was attached before first exec and all declared loss counters
+are zero.
+
+### Example: the code looks fine, the run does not
+
+At 02:00, CI starts:
+
+```sh
+rauha run -- claude -p "fix the failing test"
+```
+
+During the run, Rauha observes facts such as:
+
+```text
+started:            git, python, pytest, cat, curl
+opened for reading: /app/tests/fixtures.json
+                    /app/src/payments.py
+                    /app/.env.production
+connected:          pypi.org:443
+                    db-prod.internal:5432
+```
+
+At 02:14 the tests pass. The supervisor compares the normalized behaviour with
+accepted runs for the same task class, policy, workspace lineage, toolchain,
+and agent inputs. PIDs, timestamps, and other unstable values do not become
+noise. The complete record remains available, but the pull request foregrounds
+only the delta:
+
+```text
+rauha · behaviour
+
+CHANGED
++ opened for reading /app/.env.production
++ connected db-prod.internal:5432
+```
+
+The code diff shows what the agent wants to keep. The behaviour diff shows what
+actually happened while producing it. Here the reviewer can see that an
+otherwise plausible test fix depended on production credentials or production
+data. A strict policy should block known-forbidden access before it happens;
+the diff catches new behaviour that was observable but not already forbidden.
+
+The same mechanism catches an install script making a new connection during
+`npm install`. It also catches changes that Git cannot represent: if the
+workspace is identical but the model, toolchain, policy, or observed behaviour
+changes, the result reports the changed input and the changed behaviour.
+
+The useful unit is the difference. The first accepted run establishes a
+candidate baseline; later runs foreground deviations while retaining the full
+record. A baseline becomes trusted only through explicit acceptance and enough
+comparable runs—never merely because behaviour was seen once.
+
+No existing surface provides the same view:
+
+| Surface | What it establishes |
+|---|---|
+| Agent log | what the agent reports |
+| Code review | what the proposed files contain |
+| Sandbox policy | whether a predeclared rule allowed or denied an action |
+| Rauha result | observed behaviour, policy verdicts, and the delta from accepted runs |
+
+The product sentence is:
+
+> Run an agent through Rauha. Review the code it produced and the short list of
+> what it did differently; retain the complete evidence when deeper inspection
+> is needed.
+
+## Run continuity: the Cell is a cache
+
+Cursor's Continuity design treats an ordinary Git repository on local NVMe as
+a materialized cache and an object-storage write-ahead log as durable truth.
+Repositories can be reconstructed anywhere; atomic compare-and-swap linearizes
+updates; gossip accelerates healthy replicas but never decides correctness.
+[Cursor describes the design here](https://cursor.com/blog/git-at-any-scale).
+
+Rauha adopts the invariant, not Cursor's storage implementation:
+
+> A Cell is replaceable materialization. A Run is durable truth.
+
+```text
+Run        = journal + head + artifacts + workspace lineage
+Cell       = materialize(Run checkpoint)
+Supervisor = reduce(journal after checkpoint)
+Receipt    = seal(immutable Run head)
+Fork       = new Run referencing parent head + checkpoint
+```
+
+The recovery boundary is a committed checkpoint or agent turn, not arbitrary
+live process memory. TCP connections and half-executed instructions are not
+portable state. Live migration may optimize a healthy path but is never the
+correctness mechanism.
+
+The authoritative head is a CAS-controlled pointer to an immutable manifest:
+
+```text
+RunHead = {
+    previous_head,
+    journal_root,
+    sequence,
+    ownership_epoch,
+    checkpoint,
+    workspace_snapshot,
+    artifacts,
+    policy,
+    agent_session
+}
+```
+
+Adoption must also fence side effects. Advancing `ownership_epoch` prevents two
+supervisors from updating the head, but it does not stop a stale supervisor from
+using authority it already holds. Every brokered capability call carries the
+epoch, and the broker rejects calls whose epoch is no longer current.
+
+External effects are append-before-execute and idempotent where the provider
+allows it:
+
+```text
+requested -> authorized -> executing -> succeeded | failed | uncertain
+```
+
+After recovery, an `uncertain` effect is reconciled rather than blindly
+replayed. Git objects and patches may be prepared before approval, while the
+small publication step—updating a reference, opening a pull request, sending a
+message—remains an explicit capability effect.
+
+Live OTP messages, UI streams, and observer notifications are hints. Before
+adopting a Run, authorizing an effect, or sealing a receipt, the supervisor
+verifies the authoritative head. The operating rule is: **fast when healthy,
+correct when degraded**.
+
+Checkpoints bound replay cost without rewriting history. A checkpoint seals the
+journal-prefix hash and workspace snapshot; replay continues after it, while
+the original evidence chunks remain available for every receipt that references
+them.
+
+Tier zero needs no distributed system: immutable files, a single-writer lock,
+and atomic durable head replacement provide the same semantics locally. Vartio
+may later place immutable objects in durable storage and update the head with
+CAS. The protocol stays the same; only the storage implementation changes.
+
+The architectural promise is:
+
+> A Rauha Run is reconstructible from durable truth; every Cell, supervisor
+> process, and live event stream is replaceable.
+
 Credible "stronger than Docker defaults" milestone: user namespaces + seccomp +
 safe image extraction (no symlink/hardlink escapes, no device nodes) +
 host-input filtering + device/writable-path enforcement + trusted enrollment.
