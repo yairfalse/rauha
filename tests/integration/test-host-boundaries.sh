@@ -140,6 +140,12 @@ else
     fail "workload can access the zone cgroup enrollment handle"
 fi
 
+if $RAUHA sandbox --name "$ZONE" --image "$IMAGE" -- /bin/sh -c 'test ! -e /sys/fs/cgroup/rauha.slice && ! grep -q " cgroup2 " /proc/self/mounts' >/dev/null 2>&1; then
+    echo "PASS: host cgroup hierarchy is not visible to the workload"
+else
+    fail "workload can enumerate the host cgroup hierarchy"
+fi
+
 sed 's/mode = "strict"/mode = "audit"/' "$ROOT/policies/strict.toml" >"$HARDENED_POLICY_FILE"
 $RAUHA zone create --name "$HARDENED_ZONE" --policy "$HARDENED_POLICY_FILE" >/dev/null
 if $RAUHA sandbox --name "$HARDENED_ZONE" --image "$IMAGE" -- /bin/sh -c '

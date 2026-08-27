@@ -57,6 +57,14 @@ impl ImageService {
         }
     }
 
+    fn manifest_blobs_present(&self, manifest: &OciManifest) -> bool {
+        std::iter::once(&manifest.config)
+            .chain(manifest.layers.iter())
+            .all(|entry| {
+                Digest::parse(&entry.digest).is_some_and(|digest| self.content.has_blob(&digest))
+            })
+    }
+
     /// Pull an image from a registry, storing blobs in the content store.
     /// Returns progress events via the callback.
     pub async fn pull<F>(
@@ -73,30 +81,28 @@ impl ImageService {
                 message: e,
             })?;
         let canonical = reference.to_string_canonical();
-        if let Some(bytes) =
-            self.content
-                .get_manifest(&canonical)
-                .map_err(|error| RauhaError::ContentError {
-                    message: format!("failed to read cached manifest: {error}"),
-                })?
-        {
-            if let Ok(manifest) = serde_json::from_slice::<OciManifest>(&bytes) {
-                let complete = std::iter::once(&manifest.config)
-                    .chain(manifest.layers.iter())
-                    .all(|entry| {
-                        Digest::parse(&entry.digest)
-                            .is_some_and(|digest| self.content.has_blob(&digest))
-                    });
-                if complete {
-                    on_progress(PullProgress {
-                        status: "pull complete (cached)".into(),
-                        layer: String::new(),
-                        current: 0,
-                        total: 0,
-                        done: true,
-                    });
-                    return Ok(manifest);
-                }
+        let cached = self
+            .content
+            .get_manifest(&canonical)
+            .map_err(|error| RauhaError::ContentError {
+                message: format!("failed to read cached manifest: {error}"),
+            })?
+            .and_then(|bytes| serde_json::from_slice::<OciManifest>(&bytes).ok())
+            .filter(|manifest| self.manifest_blobs_present(manifest));
+
+        // A digest reference is immutable, so a complete cache is final. A tag
+        // can move, so it is re-resolved against the registry; the cache only
+        // stands in when the registry cannot be reached.
+        if reference.digest.is_some() {
+            if let Some(manifest) = cached {
+                on_progress(PullProgress {
+                    status: "pull complete (cached)".into(),
+                    layer: String::new(),
+                    current: 0,
+                    total: 0,
+                    done: true,
+                });
+                return Ok(manifest);
             }
         }
 
@@ -108,7 +114,23 @@ impl ImageService {
             done: false,
         });
 
-        let manifest = self.client.pull_manifest(&reference).await?;
+        let manifest = match self.client.pull_manifest(&reference).await {
+            Ok(manifest) => manifest,
+            Err(error) => {
+                let Some(manifest) = cached else {
+                    return Err(error);
+                };
+                tracing::warn!(reference = %canonical, %error, "registry unreachable; using cached tag");
+                on_progress(PullProgress {
+                    status: "pull complete (cached; registry unreachable)".into(),
+                    layer: String::new(),
+                    current: 0,
+                    total: 0,
+                    done: true,
+                });
+                return Ok(manifest);
+            }
+        };
 
         // Pull config blob.
         let config_digest =
@@ -690,8 +712,15 @@ pub fn unpack_layer(
                 continue;
             }
             if let Some(original) = name.strip_prefix(".wh.") {
-                if original.is_empty() {
-                    return Err(invalid_layer_path(&path, "whiteout target is empty"));
+                // The derived target must be exactly one plain name: `.wh...`
+                // would otherwise resolve to `..` and delete the staging
+                // directory's parent on the host.
+                if original.is_empty()
+                    || original == "."
+                    || original == ".."
+                    || original.contains('/')
+                {
+                    return Err(invalid_layer_path(&path, "invalid whiteout target"));
                 }
                 // File whiteout: delete the corresponding file.
                 if let Some(parent) = path.parent() {
@@ -795,22 +824,67 @@ pub(crate) mod tests {
         assert_eq!(inner.env.unwrap(), vec!["PATH=/usr/bin"]);
     }
 
+    /// Re-key the fixture manifest under a reference whose registry is a
+    /// closed local port, so a pull that consults the registry fails fast
+    /// instead of reaching the network.
+    fn store_manifest_under(store: &ContentStore, reference: &str) -> String {
+        let bytes = store
+            .get_manifest("registry-1.docker.io/library/testimage:latest")
+            .unwrap()
+            .unwrap();
+        let canonical = ImageReference::parse(reference)
+            .unwrap()
+            .to_string_canonical();
+        store.put_manifest(&canonical, &bytes).unwrap();
+        reference.to_string()
+    }
+
     #[tokio::test]
-    async fn pull_reuses_a_complete_cached_image() {
+    async fn pull_by_digest_is_served_from_a_complete_cache() {
         let dir = tempfile::tempdir().unwrap();
         let (store, _) = setup_content_store_with_image(dir.path());
+        let manifest_bytes = store
+            .get_manifest("registry-1.docker.io/library/testimage:latest")
+            .unwrap()
+            .unwrap();
+        let digest = store.put_blob(&manifest_bytes).unwrap();
+        let reference = store_manifest_under(
+            &store,
+            &format!("127.0.0.1:1/testimage@{}", digest.as_str()),
+        );
         let svc = ImageService::new(store, dir.path().to_path_buf());
         let mut statuses = Vec::new();
 
         let manifest = svc
-            .pull("testimage:latest", |progress| {
-                statuses.push(progress.status)
-            })
+            .pull(&reference, |progress| statuses.push(progress.status))
             .await
             .unwrap();
 
         assert_eq!(manifest.layers.len(), 1);
         assert_eq!(statuses, ["pull complete (cached)"]);
+    }
+
+    #[tokio::test]
+    async fn pull_by_tag_consults_the_registry_and_falls_back_to_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, _) = setup_content_store_with_image(dir.path());
+        let reference = store_manifest_under(&store, "127.0.0.1:1/testimage:latest");
+        let svc = ImageService::new(store, dir.path().to_path_buf());
+        let mut statuses = Vec::new();
+
+        let manifest = svc
+            .pull(&reference, |progress| statuses.push(progress.status))
+            .await
+            .unwrap();
+
+        assert_eq!(manifest.layers.len(), 1);
+        assert_eq!(
+            statuses,
+            [
+                "pulling manifest",
+                "pull complete (cached; registry unreachable)"
+            ]
+        );
     }
 
     #[test]
@@ -1000,6 +1074,33 @@ pub(crate) mod tests {
 
         // The file should have been deleted by the whiteout.
         assert!(!rootfs.join("etc/config.txt").exists());
+    }
+
+    #[test]
+    fn whiteout_target_cannot_name_the_parent_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("rootfs");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(dir.path().join("sibling"), b"host data").unwrap();
+
+        for name in [".wh...", ".wh.."] {
+            let layer = make_tar_gz(&[(name, b"")]);
+            let layer_path = dir.path().join("layer.tar.gz");
+            std::fs::write(&layer_path, layer).unwrap();
+            let decoder = flate2::read::GzDecoder::new(std::fs::File::open(&layer_path).unwrap());
+            let mut archive = tar::Archive::new(decoder);
+
+            let error = unpack_layer(&mut archive, &target).unwrap_err();
+            assert!(
+                error.to_string().contains("invalid whiteout target"),
+                "{name}"
+            );
+        }
+        assert!(target.is_dir());
+        assert_eq!(
+            std::fs::read(dir.path().join("sibling")).unwrap(),
+            b"host data"
+        );
     }
 
     #[test]

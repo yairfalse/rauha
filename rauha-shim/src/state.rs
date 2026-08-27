@@ -100,9 +100,30 @@ impl ShimState {
         Ok(pid)
     }
 
-    /// Stop a container by sending a signal.
+    /// Stop a container: deliver `signal`, then escalate to SIGKILL if init
+    /// has not exited within the grace period. Returns only once init is gone.
     pub fn stop_container(&mut self, id: &str, signal: i32) -> anyhow::Result<()> {
-        self.signal_container(id, signal)
+        const GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
+        self.signal_container(id, signal)?;
+        let proc = self
+            .containers
+            .get_mut(id)
+            .ok_or_else(|| anyhow::anyhow!("container {id} not found"))?;
+        let runtime = proc
+            .runtime
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("container {id} has no OCI runtime"))?;
+        let exit_code = runtime.wait_or_kill(GRACE);
+        tracing::info!(
+            container = id,
+            pid = proc.pid,
+            exit_code,
+            "container stopped"
+        );
+        proc.status = ContainerStatus::Stopped;
+        proc.exit_code = Some(exit_code);
+        Ok(())
     }
 
     /// Send a signal to a container's process.

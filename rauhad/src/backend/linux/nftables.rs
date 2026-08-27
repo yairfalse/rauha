@@ -37,6 +37,11 @@ pub fn ensure_nat(subnet_cidr: &str) -> Result<()> {
     Ok(())
 }
 
+/// Every bridge base chain is `policy drop`: a zone only has connectivity
+/// through the per-zone jump rules installed by `apply_zone_rules`, so a zone
+/// whose rules failed to apply, or whose rules are mid-replacement, is cut off
+/// rather than left open. The inet forward `iifname "rauha0"` accept is only
+/// reachable for frames that already passed a bridge input chain.
 fn base_ruleset(subnet_cidr: &str, replace_inet: bool, replace_bridge: bool) -> String {
     format!(
         "{delete_inet}{delete_bridge}add table inet rauha\n\
@@ -51,8 +56,8 @@ fn base_ruleset(subnet_cidr: &str, replace_inet: bool, replace_bridge: bool) -> 
          add rule inet rauha input iifname \"rauha0\" drop\n\
          add table bridge rauha\n\
          add chain bridge rauha forward {{ type filter hook forward priority filter; policy drop; }}\n\
-         add chain bridge rauha input {{ type filter hook input priority filter; policy accept; }}\n\
-         add chain bridge rauha output {{ type filter hook output priority filter; policy accept; }}\n",
+         add chain bridge rauha input {{ type filter hook input priority filter; policy drop; }}\n\
+         add chain bridge rauha output {{ type filter hook output priority filter; policy drop; }}\n",
         delete_inet = if replace_inet {
             "delete table inet rauha\n"
         } else {
@@ -348,6 +353,15 @@ fn endpoint_rules(address_match: &str, targets: &[String]) -> Result<Vec<String>
     targets
         .iter()
         .map(|target| {
+            // Zones persisted before ports became mandatory-nonzero used
+            // `addr:0` to mean "any port"; keep those zones loadable.
+            let target = match target.strip_suffix(":0") {
+                Some(network) if network.parse::<NetworkEndpoint>().is_ok() => {
+                    tracing::warn!(target, "legacy ':0' network target treated as any port");
+                    network
+                }
+                _ => target.as_str(),
+            };
             let endpoint = target.parse::<NetworkEndpoint>().map_err(|error| {
                 RauhaError::InvalidPolicy(format!("invalid network target {target:?}: {error}"))
             })?;
@@ -463,6 +477,12 @@ mod tests {
             "delete table inet rauha\ndelete table bridge rauha\nadd table inet rauha"
         ));
         assert!(rules.contains("add chain bridge rauha forward"));
+        for chain in ["forward", "input", "output"] {
+            assert!(
+                rules.contains(&format!("add chain bridge rauha {chain} {{ type filter hook {chain} priority filter; policy drop; }}")),
+                "bridge {chain} chain must fail closed"
+            );
+        }
         assert!(rules.contains("add rule inet rauha input iifname \"rauha0\" drop"));
         assert!(rules.contains("ip saddr 10.89.0.0/16"));
     }
@@ -498,6 +518,12 @@ mod tests {
                 "ip6 daddr 2001:db8::/32 accept",
             ]
         );
+    }
+
+    #[test]
+    fn endpoint_rules_accept_legacy_port_zero_as_any_port() {
+        let rules = endpoint_rules("daddr", &["0.0.0.0/0:0".into()]).unwrap();
+        assert_eq!(rules, ["ip daddr 0.0.0.0/0 accept"]);
     }
 
     #[test]

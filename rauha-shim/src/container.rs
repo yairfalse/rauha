@@ -75,16 +75,37 @@ impl RuntimeProcess {
         None
     }
 
-    pub fn stop_and_delete(&mut self) {
-        if self.try_wait().is_none() {
-            let _ = self.signal(9);
+    /// Wait up to `grace` for init to exit, then SIGKILL it and wait again.
+    ///
+    /// Init is PID 1 of its own pid namespace, where a signal with default
+    /// disposition (SIGTERM to `sleep`, say) is silently discarded — so a
+    /// delivered stop signal proves nothing until the pidfd reports exit.
+    pub fn wait_or_kill(&mut self, grace: Duration) -> i32 {
+        if let Some(exit_code) = self.wait_until(Instant::now() + grace) {
+            return exit_code;
         }
+        let _ = self.signal(9);
+        let exit_code = self
+            .wait_until(Instant::now() + Duration::from_secs(5))
+            .unwrap_or(128 + 9);
+        self.delete();
+        exit_code
+    }
 
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while self.try_wait().is_none() && Instant::now() < deadline {
+    fn wait_until(&mut self, deadline: Instant) -> Option<i32> {
+        loop {
+            if let Some(exit_code) = self.try_wait() {
+                return Some(exit_code);
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
             std::thread::sleep(Duration::from_millis(10));
         }
-        self.delete();
+    }
+
+    pub fn stop_and_delete(&mut self) {
+        self.wait_or_kill(Duration::ZERO);
     }
 
     fn delete(&mut self) {

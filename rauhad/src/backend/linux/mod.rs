@@ -517,6 +517,9 @@ fn oci_mounts(policy: &ZonePolicy, rootfs: &Path) -> Result<Vec<oci_spec::runtim
     use oci_spec::runtime::{get_default_mounts, MountBuilder};
 
     let mut mounts = get_default_mounts();
+    // The host cgroup2 hierarchy names every zone and exposes its live
+    // counters; the workload has no use for it.
+    mounts.retain(|mount| mount.destination() != Path::new("/sys/fs/cgroup"));
     for declared in policy
         .filesystem
         .writable_paths
@@ -1168,6 +1171,10 @@ impl IsolationBackend for LinuxBackend {
                 .unwrap(),
             LinuxNamespaceBuilder::default()
                 .typ(LinuxNamespaceType::Pid)
+                .build()
+                .unwrap(),
+            LinuxNamespaceBuilder::default()
+                .typ(LinuxNamespaceType::Cgroup)
                 .build()
                 .unwrap(),
         ];
