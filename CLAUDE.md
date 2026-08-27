@@ -14,6 +14,8 @@ The product hierarchy is load-bearing:
 
 Do not present Rauha as primarily an eBPF project or a Kubernetes runtime. Rauha creates the zones. Syva makes the Linux kernel respect them. Current Linux eBPF code may still live in this repository, but architecturally it belongs behind the Syva enforcement boundary.
 
+Product direction (see `docs/positioning-and-roadmap.md`): the zone is the boundary, the **run** is the product — `rauha run -- <agent cmd>` with fork/compare/accept is planned, `rauha sandbox` is what ships. README claims must be shipped or explicitly marked planned. `docs/architecture.md` holds the diagram, crate map, and full control surface.
+
 ## Build & Test Commands
 
 ```bash
@@ -21,6 +23,8 @@ cargo build                          # Build all workspace crates
 cargo test                           # Run all unit tests
 cargo test -p rauha-oci              # Test a single crate
 cargo test test_name                 # Run a single test by name
+cargo fmt --all -- --check           # CI gate
+cargo clippy --workspace --all-targets -- -D warnings   # CI gate
 cargo build --bin rauhad             # Build just the daemon
 cargo build --bin rauha              # Build just the CLI
 cargo build --bin rauha-shim         # Build the per-zone shim
@@ -46,8 +50,10 @@ cargo run --bin rauha -- zone list
 cargo run --bin rauha -- image pull alpine:latest
 cargo run --bin rauha -- run --zone test alpine:latest /bin/echo hello
 
-# Agent sandbox task (primary product shape — API contract, runtime still landing)
+# Agent sandbox task (primary product shape; implemented end to end)
 cargo run --bin rauha -- sandbox --image alpine:latest -- /bin/echo hello
+cargo run --bin rauha -- sandbox --image alpine:latest --audit --keep-zone -- /bin/sh -c id
+cargo run --bin rauha -- zone verify test --json   # boundary self-check (named checks, passed/detail)
 
 # Observability / evidence surface
 cargo run --bin rauha -- trace --zone test          # syscall trace for a zone
@@ -65,7 +71,15 @@ bash tests/integration/test-zone-networking.sh
 bash tests/integration/test-exec.sh
 bash tests/integration/test-logs.sh
 bash tests/integration/test-sandbox.sh         # agent sandbox task end-to-end
+bash tests/integration/test-host-boundaries.sh # adversarial host-impact probes
 bash tests/integration/test-cgroup-lock.sh          # eBPF enforcement required
+
+# Authoritative privileged security gate (Linux, BPF-LSM kernel, passwordless sudo, crun, jq):
+# fmt + clippy + tests + eBPF build, then daemon, every integration test, the crash-recovery
+# probe (kill -9 rauhad mid-workload, restart, verify PID/cgroup/inode ownership survive),
+# the crun executor probe, and the oracle. This is the Sykli `full` task (sykli.json).
+bash tests/security/linux-gate.sh
+bash tests/security/run.sh --gate      # same, via Sykli on this host or one running Lima VM (RAUHA_LIMA_INSTANCE)
 
 # Oracle tests (require running rauhad, any platform)
 cd eval/oracle
@@ -102,13 +116,20 @@ Both platform backends implement this trait. rauhad is platform-agnostic — it 
 
 ### One Shim Per Zone (Not Per Container)
 
-This diverges from containerd's one-shim-per-container model. Zones are the isolation boundary, not containers. Multiple containers in a zone share namespaces. rauhad spawns one `rauha-shim` per zone; the shim forks additional container processes on request. Shim binary search: same directory as rauhad, then `target/debug/`, `target/release/`, then `/usr/local/bin`, `/usr/bin`. Socket at `/run/rauha/shim-{zone_name}.sock` — rauhad polls for up to 5 seconds after spawning.
+This diverges from containerd's one-shim-per-container model. Zones are the isolation boundary, not containers. Multiple containers in a zone share namespaces. rauhad spawns one `rauha-shim` per zone; the shim supervises one crun-created init per container on request, and remains the zone lifecycle and evidence bridge. Shim binary search: same directory as rauhad, then `target/debug/`, `target/release/`, then `/usr/local/bin`, `/usr/bin`. Socket at `/run/rauha/shim-{zone_name}.sock` — rauhad polls for up to 5 seconds after spawning.
 
-### Container Fork Flow (Linux)
+### Container Start Flow (Linux): crun + enrollment before start
 
-The sync pipe pattern in `rauha-shim/src/container.rs` prevents a TOCTOU race: the child must be in the zone's cgroup **before** it runs, otherwise eBPF enforcement doesn't apply. Parent writes child PID to cgroup, then signals the pipe; child blocks until confirmed.
+The shim no longer builds containers itself; `rauha-shim/src/container.rs` delegates OCI construction to `/usr/bin/crun` (required, `--cgroup-manager=disabled` so Rauha keeps cgroup ownership). The order is the security invariant — no image code may run before the process is in the zone cgroup, otherwise eBPF enforcement doesn't apply:
 
-**Fork-safety invariant:** All code after `fork()` in the child must be async-signal-safe. This means: no `std::env::set_var`/`vars` (holds a global mutex), no `eprintln!`/`panic!` (Rust panic machinery), no heap allocation. Use `libc::putenv` with pre-allocated `CString`s, `libc::write` for output, and `libc::_exit` instead of `std::process::exit`. Pre-allocate all strings and paths before fork.
+1. `crun create --bundle … --pid-file init.pid` — crun does all privileged setup (namespaces, mounts, pivot_root, capability drop, seccomp) and parks init on its `exec.fifo`. This setup runs *outside* the zone cgroup, so the eBPF `capable` hook does not judge crun's own `CAP_SYS_ADMIN` work against the workload policy.
+2. Read `init.pid`, `pidfd_open` it (the pidfd is held for the container's lifetime; signal via `pidfd_send_signal`, wait via `poll` on the pidfd — immune to PID reuse).
+3. Write the PID to `/sys/fs/cgroup/rauha.slice/zone-{name}/cgroup.procs`. Failure → `crun delete --force`, fail closed.
+4. `crun start` — only now does init `execve` the image entrypoint, inside the boundary.
+
+Never enroll via OCI `startContainer` hooks: crun runs them after pivot_root and privilege drop, resolving `path` in the *image* rootfs — untrusted code with no `CAP_SYS_ADMIN`. `createRuntime` hooks (host binary, state JSON on stdin) are the spec-blessed alternative if a hook is ever needed. Analysis and crun source references: `docs/positioning-and-roadmap.md` § Enrollment.
+
+**Fork-safety invariant (still applies to `attach.rs` exec/PTY paths and the macOS guest agent):** all code after `fork()`/`clone3()` in the child must be async-signal-safe — no `std::env::set_var`/`vars`, no `eprintln!`/`panic!`, no heap allocation. Use `libc::putenv` with pre-allocated `CString`s, `libc::write` for output, and `libc::_exit`. Pre-allocate all strings and paths before fork.
 
 ### macOS Backend: VM-Per-Zone (`rauhad/src/backend/macos/`)
 
@@ -188,6 +209,14 @@ Don't extend `rauha-enforce/` — new enforcement work goes in the syva repo. Bu
 
 What's still documented here for context: it loaded the same eBPF LSM programs as rauhad, used label-driven zone assignment via the `rauha.dev/zone` OCI annotation, and refused to load if BPF maps were already pinned at `/sys/fs/bpf/rauha/` (mutual exclusion with rauhad).
 
+### Policy Admission: enforced, audited, or refused (`rauhad/src/backend/linux/mod.rs`)
+
+`ZonePolicy.admission` is `strict` (default) or `audit` (`policies/audit.toml`). At zone creation `admit_linux_policy()` classifies every requested control; `unsupported_linux_controls()` currently lists `filesystem.writable_paths` (unless a safe path), `devices.allowed`, `syscalls.deny`, plus any LSM hook the kernel skipped (`lsm.<hook>`). Strict admission **refuses** the zone with the control names in the error; audit admits it, records the names in `zone_degradations`, and they surface as `policy:<control>` checks in `zone verify` and as `unavailable_controls` in the sandbox result. The Linux daemon itself fails closed at startup (root + BPF-LSM required, no degraded mode) — `audit` only relaxes per-zone policy controls, never enforcement presence.
+
+`verify_isolation()` (`rauha zone verify --json`) emits named checks — `policy:admitted`, `cgroup`, `ebpf:health`, `bpf_membership`, `filesystem:inode_ownership`, `netns`, `network:veth`, `network:nftables` — each with `passed` and `detail`. The security probes (`tests/security/*.sh`) key on these names; adding a control means adding a check here, not just a code path.
+
+`rauha-enforcer-api` defines the enforcement boundary as a backend-neutral async trait (`EnforcerBackend`: `register_zone`, `attach_container`, `register_host_path`, `verify`, `capabilities`, …) with `NoopEnforcer` as the honesty baseline and a shared conformance harness. Today `LinuxBackend` still drives the in-repo `LinuxEnforcer` through inherent id-keyed methods (sync `IsolationBackend` vs. async trait); the seam is real but not yet the sole enforcement path. See `docs/rauha-product-abilities.md`.
+
 ### gRPC Error Boundary (`rauhad/src/server.rs`)
 
 `to_status()` maps `RauhaError` variants to correct gRPC status codes. When adding new error variants, update this function — the oracle will catch incorrect mappings. Key mappings: `ZoneNotFound`/`ContainerNotFound`/`ImageNotFound`→`NotFound`, `ZoneAlreadyExists`/`ContainerAlreadyExists`→`AlreadyExists`, `InvalidInput`/`InvalidPolicy`→`InvalidArgument`, `PermissionDenied`/`CrossZoneAccessDenied`→`PermissionDenied`, `ZoneNotEmpty`→`FailedPrecondition`.
@@ -227,10 +256,11 @@ Built separately via `cargo xtask build-ebpf` targeting `bpfel-unknown-none`. Re
 
 | Crate | Purpose |
 |-------|---------|
-| `rauha-common` | Shared types, `IsolationBackend` trait, error types, policy parsing, shim IPC protocol |
+| `rauha-common` | Shared types, `IsolationBackend` trait, error types, policy parsing, sandbox result types, shim IPC protocol |
+| `rauha-enforcer-api` | `EnforcerBackend` trait, kernel-facing policy/event types, `Capabilities`, `NoopEnforcer`, shared conformance harness |
 | `rauhad` | Daemon — gRPC server, zone registry, metadata (redb), networking, Linux/macOS backends |
 | `rauha-cli` | CLI binary — connects to rauhad via gRPC |
-| `rauha-shim` | Per-zone sync process — fork/run containers (Linux only) |
+| `rauha-shim` | Per-zone sync supervisor (Linux only) — crun create/enroll/start per container, pidfd lifetime, exec/attach |
 | `rauha-guest-agent` | Guest-side daemon inside macOS VMs — container lifecycle over virtio-vsock |
 | `rauha-oci` | OCI image pull, content store, rootfs preparation, runtime spec generation |
 | `rauha-evidence` | Evidence-grade observability schema, projections, and sinks. Normalizes Syva/backend enforcement records + Rauha lifecycle events into one schema. Does not enforce. Consumed only by `rauhad`. |
@@ -239,6 +269,11 @@ Built separately via `cargo xtask build-ebpf` targeting `bpfel-unknown-none`. Re
 | `rauha-ebpf` | eBPF LSM programs (kernel-side, not in workspace, separate build) |
 | `rauha-ebpf-common` | Shared `#[repr(C)]` types between eBPF programs and userspace |
 | `xtask` | Build helper for eBPF compilation |
+
+## Work tooling in this repo
+
+- `sykli.json` / `sykli.lock` — the locked Sykli work graph; its single `full` task is the privileged security gate above. Changes to `tests/security/linux-gate.sh` usually go together with these two files.
+- `.toimija/` — Toimija session packets (the workset contract shown at session start). `.toimija/current.*`, `sessions/`, `runs/` are gitignored; `history.*` currently is not. Run `toimija verify` before committing; declare reads outside the packet's workset with `toimija intent "<why>" --scope <path>`.
 
 ## Oracle (`eval/oracle/`)
 
@@ -253,6 +288,7 @@ The oracle must not be modified as a side effect of modifying the system. It has
 - Linux 6.1+ with `CONFIG_BPF_LSM=y`, `CONFIG_BPF_SYSCALL=y`, `CONFIG_DEBUG_INFO_BTF=y`
 - Boot parameter: `lsm=lockdown,capability,bpf`
 - BTF at `/sys/kernel/btf/vmlinux`
+- `crun` at `/usr/bin/crun` (container construction is delegated to it); `jq` for the security probes
 
 ### macOS (Virtualization.framework)
 
