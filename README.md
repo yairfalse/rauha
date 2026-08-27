@@ -190,7 +190,10 @@ Three layers of verification, each independent of the source:
   `RAUHA_GRPC_ENDPOINT=http://[::1]:9876 cargo test`
 - **Linux integration and security gate** (`tests/integration/`,
   `tests/security/linux-gate.sh`; root + BPF-LSM kernel): lifecycle, isolation,
-  networking, crash recovery, and adversarial host-impact probes.
+  networking, crash recovery, and adversarial host-impact probes. On GitHub the
+  privileged workflow installs the pinned Sykli evaluator from the private
+  `false-systems/sykli` repository and needs a `SYKLI_READ_TOKEN` repository
+  secret with `contents:read` there.
 - **Enforcer conformance**: runs against `NoopEnforcer` in ordinary tests; the
   real eBPF backend is opt-in on an isolated root host with
   `RAUHA_RUN_EBPF_CONFORMANCE=1 cargo test -p rauhad linux_enforcer_passes_basic_conformance`.
