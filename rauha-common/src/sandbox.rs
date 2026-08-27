@@ -23,6 +23,7 @@ pub struct SandboxExecResult {
     pub finished_at: Option<DateTime<Utc>>,
     pub events: Vec<SandboxEventSummary>,
     pub enforcement_events: Vec<EnforcementEventSummary>,
+    pub enforcement_drop_count: u64,
 }
 
 impl SandboxExecResult {
@@ -46,6 +47,7 @@ impl SandboxExecResult {
             finished_at: None,
             events: Vec::new(),
             enforcement_events: Vec::new(),
+            enforcement_drop_count: 0,
         }
     }
 }
@@ -111,6 +113,7 @@ mod tests {
             finished_at: None,
             events: Vec::new(),
             enforcement_events: Vec::new(),
+            enforcement_drop_count: 0,
         };
 
         let value = serde_json::to_value(&result).unwrap();

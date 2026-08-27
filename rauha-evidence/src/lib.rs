@@ -16,6 +16,8 @@ use chrono::{DateTime, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+pub mod receipt;
+
 pub mod event_name {
     pub const DAEMON_START: &str = "rauha.daemon.start";
     pub const DAEMON_READY: &str = "rauha.daemon.ready";

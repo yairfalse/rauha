@@ -118,6 +118,13 @@ async fn main() -> anyhow::Result<()> {
     registry.reconcile().await?;
 
     // Set up gRPC services.
+    let receipt_signer = rauha_evidence::receipt::ReceiptSigner::load_or_create(
+        &root_path.join("metadata").join("receipt.ed25519"),
+    )
+    .map_err(anyhow::Error::msg)?;
+    receipt_signer
+        .publish_public_key(&root_path.join("metadata").join("receipt.ed25519.pub"))
+        .map_err(anyhow::Error::msg)?;
     #[cfg(target_os = "linux")]
     let zone_svc = server::ZoneServiceImpl::new(registry.clone(), root.clone(), event_tx.clone());
     #[cfg(not(target_os = "linux"))]
@@ -125,9 +132,11 @@ async fn main() -> anyhow::Result<()> {
     let container_svc = server::ContainerServiceImpl::new(registry.clone());
     let image_svc = server::ImageServiceImpl::new(image_service);
     #[cfg(target_os = "linux")]
-    let sandbox_svc = server::SandboxServiceImpl::new(registry.clone(), event_tx.clone());
+    let sandbox_svc =
+        server::SandboxServiceImpl::new(registry.clone(), event_tx.clone(), receipt_signer.clone());
     #[cfg(not(target_os = "linux"))]
-    let sandbox_svc = server::SandboxServiceImpl::new(registry.clone(), None);
+    let sandbox_svc =
+        server::SandboxServiceImpl::new(registry.clone(), None, receipt_signer.clone());
 
     let addr: SocketAddr = "[::1]:9876".parse()?;
     tracing::info!(%addr, "listening on gRPC");

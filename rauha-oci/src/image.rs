@@ -72,6 +72,33 @@ impl ImageService {
                 reference: reference_str.into(),
                 message: e,
             })?;
+        let canonical = reference.to_string_canonical();
+        if let Some(bytes) =
+            self.content
+                .get_manifest(&canonical)
+                .map_err(|error| RauhaError::ContentError {
+                    message: format!("failed to read cached manifest: {error}"),
+                })?
+        {
+            if let Ok(manifest) = serde_json::from_slice::<OciManifest>(&bytes) {
+                let complete = std::iter::once(&manifest.config)
+                    .chain(manifest.layers.iter())
+                    .all(|entry| {
+                        Digest::parse(&entry.digest)
+                            .is_some_and(|digest| self.content.has_blob(&digest))
+                    });
+                if complete {
+                    on_progress(PullProgress {
+                        status: "pull complete (cached)".into(),
+                        layer: String::new(),
+                        current: 0,
+                        total: 0,
+                        done: true,
+                    });
+                    return Ok(manifest);
+                }
+            }
+        }
 
         on_progress(PullProgress {
             status: "pulling manifest".into(),
@@ -766,6 +793,24 @@ pub(crate) mod tests {
         let inner = config.config.unwrap();
         assert_eq!(inner.cmd.unwrap(), vec!["/bin/sh"]);
         assert_eq!(inner.env.unwrap(), vec!["PATH=/usr/bin"]);
+    }
+
+    #[tokio::test]
+    async fn pull_reuses_a_complete_cached_image() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, _) = setup_content_store_with_image(dir.path());
+        let svc = ImageService::new(store, dir.path().to_path_buf());
+        let mut statuses = Vec::new();
+
+        let manifest = svc
+            .pull("testimage:latest", |progress| {
+                statuses.push(progress.status)
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(manifest.layers.len(), 1);
+        assert_eq!(statuses, ["pull complete (cached)"]);
     }
 
     #[test]

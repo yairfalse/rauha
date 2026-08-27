@@ -425,6 +425,12 @@ impl ZoneRegistry {
         self.metadata.list_zones()
     }
 
+    pub fn image_digest(&self, reference: &str) -> Result<String> {
+        self.image_service
+            .inspect_full(reference)
+            .map(|image| image.digest)
+    }
+
     pub async fn apply_policy(&self, zone_name: &str, policy: ZonePolicy) -> Result<()> {
         self.event(
             event_name::POLICY_APPLY_STARTED,

@@ -5,6 +5,10 @@ use tonic::{Request, Response, Status, Streaming};
 use tracing::Instrument;
 
 use rauha_common::error::RauhaError;
+use rauha_evidence::receipt::{
+    enforcement_totals, sha256_json, ExecutionReceiptPayload, ImageAdmission, ReceiptSigner,
+    EXECUTION_RECEIPT_SCHEMA,
+};
 use rauha_evidence::{
     event_name, EnforcementMode, EventKind, EventOutcome, FalseEvent, FieldValue,
     RuntimeEventBuilder, Severity, TrustLevel,
@@ -39,6 +43,10 @@ fn to_status(e: RauhaError) -> Status {
 
         _ => Status::internal(e.to_string()),
     }
+}
+
+fn to_internal_status(error: impl std::fmt::Display) -> Status {
+    Status::internal(error.to_string())
 }
 
 pub mod pb {
@@ -1220,6 +1228,7 @@ pub struct SandboxServiceImpl {
     /// (macOS VMs, or Linux with eBPF not loaded), in which case sandbox
     /// results carry no enforcement events.
     event_tx: Option<tokio::sync::broadcast::Sender<FalseEvent>>,
+    receipt_signer: ReceiptSigner,
 }
 
 struct ContainerCleanupGuard {
@@ -1306,8 +1315,13 @@ impl SandboxServiceImpl {
     pub fn new(
         registry: Arc<ZoneRegistry>,
         event_tx: Option<tokio::sync::broadcast::Sender<rauha_evidence::FalseEvent>>,
+        receipt_signer: ReceiptSigner,
     ) -> Self {
-        Self { registry, event_tx }
+        Self {
+            registry,
+            event_tx,
+            receipt_signer,
+        }
     }
 
     /// Run one task to completion inside an already-resolved zone.
@@ -1571,7 +1585,7 @@ impl SandboxServiceImpl {
             SandboxStatus::Failed
         };
 
-        let enforcement_events = drain_enforcement_capture(capture);
+        let (enforcement_events, enforcement_drop_count) = drain_enforcement_capture(capture);
         sandbox_event_builder(
             &self.registry,
             event_name::SANDBOX_RESULT_BUILT,
@@ -1606,6 +1620,7 @@ impl SandboxServiceImpl {
             events,
             // Drain the events that landed on this task's zone while it ran.
             enforcement_events,
+            enforcement_drop_count,
         })
     }
 
@@ -1749,25 +1764,31 @@ struct EnforcementCapture {
 /// error means the broadcast outran our buffer; we keep draining what remains
 /// rather than aborting (some events are better than none, and the drop is
 /// already surfaced as a `pipeline.shed` event on the `WatchEvents` stream).
-fn drain_enforcement_capture(capture: Option<EnforcementCapture>) -> Vec<EnforcementEventSummary> {
+fn drain_enforcement_capture(
+    capture: Option<EnforcementCapture>,
+) -> (Vec<EnforcementEventSummary>, u64) {
     use tokio::sync::broadcast::error::TryRecvError;
 
     let Some(mut capture) = capture else {
-        return Vec::new();
+        return (Vec::new(), 0);
     };
 
     let mut out = Vec::new();
+    let mut dropped = 0;
     loop {
         match capture.rx.try_recv() {
             Ok(event) if enforcement_event_matches(&event, capture.kernel_zone_id) => {
                 out.push(project_enforcement_event(&event));
             }
             Ok(_) => {}
-            Err(TryRecvError::Lagged(_)) => continue,
+            Err(TryRecvError::Lagged(count)) => {
+                dropped += count;
+                continue;
+            }
             Err(TryRecvError::Empty | TryRecvError::Closed) => break,
         }
     }
-    out
+    (out, dropped)
 }
 
 /// Decide whether a broadcast enforcement event belongs to this task.
@@ -1857,6 +1878,7 @@ fn to_proto_result(
     exec: SandboxExecResult,
     admission: rauha_common::zone::PolicyAdmission,
     unavailable_controls: Vec<String>,
+    receipt_json: String,
 ) -> pb::sandbox::SandboxResult {
     pb::sandbox::SandboxResult {
         task_id: exec.task_id,
@@ -1895,6 +1917,7 @@ fn to_proto_result(
             .collect(),
         admission: admission_str(admission).into(),
         unavailable_controls,
+        receipt_json,
     }
 }
 
@@ -1959,7 +1982,7 @@ impl SandboxService for SandboxServiceImpl {
             // Resolve the zone. An empty name allocates a temporary zone that we own
             // and (by default) delete afterwards; a named zone must already exist
             // and is left intact.
-            let (zone_name, zone_id, temp_zone, admission) = if req.name.trim().is_empty() {
+            let (zone_name, zone_id, temp_zone, policy) = if req.name.trim().is_empty() {
                 let name = format!(
                     "sandbox-{}",
                     &uuid::Uuid::new_v4().simple().to_string()[..12]
@@ -1988,11 +2011,12 @@ impl SandboxService for SandboxServiceImpl {
                 )
                 .trust_level(TrustLevel::Complete)
                 .emit();
-                (zone.name, zone.id.to_string(), true, admission)
+                (zone.name, zone.id.to_string(), true, zone.policy)
             } else {
                 let zone = self.registry.get_zone(&req.name).await.map_err(to_status)?;
-                (zone.name, zone.id.to_string(), false, zone.policy.admission)
+                (zone.name, zone.id.to_string(), false, zone.policy)
             };
+            let admission = policy.admission;
             let mut zone_cleanup = (temp_zone && !req.keep_zone)
                 .then(|| ZoneCleanupGuard::new(self.registry.clone(), zone_name.clone()));
 
@@ -2081,6 +2105,51 @@ impl SandboxService for SandboxServiceImpl {
             let exec = outcome.unwrap_or_else(|message| {
                 SandboxExecResult::runtime_error(&task_id, &zone_id, req.command.clone(), message)
             });
+            let manifest_digest = self.registry.image_digest(&req.image).ok();
+            let receipt_env = req.env.iter().collect::<std::collections::BTreeMap<_, _>>();
+            let receipt = self.receipt_signer.sign(ExecutionReceiptPayload {
+                schema: EXECUTION_RECEIPT_SCHEMA.into(),
+                task_id: task_id.clone(),
+                zone_id: zone_id.clone(),
+                image: ImageAdmission {
+                    reference: req.image.clone(),
+                    manifest_digest: manifest_digest.clone().unwrap_or_default(),
+                    digest_verified: manifest_digest.is_some(),
+                },
+                policy_sha256: sha256_json(&policy).map_err(to_internal_status)?,
+                inputs_sha256: sha256_json(&serde_json::json!({
+                    "salt": task_id,
+                    "image": req.image,
+                    "command": req.command,
+                    "repo_path": req.repo_path,
+                    "workdir": req.workdir,
+                    "timeout_seconds": req.timeout_seconds,
+                    "env": receipt_env,
+                    "admission": admission_str(admission),
+                }))
+                .map_err(to_internal_status)?,
+                outputs_sha256: sha256_json(&serde_json::json!({
+                    "salt": task_id,
+                    "status": sandbox_status_str(exec.status),
+                    "exit_code": exec.exit_code,
+                    "stdout": exec.stdout,
+                    "stderr": exec.stderr,
+                }))
+                .map_err(to_internal_status)?,
+                status: sandbox_status_str(exec.status),
+                exit_code: exec.exit_code,
+                started_at: exec.started_at.map(|time| time.to_rfc3339()),
+                finished_at: exec.finished_at.map(|time| time.to_rfc3339()),
+                enforcement: enforcement_totals(
+                    exec.enforcement_events
+                        .iter()
+                        .map(|event| event.decision.as_str()),
+                    exec.enforcement_drop_count,
+                ),
+                unavailable_controls: unavailable_controls.clone(),
+            });
+            receipt.verify().map_err(to_internal_status)?;
+            let receipt_json = serde_json::to_string(&receipt).map_err(to_internal_status)?;
             let run_event = match exec.status {
                 SandboxStatus::Succeeded => (
                     event_name::SANDBOX_RUN_SUCCEEDED,
@@ -2134,6 +2203,7 @@ impl SandboxService for SandboxServiceImpl {
                 exec,
                 admission,
                 unavailable_controls,
+                receipt_json,
             )))
         }
         .instrument(span)
@@ -2189,6 +2259,7 @@ mod tests {
             exec,
             rauha_common::zone::PolicyAdmission::Audit,
             vec!["ebpf:test".into()],
+            "{}".into(),
         );
         assert_eq!(proto.status, "runtime_error");
         assert_eq!(proto.stderr, "boom");
@@ -2256,7 +2327,7 @@ mod tests {
 
     #[test]
     fn drain_without_capture_yields_no_events() {
-        assert!(drain_enforcement_capture(None).is_empty());
+        assert_eq!(drain_enforcement_capture(None), (Vec::new(), 0));
     }
 
     #[test]
@@ -2278,9 +2349,22 @@ mod tests {
             rx,
             kernel_zone_id: Some(7),
         };
-        let events = drain_enforcement_capture(Some(capture));
+        let (events, dropped) = drain_enforcement_capture(Some(capture));
 
+        assert_eq!(dropped, 0);
         assert_eq!(events.len(), 1, "only the task's own zone is captured");
         assert_eq!(events[0].source_zone.as_deref(), Some("zone-7"));
+    }
+
+    #[tokio::test]
+    async fn drain_counts_broadcast_lag() {
+        let (tx, rx) = tokio::sync::broadcast::channel(1);
+        tx.send(enforcement_event(7)).unwrap();
+        tx.send(enforcement_event(7)).unwrap();
+        let (_, dropped) = drain_enforcement_capture(Some(EnforcementCapture {
+            rx,
+            kernel_zone_id: Some(7),
+        }));
+        assert_eq!(dropped, 1);
     }
 }
