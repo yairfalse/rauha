@@ -13,7 +13,11 @@ pub const EXECUTION_RECEIPT_SCHEMA: &str = "rauha.execution-receipt.v1";
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ImageAdmission {
     pub reference: String,
+    /// Manifest digest of the image the container was built from, captured at
+    /// container creation.
     pub manifest_digest: String,
+    /// True only when `reference` pinned a digest and `manifest_digest` matches
+    /// it. A tag that resolved or a cached manifest leaves this false.
     pub digest_verified: bool,
 }
 

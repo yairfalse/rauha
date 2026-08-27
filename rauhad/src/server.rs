@@ -1336,7 +1336,7 @@ impl SandboxServiceImpl {
         zone_name: &str,
         zone_id: &str,
         req: &pb::sandbox::RunSandboxRequest,
-    ) -> std::result::Result<SandboxExecResult, String> {
+    ) -> std::result::Result<(SandboxExecResult, Option<String>), String> {
         sandbox_event_builder(
             &self.registry,
             event_name::FS_ROOTFS_PREPARE_STARTED,
@@ -1383,6 +1383,10 @@ impl SandboxServiceImpl {
                 )
             })?;
         let mut cleanup = ContainerCleanupGuard::new(self.registry.clone(), container.id);
+        // The receipt must attest the manifest this container was built from,
+        // so read it now — a concurrent pull of the same tag after this point
+        // must not change what the receipt claims ran.
+        let manifest_digest = self.registry.image_digest(&req.image).ok();
 
         sandbox_event_builder(
             &self.registry,
@@ -1435,7 +1439,7 @@ impl SandboxServiceImpl {
         }
         cleanup.disarm();
 
-        outcome
+        outcome.map(|result| (result, manifest_digest))
     }
 
     async fn run_started_container(
@@ -1857,6 +1861,20 @@ fn validate_sandbox_request(req: &pb::sandbox::RunSandboxRequest) -> Result<(), 
     Ok(())
 }
 
+/// A receipt may claim the image digest was verified only when the caller
+/// pinned one (`ref@sha256:…`) and the manifest that ran matches that pin.
+/// A tag that merely resolved, or a cached manifest, proves nothing about
+/// what the caller intended to run.
+fn image_digest_pinned(reference: &str, manifest_digest: Option<&str>) -> bool {
+    let Some(manifest_digest) = manifest_digest else {
+        return false;
+    };
+    rauha_oci::reference::ImageReference::parse(reference)
+        .ok()
+        .and_then(|parsed| parsed.digest)
+        .is_some_and(|pinned| pinned == manifest_digest)
+}
+
 fn sandbox_status_str(status: SandboxStatus) -> String {
     match status {
         SandboxStatus::Succeeded => "succeeded",
@@ -2062,9 +2080,13 @@ impl SandboxService for SandboxServiceImpl {
                 )));
             }
 
-            let outcome = self
+            let (outcome, manifest_digest) = match self
                 .execute_task(&task_id, &zone_name, &zone_id, &req)
-                .await;
+                .await
+            {
+                Ok((result, digest)) => (Ok(result), digest),
+                Err(message) => (Err(message), None),
+            };
 
             match self.registry.verify_isolation(&zone_name).await {
                 Ok(postflight) => unavailable_controls.extend(
@@ -2105,7 +2127,6 @@ impl SandboxService for SandboxServiceImpl {
             let exec = outcome.unwrap_or_else(|message| {
                 SandboxExecResult::runtime_error(&task_id, &zone_id, req.command.clone(), message)
             });
-            let manifest_digest = self.registry.image_digest(&req.image).ok();
             let receipt_env = req.env.iter().collect::<std::collections::BTreeMap<_, _>>();
             let receipt = self.receipt_signer.sign(ExecutionReceiptPayload {
                 schema: EXECUTION_RECEIPT_SCHEMA.into(),
@@ -2114,7 +2135,7 @@ impl SandboxService for SandboxServiceImpl {
                 image: ImageAdmission {
                     reference: req.image.clone(),
                     manifest_digest: manifest_digest.clone().unwrap_or_default(),
-                    digest_verified: manifest_digest.is_some(),
+                    digest_verified: image_digest_pinned(&req.image, manifest_digest.as_deref()),
                 },
                 policy_sha256: sha256_json(&policy).map_err(to_internal_status)?,
                 inputs_sha256: sha256_json(&serde_json::json!({
@@ -2222,6 +2243,24 @@ mod tests {
             command: command.into_iter().map(String::from).collect(),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn digest_is_verified_only_for_a_matching_pin() {
+        let digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+        let other = "sha256:1111111111111111111111111111111111111111111111111111111111111111";
+
+        assert!(image_digest_pinned(
+            &format!("alpine@{digest}"),
+            Some(digest)
+        ));
+        assert!(!image_digest_pinned(
+            &format!("alpine@{digest}"),
+            Some(other)
+        ));
+        assert!(!image_digest_pinned("alpine:latest", Some(digest)));
+        assert!(!image_digest_pinned(&format!("alpine@{digest}"), None));
+        assert!(!image_digest_pinned("", Some(digest)));
     }
 
     #[test]

@@ -61,10 +61,24 @@ if echo "$JSON" | grep -q '"status":"succeeded"' \
     && echo "$JSON" | grep -q '"exit_code":0' \
     && echo "$JSON" | grep -q '"admission":"audit"' \
     && echo "$JSON" | grep -q '"schema":"rauha.execution-receipt.v1"' \
-    && echo "$JSON" | grep -q '"digest_verified":true'; then
-    echo "   JSON contract intact (OK)"
+    && echo "$JSON" | grep -q '"digest_verified":false'; then
+    echo "   JSON contract intact; tag pull is not claimed as digest-verified (OK)"
 else
     echo "   FAIL: unexpected JSON result: $JSON"
+    exit 1
+fi
+
+echo "6. A digest-pinned image is receipted as digest-verified..."
+DIGEST=$($RAUHA --json image inspect "$IMAGE" | jq -r .digest)
+PINNED="${IMAGE%%:*}@$DIGEST"
+$RAUHA image pull "$PINNED" >/dev/null
+JSON=$($RAUHA --json sandbox --audit --image "$PINNED" -- /bin/true)
+if echo "$JSON" | grep -q '"status":"succeeded"' \
+    && echo "$JSON" | grep -q "\"manifest_digest\":\"$DIGEST\"" \
+    && echo "$JSON" | grep -q '"digest_verified":true'; then
+    echo "   pinned digest verified and receipted (OK)"
+else
+    echo "   FAIL: pinned image receipt: $JSON"
     exit 1
 fi
 
